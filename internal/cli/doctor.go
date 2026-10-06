@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/yashwardhanv/dd/internal/copier"
 	"github.com/yashwardhanv/dd/internal/doctor"
 	"github.com/yashwardhanv/dd/internal/index"
+	"github.com/yashwardhanv/dd/internal/install"
 	"github.com/yashwardhanv/dd/internal/ntfs"
 	"github.com/yashwardhanv/dd/internal/shellint"
 	"github.com/yashwardhanv/dd/internal/ui"
@@ -201,12 +203,28 @@ func collectFacts(ctx context.Context, version string) doctor.Facts {
 		f.StartupKnown, f.StartupEnabled = true, st.Enabled()
 	}
 	if exe, err := shellExe(); err == nil {
-		if sts, err := shellint.Status(newShellRegistry(), exe); err == nil {
-			f.MenuKnown, f.MenuTotal = true, len(sts)
+		// The entries may point at this program or at the installed copy
+		// (`drivedex install` run from a downloaded folder installs entries for
+		// the copy in %LOCALAPPDATA%): either one is a correct menu.
+		candidates := []string{exe}
+		if dir, err := installDirFor(); err == nil {
+			if inst := filepath.Join(dir, install.ExeName); !install.SamePath(inst, exe) {
+				candidates = append(candidates, inst)
+			}
+		}
+		for _, c := range candidates {
+			sts, err := shellint.Status(newShellRegistry(), c)
+			if err != nil {
+				continue
+			}
+			installed := 0
 			for _, s := range sts {
 				if s.State == shellint.Current {
-					f.MenuInstalled++
+					installed++
 				}
+			}
+			if !f.MenuKnown || installed > f.MenuInstalled {
+				f.MenuKnown, f.MenuTotal, f.MenuInstalled = true, len(sts), installed
 			}
 		}
 	}

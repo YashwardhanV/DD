@@ -105,6 +105,11 @@ func TestInstallAsksBeforeEachChangeAndDoesEverythingOnYes(t *testing.T) {
 			t.Errorf("output missing %q:\n%s", want, out)
 		}
 	}
+	// The doctor run at the end must see the freshly installed menu as fine, even though
+	// the running program is the downloaded copy, not the installed one.
+	if !strings.Contains(out, "right-click menu is installed") || strings.Contains(out, "partly installed") {
+		t.Errorf("doctor should report the right-click menu as installed:\n%s", out)
+	}
 	// 1. files
 	for _, n := range install.ProgramFiles() {
 		b, err := os.ReadFile(filepath.Join(w.dir, n))
