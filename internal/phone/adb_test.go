@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -215,4 +216,86 @@ func TestLimitedBufferKeepsOnlyTheStart(t *testing.T) {
 	if b.Len() != maxStderr {
 		t.Errorf("kept %d bytes, want %d", b.Len(), maxStderr)
 	}
+}
+
+// ---- StatPath and Pull ------------------------------------------------------------
+
+func TestStatPath(t *testing.T) {
+	answers := map[string]string{
+		"/sdcard/DCIM":              "directory|4096|1700000000\n",
+		"/sdcard/a.jpg":             "regular file|1234|1700000100\r\n", // old adb: CRLF
+		"/sdcard/empty":             "regular empty file|0|5\n",
+		`'/sdcard/My Photos/b.jpg'`: "regular file|9|7\n",
+	}
+	var seen []string
+	adb := NewADBWithRunner(runnerFunc(func(ctx context.Context, args ...string) ([]byte, error) {
+		seen = append(seen, args[len(args)-1])
+		for p, out := range answers {
+			if strings.Contains(args[len(args)-1], p) || strings.Contains(args[len(args)-1], strings.Trim(p, "'")) && strings.Contains(p, "'") {
+				return []byte(out), nil
+			}
+		}
+		return nil, &ExitError{Code: 1} // stat: no such file (and 2>/dev/null hides the message)
+	}))
+	ctx := context.Background()
+
+	if info, err := adb.StatPath(ctx, "S", "/sdcard/DCIM"); err != nil || !info.Exists || !info.IsDir || info.ModTime != 1700000000 {
+		t.Errorf("folder: %+v %v", info, err)
+	}
+	if info, err := adb.StatPath(ctx, "S", "/sdcard/a.jpg"); err != nil || !info.Exists || info.IsDir || info.Size != 1234 || info.ModTime != 1700000100 {
+		t.Errorf("file: %+v %v", info, err)
+	}
+	if info, _ := adb.StatPath(ctx, "S", "/sdcard/empty"); info.IsDir || !info.Exists || info.Size != 0 {
+		t.Errorf("empty file: %+v", info)
+	}
+	if info, err := adb.StatPath(ctx, "S", "/sdcard/nope"); err != nil || info.Exists {
+		t.Errorf("missing: %+v %v", info, err)
+	}
+	if info, _ := adb.StatPath(ctx, "S", "/sdcard/My Photos/b.jpg"); !info.Exists {
+		t.Errorf("a path with a space must be quoted for the phone's shell; sent %q", seen[len(seen)-1])
+	}
+	// An adb that can't even start is an error, not "doesn't exist".
+	broken := NewADBWithRunner(runnerFunc(func(context.Context, ...string) ([]byte, error) { return nil, errors.New("adb not running") }))
+	if _, err := broken.StatPath(ctx, "S", "/x"); err == nil {
+		t.Error("an adb failure must be reported")
+	}
+}
+
+func TestPullBuildsTheRightCommand(t *testing.T) {
+	var got []string
+	adb := NewADBWithRunner(runnerFunc(func(ctx context.Context, args ...string) ([]byte, error) { got = args; return nil, nil }))
+	if err := adb.Pull(context.Background(), "S", []string{"/sdcard/a.jpg", "/sdcard/b c.jpg"}, `D:\stage`); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"-s", "S", "pull", "-a", "/sdcard/a.jpg", "/sdcard/b c.jpg", `D:\stage`}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("args = %q\nwant   %q", got, want)
+	}
+	got = nil
+	if err := adb.Pull(context.Background(), "S", nil, "x"); err != nil || got != nil {
+		t.Error("pulling nothing must not run adb")
+	}
+	failing := NewADBWithRunner(runnerFunc(func(context.Context, ...string) ([]byte, error) {
+		return nil, &ExitError{Code: 1, Stderr: "adb: error: remote object doesn't exist"}
+	}))
+	var ee *ExitError
+	if err := failing.Pull(context.Background(), "S", []string{"/x"}, "d"); !errors.As(err, &ee) || !strings.Contains(err.Error(), "adb pull") {
+		t.Errorf("err = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cancelled := NewADBWithRunner(runnerFunc(func(context.Context, ...string) ([]byte, error) { return nil, errors.New("killed") }))
+	if err := cancelled.Pull(ctx, "S", []string{"/x"}, "d"); !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want context.Canceled", err)
+	}
+}
+
+// runnerFunc adapts a function to the Runner interface (Output only).
+type runnerFunc func(ctx context.Context, args ...string) ([]byte, error)
+
+func (f runnerFunc) Output(ctx context.Context, args ...string) ([]byte, error) {
+	return f(ctx, args...)
+}
+func (f runnerFunc) Stream(context.Context, ...string) (io.ReadCloser, func() error, error) {
+	return nil, nil, errors.New("not supported by this test runner")
 }

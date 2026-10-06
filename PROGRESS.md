@@ -10,7 +10,7 @@ Legend: `[x]` done and verified · `[~]` code complete and tested in the cloud c
 - [~] 4 Parallel scanner
 - [~] 5 Android via ADB
 - [~] 6 NTFS MFT + USN
-- [ ] 7 Fast copy
+- [~] 7 Fast copy
 - [ ] 8 Interactive UI
 - [ ] 9 Auto-index agent
 - [ ] 10 Explorer integration
@@ -18,7 +18,7 @@ Legend: `[x]` done and verified · `[~]` code complete and tested in the cloud c
 - [ ] 12 Packaging & release
 
 ## Current status
-Stage: 6 code complete (owner checks pending) — next: stage 7
+Stage: 7 code complete (owner checks pending) — next: stage 8
 
 ## Decisions
 - 2026-10-06: module path = `github.com/yashwardhanv/dd` (matches the actual GitHub repo `YashwardhanV/DD`, so `go install` paths work). BUILD.md suggested `github.com/<user>/drivedex`.
@@ -31,6 +31,11 @@ Stage: 6 code complete (owner checks pending) — next: stage 7
 - Stage 1: `internal/index/model.go` and `path.go` were created in stage 1 (BUILD.md lists them under stage 2) because the `Scanner` interface (section 7.5) takes an `*index.Builder`. Stage 2 adds the file format, store and search on top.
 - Stage 1: added `internal/fixture` (the generator logic) so `cmd/genfixture` and unit tests share one implementation. `cmd/genfixture` is a thin wrapper.
 - Stage 1: `ui` also contains console setup (ANSI colors + UTF-8 code page on Windows, restored on exit) and the one-line status display; BUILD.md describes these later but every command needs them from the start.
+- Stage 7: `copy` is built around a plan/run split (`copier.Plan` of `Item`s = a `Job` + a `Decision`), so stage 11's `search --copy-to` can reuse it with `copier.PlanJobs` (an explicit file list). Conflict decisions are made at *plan* time (needed for `--dry-run` and the free-space/FAT32 pre-checks); progress counts skipped files as done immediately, and the byte total counts only files that will be written.
+- Stage 7: pre-checks only count files that will actually be written (BUILD.md says "total bytes"); a huge file that is being skipped can't block a copy to FAT32.
+- Stage 7: `adb pull` is **staged**: each batch is pulled into a hidden `.ddxpull-*` folder inside the destination and files are renamed into place only when they arrived, so an interrupted pull can never leave a half-written file under its real name (which a later run might otherwise accept as "same size/time" or "newer"). BUILD.md pulls straight into the destination. Stale staging folders are removed at the start of the next run. Failed batch members are retried one file at a time (2 retries). `--verify` is not available for phone copies (nothing local to compare against) — the command says so.
+- Stage 7: links/special files are never followed (a symlink's target is not copied); they are counted as skipped. A failed `--verify` deletes the bad copy (it would otherwise look "already there" to the next run). Ctrl+C removes the partial `.ddxpart` files it was writing and exits 0 after printing the resume hint (only failed files give a non-zero exit).
+- Stage 7: phone paths are relative to the phone's storage as shown by `search` (`phone:/DCIM/Camera` = `/sdcard/DCIM/Camera`); `/sdcard/...` and `/storage/...` are taken literally. Copying *to* a phone is refused (DriveDex never writes to a phone).
 - Stage 6: the NTFS logic is split so almost all of it is testable off-Windows: `ntfs.Device` (a one-method interface: `IOControl(code, in, out)`) hides `DeviceIoControl`; Windows error numbers are translated to sentinel errors (`ErrEOF`, `ErrJournalNotActive`, `ErrJournalEntryDeleted`, `ErrNeedAdmin`, ...) in `mft_windows.go`. `internal/ntfs/ntfstest` is an in-memory fake NTFS volume (MFT, metafiles, System Volume Information, a real journal with trim/reset) used by the ntfs and cli tests. The only code that cannot run here is the ~60-line `mft_windows.go` + `IsElevated` — it is type-checked with `GOOS=windows go vet/build`.
 - Stage 6: the skip list (System Volume Information, $RECYCLE.BIN) is applied at **any depth** in MFT mode, matching `walk`/`parallel` (BUILD.md says "root level"); results stay comparable between scanners.
 - Stage 6: collected MFT records are kept in a slice, not the `map[uint64]rec` BUILD.md suggests — a map for millions of records costs far more memory; reachability uses one `map[frn]slot` plus a memoized state array.
@@ -58,6 +63,7 @@ Stage: 6 code complete (owner checks pending) — next: stage 7
 - Hardware / admin acceptance criteria (real drives, phone, Administrator terminal, Explorer timings) can't be run in the cloud container. They are listed per stage below as "owner to verify" and are NOT marked passed.
 
 ## Owner to verify (hardware-dependent checks)
+- **Stage 7:** (a) `drivedex copy E:\Photos D:\Backup --dry-run`, then the real copy; run it a second time (everything should be skipped). (b) Benchmark ONE folder of 5,000+ small files three ways — Explorer, `robocopy src dst /E /MT:16`, `drivedex copy` — and record all three times (Benchmarks table). (c) Press Ctrl+C part-way through a big copy and run the same command again: it must resume and leave no `.ddxpart` files. (d) Phone: `drivedex copy phone:/DCIM/Camera D:\PhoneBackup`; unplug mid-way, replug, rerun → resumes. (e) Try `--verify` once. (f) Copy a >4 GB file to a FAT32 pen drive: must be refused before copying starts.
 - **Stage 6 (all in an *Administrator* PowerShell):** (a) `drivedex journal status C:`. (b) `drivedex index C: --mode mft` — record entries + time (target < ~15 s per million files); (c) `drivedex index E: --mode mft` on an NTFS external drive (read-only, safe); also `drivedex index E: --mode parallel` and check the two entry counts are within ±2% — note the differences (hidden/system items, protected folders the walker can't read). (d) Pick 20 random paths from `drivedex search ... --limit 20` on the C: index and check they exist. (e) Create/rename/delete a few files on E:, then `drivedex index E:` → must print `Refreshed E:\ from change journal — N changes applied in X ms`; search must show the changes. (f) In a *normal* (non-admin) terminal `drivedex index E:` must fall back to the parallel scanner and print the Administrator tip once. (g) If a drive has no journal: `drivedex journal enable E:` (answer y) then index again.
 - **Stage 5:** set up the phone (BUILD.md stage 5 steps; the error message prints them if adb is missing), then `adb devices -l` should show `device`. Run `drivedex index phone` and record time + entry count; time an Explorer search of the phone (or note "gave up after N min"); unplug and run `drivedex search IMG_2024 --limit 5` → results must end with `· offline`. Also try `drivedex index phone:<serial>` if two phones are connected, and a phone locked/unauthorized (should print the "tap Allow" hint).
 - **Stage 4:** (a) `drivedex index E: --mode walk`, replug, `drivedex index E: --mode parallel` (replug between runs — Windows caches folder listings) and record both times in Benchmarks. (b) `drivedex index E:` prints which worker count it chose and why ("flash/SSD detected" / "spinning hard disk detected" / "drive type unknown") — note what it said for each drive you try, especially a USB hard disk (is HDD detected, or unknown?). (c) Optional: `drivedex bench-scan E: --workers 1,4,16`. Also run `go test ./internal/volume/` on Windows (the seek-penalty test just checks it doesn't crash).
@@ -72,4 +78,5 @@ Stage: 6 code complete (owner checks pending) — next: stage 7
 | 2026-10-06 | `go test -bench` Load, 1,000,000-entry .ddx from disk | cloud container, 4 vCPU Xeon 2.8 GHz | 1,000,000 | n/a | 380 ms (≈ 38 MB file) | read + CRC + parse + lowercase + ID map | target < 1.5 s: PASS |
 | 2026-10-06 | index + search fixture fx20k | cloud container tmpfs | 20,171 | n/a | index 126 ms; search < 1 ms | walk | footer shows `<1 ms` |
 | 2026-10-06 | `bench-scan` on fixture fx20k (workers 1/2/4/8/16) | cloud container tmpfs, 4 vCPU | 20,171 | n/a | 80 / 56 / 30 / 35 / 43 ms (250k → 656k entries/s peak at 4) | parallel | RAM-cached tmpfs, NOT a USB drive; only shows the scanner scales. Owner numbers needed. |
+| 2026-10-06 | copy fixture fx20k (20,000 small files, 38.8 MB), 3 alternating rounds | cloud container ext4 (page-cache dominated, no USB) | 20,000 | `cp -r`: 7980 / 920 / 662 ms | `drivedex copy --workers 8`: 1496 / 622 / 592 ms | parallel, 8 workers | very noisy: shows parity-or-better vs `cp -r`, NOT a USB result. Owner's Explorer / robocopy / drivedex numbers still needed. |
 | 2026-10-06 | scan --count-only (fixture fx20k) | cloud container tmpfs (Linux) | 20,171 | n/a | 94 ms (~214k entries/s) | walk | not representative of a USB drive; sanity check only |

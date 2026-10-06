@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -87,6 +88,39 @@ func TestCompact(t *testing.T) {
 	for in, want := range cases {
 		if got := Compact(in); got != want {
 			t.Errorf("Compact(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestFormatCopyProgress(t *testing.T) {
+	got := FormatCopyProgress(CopyProgress{
+		FilesDone: 8412, FilesTotal: 12408,
+		BytesDone: 13 << 30, BytesTotal: 20 << 30, // 13 / 20 GiB
+		Skipped: 3, Failed: 0, BytesPerSec: 86 << 20,
+	})
+	want := "[ 8,412/12,408 files ]  13.0/20.0 GB  ·  86 MB/s  ·  ETA 1m23s  ·  3 skipped  ·  0 failed"
+	if got != want {
+		t.Errorf("\n got %q\nwant %q", got, want)
+	}
+	if got := FormatCopyProgress(CopyProgress{FilesTotal: 5, BytesTotal: 100}); !strings.Contains(got, "ETA …") || !strings.Contains(got, "0 B/s") {
+		t.Errorf("before any speed is known: %q", got)
+	}
+	if got := FormatCopyProgress(CopyProgress{FilesDone: 5, FilesTotal: 5, BytesDone: 100, BytesTotal: 100, BytesPerSec: 50}); !strings.Contains(got, "ETA 0s") {
+		t.Errorf("when finished: %q", got)
+	}
+}
+
+func TestHumanPairAndRate(t *testing.T) {
+	if got := HumanPair(512, 2048); got != "0.5/2.0 KB" {
+		t.Errorf("HumanPair = %q", got)
+	}
+	if got := HumanPair(5, 900); got != "5/900 B" {
+		t.Errorf("HumanPair = %q", got)
+	}
+	cases := map[float64]string{0: "0 B/s", 500: "500 B/s", 4.2 * 1024 * 1024: "4.2 MB/s", 86 * 1024 * 1024: "86 MB/s", 1.5 * 1024 * 1024 * 1024: "1.5 GB/s"}
+	for in, want := range cases {
+		if got := FormatRate(in); got != want {
+			t.Errorf("FormatRate(%v) = %q, want %q", in, got, want)
 		}
 	}
 }

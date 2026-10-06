@@ -86,6 +86,7 @@ saved index instantly - even for drives that are not plugged in.`,
 	root.AddCommand(newForgetCmd())
 	root.AddCommand(newBenchScanCmd())
 	root.AddCommand(newJournalCmd())
+	root.AddCommand(newCopyCmd())
 	return root
 }
 
