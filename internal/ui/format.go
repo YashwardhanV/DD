@@ -86,6 +86,15 @@ func FormatDuration(d time.Duration) string {
 	}
 }
 
+// FormatMillis prints a short duration the way the search footer wants it:
+// "21 ms", or "<1 ms" for anything quicker than a millisecond.
+func FormatMillis(d time.Duration) string {
+	if d < time.Millisecond {
+		return "<1 ms"
+	}
+	return fmt.Sprintf("%d ms", d.Milliseconds())
+}
+
 // Ago describes how long before `now` the time t was: "just now", "5 minutes
 // ago", "3 days ago".
 func Ago(t, now time.Time) string {

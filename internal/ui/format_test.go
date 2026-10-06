@@ -70,3 +70,14 @@ func TestPerSecond(t *testing.T) {
 		t.Errorf("PerSecond with zero duration = %d, want 7", got)
 	}
 }
+
+func TestFormatMillis(t *testing.T) {
+	cases := map[time.Duration]string{
+		200 * time.Microsecond: "<1 ms", time.Millisecond: "1 ms", 21*time.Millisecond + 700*time.Microsecond: "21 ms",
+	}
+	for in, want := range cases {
+		if got := FormatMillis(in); got != want {
+			t.Errorf("FormatMillis(%v) = %q, want %q", in, got, want)
+		}
+	}
+}

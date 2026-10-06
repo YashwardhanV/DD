@@ -75,6 +75,8 @@ saved index instantly - even for drives that are not plugged in.`,
 
 	root.AddCommand(newVersionCmd(version))
 	root.AddCommand(newScanCmd())
+	root.AddCommand(newIndexCmd())
+	root.AddCommand(newSearchCmd())
 	return root
 }
 

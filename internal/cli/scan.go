@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -34,7 +35,7 @@ are measured against.`,
   drivedex scan . --limit 20`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runScan(cmd.Context(), args[0], countOnly, limit)
+			return runScan(cmd.Context(), cmd.OutOrStdout(), args[0], countOnly, limit)
 		},
 	}
 	cmd.Flags().BoolVar(&countOnly, "count-only", false, "don't print paths, just count and show the summary")
@@ -42,14 +43,14 @@ are measured against.`,
 	return cmd
 }
 
-func runScan(ctx context.Context, arg string, countOnly bool, limit int) error {
+func runScan(ctx context.Context, stdout io.Writer, arg string, countOnly bool, limit int) error {
 	root, err := resolveRoot(arg)
 	if err != nil {
 		return err
 	}
 
 	w := scan.NewWalk(root)
-	out := bufio.NewWriterSize(os.Stdout, 64*1024)
+	out := bufio.NewWriterSize(stdout, 64*1024)
 	defer out.Flush()
 
 	printed := 0
@@ -76,39 +77,38 @@ func runScan(ctx context.Context, arg string, countOnly bool, limit int) error {
 
 	err = w.Scan(ctx, index.NewDiscardBuilder(), report)
 	status.Clear()
-	out.Flush()
 	elapsed := time.Since(start)
 	st := w.Stats()
 
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			fmt.Printf("Stopped after %s — %s entries so far.\n", ui.FormatDuration(elapsed), ui.Thousands(st.Entries()))
+			fmt.Fprintf(out, "Stopped after %s — %s entries so far.\n", ui.FormatDuration(elapsed), ui.Thousands(st.Entries()))
 			return nil
 		}
 		return userErr(fmt.Sprintf("scan of %s failed", arg), "check the drive is connected and readable", err)
 	}
 
-	fmt.Printf("Scanned %s in %s — %s files, %s folders, %d errors (%s entries/s)\n",
+	fmt.Fprintf(out, "Scanned %s in %s — %s files, %s folders, %d errors (%s entries/s)\n",
 		root, ui.FormatDuration(elapsed), ui.Thousands(st.Files), ui.Thousands(st.Dirs), st.Errors,
 		ui.Thousands(ui.PerSecond(st.Entries(), elapsed)))
-	printScanErrors(st)
+	printScanErrors(out, st)
 	return nil
 }
 
 // printScanErrors shows the first few errors with a reassuring hint.
-func printScanErrors(st scan.Stats) {
+func printScanErrors(out io.Writer, st scan.Stats) {
 	if st.Errors == 0 {
 		return
 	}
 	const show = 5
-	fmt.Println(ui.Dim("Some folders could not be read (this is normal: Windows protects some system folders):"))
+	fmt.Fprintln(out, ui.Dim("Some folders could not be read (this is normal: Windows protects some system folders):"))
 	for i, e := range st.FirstErrors {
 		if i == show {
 			break
 		}
-		fmt.Println(ui.Dim("  " + e))
+		fmt.Fprintln(out, ui.Dim("  "+e))
 	}
 	if more := st.Errors - int64(min(show, len(st.FirstErrors))); more > 0 {
-		fmt.Println(ui.Dim(fmt.Sprintf("  … and %d more", more)))
+		fmt.Fprintln(out, ui.Dim(fmt.Sprintf("  … and %d more", more)))
 	}
 }
