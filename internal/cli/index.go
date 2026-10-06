@@ -19,6 +19,7 @@ import (
 // and from then on `drivedex search` finds files instantly without touching
 // the drive.
 func newIndexCmd() *cobra.Command {
+	var opts scanOptions
 	cmd := &cobra.Command{
 		Use:   "index <path>",
 		Short: "Scan a folder or drive and save its index for instant search",
@@ -26,16 +27,19 @@ func newIndexCmd() *cobra.Command {
 After that, 'drivedex search' answers in milliseconds without touching the
 drive - even when the drive is unplugged. Run it again to refresh.`,
 		Example: `  drivedex index D:\Projects
-  drivedex index E:`,
+  drivedex index E:
+  drivedex index E: --workers 8
+  drivedex index E: --mode walk`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runIndex(cmd.Context(), cmd.OutOrStdout(), args[0])
+			return runIndex(cmd.Context(), cmd.OutOrStdout(), args[0], opts)
 		},
 	}
+	addScanFlags(cmd.Flags(), &opts)
 	return cmd
 }
 
-func runIndex(ctx context.Context, out io.Writer, arg string) error {
+func runIndex(ctx context.Context, out io.Writer, arg string, opts scanOptions) error {
 	root, err := resolveRoot(arg)
 	if err != nil {
 		return err
@@ -44,12 +48,12 @@ func runIndex(ctx context.Context, out io.Writer, arg string) error {
 	if err != nil {
 		return err
 	}
-	return indexRoot(ctx, out, root, header)
+	return indexRoot(ctx, out, root, header, opts)
 }
 
 // indexRoot scans root and saves the result as the index described by header.
 // (Split from runIndex so tests can index a plain folder "as if" it were a drive.)
-func indexRoot(ctx context.Context, out io.Writer, root string, header index.Header) error {
+func indexRoot(ctx context.Context, out io.Writer, root string, header index.Header, opts scanOptions) error {
 	store, err := openStore()
 	if err != nil {
 		return err
@@ -63,7 +67,11 @@ func indexRoot(ctx context.Context, out io.Writer, root string, header index.Hea
 		header.CreatedAt = old.CreatedAt
 	}
 
-	var scanner scan.Scanner = scan.NewWalk(root)
+	scanner, note, err := chooseScanner(root, opts)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(out, ui.Dim(note))
 	header.Scanner = scanner.Name()
 	builder := index.NewBuilder(header)
 

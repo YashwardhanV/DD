@@ -33,7 +33,7 @@ func plug(t *testing.T, vols ...volume.Volume) {
 func indexAsDrive(t *testing.T, tree string, v volume.Volume) {
 	t.Helper()
 	var out strings.Builder
-	if err := indexRoot(context.Background(), &out, tree, volumeHeader(v)); err != nil {
+	if err := indexRoot(context.Background(), &out, tree, volumeHeader(v), scanOptions{}); err != nil {
 		t.Fatalf("indexRoot: %v\n%s", err, out.String())
 	}
 }
@@ -280,7 +280,7 @@ func TestForgetErrors(t *testing.T) {
 	h2.SourceID = "vol-DEADBEEF"
 	for _, h := range []index.Header{h1, h2} {
 		var out strings.Builder
-		if err := indexRoot(context.Background(), &out, tree, h); err != nil {
+		if err := indexRoot(context.Background(), &out, tree, h, scanOptions{}); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -30,3 +30,13 @@ func TestForPathFindsContainingDrive(t *testing.T) {
 		t.Error("UNC paths should be rejected")
 	}
 }
+
+// SeekPenalty must never crash, whatever the answer. (It may be "unknown" on
+// some machines; that is allowed.)
+func TestSeekPenaltyDoesNotCrash(t *testing.T) {
+	penalty, known := SeekPenalty(`C:\`)
+	t.Logf("C:\\ seek penalty = %v (known = %v)", penalty, known)
+	if _, known := SeekPenalty(`\\server\share`); known {
+		t.Error("network paths should be unknown")
+	}
+}

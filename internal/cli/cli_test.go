@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/yashwardhanv/dd/internal/fixture"
+	"github.com/yashwardhanv/dd/internal/ui"
 )
 
 // run executes the drivedex CLI in-process and returns what it printed.
@@ -147,3 +148,6 @@ func asUserError(err error, target **UserError) bool {
 	}
 	return ok
 }
+
+// fmtCount formats n the way the CLI prints it, for assertions.
+func fmtCount(n int) string { return ui.Thousands(int64(n)) }
