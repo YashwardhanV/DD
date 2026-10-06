@@ -150,7 +150,7 @@ func (m Model) renderRows(width int) string {
 	}
 	// Pad with blank lines (or a hint) so the screen never jumps.
 	for i := end - m.offset; i < visible; i++ {
-		if i == 0 && len(m.rows) == 0 && strings.TrimSpace(m.input.Value()) != "" && m.took > 0 {
+		if i == 0 && len(m.rows) == 0 && strings.TrimSpace(m.input.Value()) != "" && m.searched {
 			b.WriteString(" " + dimStyle.Render("  No matches.") + "\n")
 			continue
 		}

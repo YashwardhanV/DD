@@ -74,6 +74,11 @@ func TestBuildTUIConfig(t *testing.T) {
 func TestBuildTUIConfigDriveAndScope(t *testing.T) {
 	tree, _ := withFixture(t)
 	plug(t, fakeDrive("E:"))
+	// The test folder must be indexed as a plain folder. (On Windows the real lookup
+	// would find that the folder is on a real drive and index the WHOLE drive.)
+	old := volumeForPath
+	volumeForPath = func(string) (volume.Volume, error) { return volume.Volume{}, errors.New("not a drive in this test") }
+	defer func() { volumeForPath = old }()
 
 	cfg, err := buildTUIConfig(context.Background(), tuiFlags{drive: "e"})
 	if err != nil || cfg.DriveSourceID != "vol-1A2B3C4D" {

@@ -79,3 +79,23 @@ func TestHideHiddenSetting(t *testing.T) {
 		t.Error("ordinary files must still show when hidden files are hidden")
 	}
 }
+
+// On Windows a very fast search can measure as 0 elapsed time; "No matches." must
+// not depend on the timer (it did once - the CI run on Windows caught it).
+func TestNoMatchesHintDoesNotDependOnTheTimer(t *testing.T) {
+	h := newWorld(t).start(t)
+	h.typeText("zzzznothing")
+	h.send(searchDoneMsg{seq: h.m.seq, ran: true, took: 0})
+	if !strings.Contains(h.view(), "No matches.") {
+		t.Errorf("a finished search with no rows must say so even when took == 0:\n%s", h.view())
+	}
+	// ...but not before any search has finished for this text.
+	h.m.input.SetValue("")
+	h.m.input.CursorEnd()
+	h.typeText("a")
+	h.m.searched = false
+	h.m.rows = nil
+	if strings.Contains(h.view(), "No matches.") {
+		t.Error("no hint while the search hasn't finished")
+	}
+}

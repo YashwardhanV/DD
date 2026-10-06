@@ -118,6 +118,9 @@ type searchDoneMsg struct {
 	rows  []Row
 	took  time.Duration
 	terms []string
+	// ran is true when a search really ran (as opposed to an empty query).
+	// (Not inferred from took > 0: on Windows a fast search can read as 0 elapsed.)
+	ran bool
 	// queryErr is set when the text isn't (yet) a valid search, e.g. "size:>".
 	// The previous results stay on screen while the user finishes typing.
 	queryErr string
@@ -154,6 +157,7 @@ type Model struct {
 	total    int
 	covered  int // indexes searched
 	took     time.Duration
+	searched bool // a search has finished for the current text (so "no rows" means "no matches")
 	cursor   int
 	offset   int
 	status   string
@@ -252,6 +256,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil // keep showing the last good results while the user finishes the filter
 		}
 		m.rows, m.total, m.covered, m.took, m.terms, m.noMeta = msg.rows, msg.res.Total, msg.res.Indexes, msg.took, msg.terms, msg.noMeta
+		m.searched = msg.ran
 		m.cursor, m.offset = 0, 0
 		m.ensureMeta()
 		return m, nil
@@ -358,7 +363,7 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	m.query = m.input.Value()
 	if strings.TrimSpace(m.query) == "" {
 		m.rows, m.total, m.cursor, m.offset, m.terms = nil, 0, 0, 0, nil
-		m.queryErr, m.noMeta = "", 0
+		m.queryErr, m.noMeta, m.searched = "", 0, false
 		return m, cmd
 	}
 	seq := m.seq
@@ -452,7 +457,7 @@ func (m Model) searchCmd(seq int) tea.Cmd {
 		if q.UsesMetadata() {
 			noMeta = qm.SkippedNoMeta()
 		}
-		return searchDoneMsg{seq: seq, res: res, rows: buildRows(indexes, env, res), took: time.Since(start), terms: highlightTerms(q), noMeta: noMeta}
+		return searchDoneMsg{seq: seq, res: res, rows: buildRows(indexes, env, res), took: time.Since(start), terms: highlightTerms(q), noMeta: noMeta, ran: true}
 	}
 }
 

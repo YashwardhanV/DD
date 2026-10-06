@@ -37,6 +37,9 @@ func TestDoctorReportsEveryArea(t *testing.T) {
 	fs := phonetest.NewFS()
 	useFS(t, fs)
 	fakeBus(t, "USB")
+	oldElevated := isElevated
+	isElevated = func() bool { return false } // (the CI machine's real account is an administrator)
+	defer func() { isElevated = oldElevated }()
 
 	out, err := run(t, "--no-color", "doctor")
 	if err != nil {
