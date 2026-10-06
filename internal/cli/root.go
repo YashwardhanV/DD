@@ -13,6 +13,8 @@ import (
 	"runtime"
 
 	"github.com/spf13/cobra"
+
+	"github.com/yashwardhanv/dd/internal/ui"
 )
 
 // Global flags shared by every command. They are filled in by cobra before a
@@ -41,6 +43,10 @@ func userErr(msg, hint string, cause error) error {
 // Execute builds the command tree, runs it, and returns the process exit code
 // (0 = success, 1 = error).
 func Execute(ctx context.Context, version string) int {
+	// Make the Windows console show colors and Unicode properly (undone on exit).
+	restore := ui.SetupConsole()
+	defer restore()
+
 	root := NewRootCmd(version)
 	if err := root.ExecuteContext(ctx); err != nil {
 		printError(err)
@@ -59,12 +65,16 @@ saved index instantly - even for drives that are not plugged in.`,
 		// We print errors ourselves (see printError) so they are friendly.
 		SilenceErrors: true,
 		SilenceUsage:  true,
+		PersistentPreRun: func(cmd *cobra.Command, args []string) {
+			ui.SetColor(!flagNoColor)
+		},
 	}
 
 	root.PersistentFlags().BoolVar(&flagDebug, "debug", false, "show technical details when something fails")
 	root.PersistentFlags().BoolVar(&flagNoColor, "no-color", false, "turn off colored output")
 
 	root.AddCommand(newVersionCmd(version))
+	root.AddCommand(newScanCmd())
 	return root
 }
 
