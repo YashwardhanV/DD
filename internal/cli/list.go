@@ -43,7 +43,11 @@ func runList(out io.Writer) error {
 		return nil
 	}
 
-	env := currentEnv()
+	wantPhones := false
+	for _, in := range infos {
+		wantPhones = wantPhones || (in.Err == nil && in.Header.SourceKind == index.KindPhone)
+	}
+	env := currentEnv(wantPhones)
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "ID\tLABEL\tKIND\tFS\tENTRIES\tUPDATED\tSTATUS\tLAST MOUNT\tFILE SIZE")
 	for _, in := range infos {

@@ -8,7 +8,7 @@ Legend: `[x]` done and verified · `[~]` code complete and tested in the cloud c
 - [~] 2 Index + search
 - [~] 3 Drive identity & offline search
 - [~] 4 Parallel scanner
-- [ ] 5 Android via ADB
+- [~] 5 Android via ADB
 - [ ] 6 NTFS MFT + USN
 - [ ] 7 Fast copy
 - [ ] 8 Interactive UI
@@ -18,7 +18,7 @@ Legend: `[x]` done and verified · `[~]` code complete and tested in the cloud c
 - [ ] 12 Packaging & release
 
 ## Current status
-Stage: 4 code complete (owner checks pending) — next: stage 5
+Stage: 5 code complete (owner checks pending) — next: stage 6
 
 ## Decisions
 - 2026-10-06: module path = `github.com/yashwardhanv/dd` (matches the actual GitHub repo `YashwardhanV/DD`, so `go install` paths work). BUILD.md suggested `github.com/<user>/drivedex`.
@@ -31,6 +31,11 @@ Stage: 4 code complete (owner checks pending) — next: stage 5
 - Stage 1: `internal/index/model.go` and `path.go` were created in stage 1 (BUILD.md lists them under stage 2) because the `Scanner` interface (section 7.5) takes an `*index.Builder`. Stage 2 adds the file format, store and search on top.
 - Stage 1: added `internal/fixture` (the generator logic) so `cmd/genfixture` and unit tests share one implementation. `cmd/genfixture` is a thin wrapper.
 - Stage 1: `ui` also contains console setup (ANSI colors + UTF-8 code page on Windows, restored on exit) and the one-line status display; BUILD.md describes these later but every command needs them from the start.
+- Stage 5: all adb access goes through a small `phone.Runner` interface (real one = `ExecRunner`, tests use `internal/phone/phonetest`), so every adb behaviour is unit-tested without a phone, including on Windows CI (the `ExecRunner` tests start the Go test binary itself as a stand-in adb).
+- Stage 5: fallback to the names-only `find` triggers when the stat listing produced **no usable lines** and either exited non-zero *or* printed only unparseable lines (BUILD.md only mentions non-zero exit; the extra case covers a stat that prints an error but exits 0). A non-zero exit that *did* produce lines is accepted (find exits 1 when any folder, e.g. `Android/data`, is protected).
+- Stage 5: `adb` is only started during `search`/`list` when at least one phone index exists, with a 5 s timeout, so people without phones never pay for it; if adb is missing, phones simply show as `· offline` (never an error).
+- Stage 5: hints may now be multi-line (setup steps), printed aligned under `Fix:`. `adb_path` config is wired in stage 11 (`phone.FindADB(configured)` already takes it).
+- Stage 5: names-only phone entries carry `FlagNoMeta` per spec; stage 6's lazy `os.Lstat` metadata fill must **skip phone sources** (a phone path isn't a local file).
 - Stage 4: `index` also gained `--mode`/`--workers` (as specified); `scan.AutoWorkers` (portable) holds the HDD/flash/unknown → 2 / min(16, 2×CPUs) / 4 rule, `volume.SeekPenalty` (Windows IOCTL, stub elsewhere) supplies the input. `bench-scan` always uses the *parallel* scanner (1 worker = parallel with one worker), not `walk`.
 - Stage 4: the parallel scanner reads folders with `File.ReadDir(-1)` (unsorted) instead of `os.ReadDir` (sorted) because order doesn't matter and sorting every folder is wasted work; `readDir` is a package variable so tests can inject failing folders.
 - Stage 4: race test **was run** (`CGO_ENABLED=1 go test -race ./internal/scan/ ./internal/index/`, gcc available in the cloud container): clean. The owner's PC may have no C compiler; CI runs without `-race` (CGO off) — see stage 12.
@@ -47,6 +52,7 @@ Stage: 4 code complete (owner checks pending) — next: stage 5
 - Hardware / admin acceptance criteria (real drives, phone, Administrator terminal, Explorer timings) can't be run in the cloud container. They are listed per stage below as "owner to verify" and are NOT marked passed.
 
 ## Owner to verify (hardware-dependent checks)
+- **Stage 5:** set up the phone (BUILD.md stage 5 steps; the error message prints them if adb is missing), then `adb devices -l` should show `device`. Run `drivedex index phone` and record time + entry count; time an Explorer search of the phone (or note "gave up after N min"); unplug and run `drivedex search IMG_2024 --limit 5` → results must end with `· offline`. Also try `drivedex index phone:<serial>` if two phones are connected, and a phone locked/unauthorized (should print the "tap Allow" hint).
 - **Stage 4:** (a) `drivedex index E: --mode walk`, replug, `drivedex index E: --mode parallel` (replug between runs — Windows caches folder listings) and record both times in Benchmarks. (b) `drivedex index E:` prints which worker count it chose and why ("flash/SSD detected" / "spinning hard disk detected" / "drive type unknown") — note what it said for each drive you try, especially a USB hard disk (is HDD detected, or unknown?). (c) Optional: `drivedex bench-scan E: --workers 1,4,16`. Also run `go test ./internal/volume/` on Windows (the seek-penalty test just checks it doesn't crash).
 - **Stage 3:** (a) `drivedex drives`, then `drivedex index E:` for a pen drive; `drivedex list`. (b) Unplug the drive and run `drivedex search <known file>` → result must show `[LABEL · offline · last seen E:]`. (c) Plug it into another port/letter → result shows the new letter. (d) `drivedex forget E:` removes only the index (check the drive's files are intact). Also run `go test ./internal/volume/` on Windows (checks `C:\` is NTFS with a serial).
 - **Stage 2:** `drivedex index <pen drive letter>` then `drivedex search <a file you know is on it>`; record the index time, the search time shown in the footer, and an Explorer search of the same drive (stopwatch).

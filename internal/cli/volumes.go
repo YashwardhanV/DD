@@ -22,15 +22,22 @@ var (
 // suggests refreshing it. (Becomes configurable in stage 11.)
 const staleAfter = 24 * time.Hour
 
+// phoneCheckTimeout bounds the "which phones are connected?" check that runs
+// during search/list, so a stuck adb can never make searching hang.
+const phoneCheckTimeout = 5 * time.Second
+
 // currentEnv works out what is connected right now, so results can show the
 // drive's CURRENT letter (found by serial number) or an "offline" marker.
-func currentEnv() index.Env {
+func currentEnv(wantPhones bool) index.Env {
 	env := index.Env{Mounts: map[string]string{}, Phones: map[string]bool{}}
 	vols, _ := listVolumes() // on error we simply know of no drives
 	for _, v := range vols {
 		if v.Ready && v.Serial != 0 {
 			env.Mounts[volume.SourceID(v)] = v.Root
 		}
+	}
+	if wantPhones {
+		phoneEnv(&env) // asks adb once; the answer is used for the whole command
 	}
 	return env
 }

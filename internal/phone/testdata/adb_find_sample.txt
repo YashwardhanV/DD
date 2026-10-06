@@ -1,0 +1,13 @@
+1048576|1700000000|/sdcard/DCIM/Camera/IMG_20240101_120000.jpg
+2048|1700000100|/sdcard/Download/My Report (final).pdf
+12|1700000200|/sdcard/Download/weird|name|with|pipes.txt
+345|1700000300|/sdcard/Documents/写真/फोटो.jpg
+0|1690000000|/sdcard/a/b/c/d/e/f/g/deep.txt
+this line is malformed
+
+notanumber|123|/sdcard/bad-size.txt
+100|abc|/sdcard/bad-time.txt
+-5|123|/sdcard/negative.txt
+7|1700000400|/sdcard/top.txt
+99|1700000500|/sdcard/DCIM/Camera/IMG_20240102_120000.jpg
+55|1700000600|/sdcard/DCIM/crlf.jpg

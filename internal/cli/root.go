@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -109,7 +110,8 @@ func printError(err error) {
 	if errors.As(err, &ue) {
 		fmt.Fprintf(os.Stderr, "Error: %s\n", ue.Msg)
 		if ue.Hint != "" {
-			fmt.Fprintf(os.Stderr, "  Fix: %s\n", ue.Hint)
+			// Multi-line hints (such as setup steps) keep their lines aligned under "Fix:".
+			fmt.Fprintf(os.Stderr, "  Fix: %s\n", strings.ReplaceAll(ue.Hint, "\n", "\n       "))
 		}
 		if flagDebug && ue.Err != nil {
 			fmt.Fprintf(os.Stderr, "  Details: %v\n", ue.Err)

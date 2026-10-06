@@ -75,7 +75,7 @@ func runSearch(stdout io.Writer, query string, f searchFlags) error {
 		return nil
 	}
 
-	env := currentEnv()
+	env := currentEnv(hasPhone(loaded.Indexes))
 	m := index.NewTermMatcher(query)
 	m.SourceID, m.OnlyFiles, m.OnlyDirs = f.source, f.filesOnly, f.dirsOnly
 	if f.drive != "" {
@@ -161,4 +161,14 @@ func printStaleTips(out io.Writer, indexes []*index.Index, m *index.TermMatcher,
 				root, ui.Ago(h.UpdatedAt, now), letter)))
 		}
 	}
+}
+
+// hasPhone reports whether any loaded index belongs to a phone.
+func hasPhone(indexes []*index.Index) bool {
+	for _, ix := range indexes {
+		if ix.Header.SourceKind == index.KindPhone {
+			return true
+		}
+	}
+	return false
 }
