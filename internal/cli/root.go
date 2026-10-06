@@ -6,9 +6,11 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"strings"
@@ -24,6 +26,7 @@ import (
 var (
 	flagDebug   bool
 	flagNoColor bool
+	flagPause   bool
 	rootTUI     tuiFlags // flags of plain `drivedex` (same as `drivedex tui`)
 )
 
@@ -52,12 +55,28 @@ func Execute(ctx context.Context, version string) int {
 	// Stop Windows popping up "There is no disk in the drive" for empty card readers.
 	volume.InitProcess()
 
-	root := NewRootCmd(version)
+	return executeRoot(ctx, NewRootCmd(version), os.Stdin, os.Stdout)
+}
+
+// executeRoot runs the command tree and returns the exit code. If --pause was
+// given it then waits for Enter, so a window opened by the Explorer right-click
+// menu doesn't vanish before the output can be read.
+func executeRoot(ctx context.Context, root *cobra.Command, in io.Reader, out io.Writer) int {
+	code := 0
 	if err := root.ExecuteContext(ctx); err != nil {
 		printError(err)
-		return 1
+		code = 1
 	}
-	return 0
+	if flagPause {
+		waitForEnter(in, out)
+	}
+	return code
+}
+
+// waitForEnter prints a prompt and waits for the user to press Enter.
+func waitForEnter(in io.Reader, out io.Writer) {
+	fmt.Fprint(out, "\nPress Enter to close…")
+	bufio.NewReader(in).ReadString('\n')
 }
 
 // NewRootCmd creates the `drivedex` command with all subcommands attached.
@@ -81,6 +100,7 @@ saved index instantly - even for drives that are not plugged in.`,
 	addTUIFlags(root, &rootTUI)
 	root.PersistentFlags().BoolVar(&flagDebug, "debug", false, "show technical details when something fails")
 	root.PersistentFlags().BoolVar(&flagNoColor, "no-color", false, "turn off colored output")
+	root.PersistentFlags().BoolVar(&flagPause, "pause", false, "wait for Enter before closing the window (used by the right-click menu)")
 
 	root.AddCommand(newVersionCmd(version))
 	root.AddCommand(newScanCmd())
@@ -95,6 +115,7 @@ saved index instantly - even for drives that are not plugged in.`,
 	root.AddCommand(newTUICmd())
 	root.AddCommand(newAgentCmd())
 	root.AddCommand(newStartupCmd())
+	root.AddCommand(newShellCmd())
 	return root
 }
 
