@@ -63,6 +63,12 @@ func fileName(sourceID string) string {
 // Path is where the index for sourceID lives.
 func (s *Store) Path(sourceID string) string { return filepath.Join(s.Dir, fileName(sourceID)) }
 
+// LockPath is the lock file used while an index is being rebuilt
+// ("<id>.lock" next to "<id>.ddx"). See the agent package for how it is used.
+func (s *Store) LockPath(sourceID string) string {
+	return strings.TrimSuffix(s.Path(sourceID), ".ddx") + ".lock"
+}
+
 // Save writes the index atomically and returns the file size.
 //
 // It writes to "<id>.ddx.tmp" and then renames over "<id>.ddx", so a crash or

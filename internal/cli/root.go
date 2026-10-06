@@ -93,6 +93,8 @@ saved index instantly - even for drives that are not plugged in.`,
 	root.AddCommand(newJournalCmd())
 	root.AddCommand(newCopyCmd())
 	root.AddCommand(newTUICmd())
+	root.AddCommand(newAgentCmd())
+	root.AddCommand(newStartupCmd())
 	return root
 }
 

@@ -14,6 +14,10 @@ go test ./...
 if ($LASTEXITCODE -ne 0) { throw "go test failed" }
 
 go build -trimpath -ldflags "-s -w -X main.version=$v" -o bin/drivedex.exe ./cmd/drivedex
-if ($LASTEXITCODE -ne 0) { throw "go build failed" }
+if ($LASTEXITCODE -ne 0) { throw "go build failed (drivedex)" }
 
-Write-Host "Built bin/drivedex.exe ($v)"
+# The background agent is a Windows GUI-subsystem program (-H=windowsgui) so it never shows a console window.
+go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=$v" -o bin/drivedex-agent.exe ./cmd/drivedex-agent
+if ($LASTEXITCODE -ne 0) { throw "go build failed (drivedex-agent)" }
+
+Write-Host "Built bin/drivedex.exe and bin/drivedex-agent.exe ($v)"

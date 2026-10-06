@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/yashwardhanv/dd/internal/agent"
 	"github.com/yashwardhanv/dd/internal/index"
 	"github.com/yashwardhanv/dd/internal/phone"
 	"github.com/yashwardhanv/dd/internal/scan"
@@ -72,6 +73,12 @@ func indexRoot(ctx context.Context, out io.Writer, root string, header index.Hea
 	if _, _, err := parseWorkers(opts.workers); err != nil { // reject a bad --workers before any slow work
 		return err
 	}
+	// Only one DriveDex process may rebuild a given index at a time (the
+	// background agent uses the same lock).
+	return withIndexLock(header.SourceID, header.Label, func() error { return indexRootLocked(ctx, out, root, header, opts) })
+}
+
+func indexRootLocked(ctx context.Context, out io.Writer, root string, header index.Header, opts scanOptions) error {
 	turbo, err := useTurbo(out, header, opts)
 	if err != nil {
 		return err
@@ -153,4 +160,31 @@ func scanFailure(display string, h index.Header, err error) error {
 			"unlock the phone, make sure USB debugging is allowed, then try again (run 'drivedex doctor' for a check-up)", err)
 	}
 	return userErr(fmt.Sprintf("indexing %s failed", display), "check the drive is connected and readable", err)
+}
+
+// withIndexLock runs fn while holding the lock for one index. If another
+// DriveDex process (perhaps the background agent) is already indexing the same
+// source, it explains instead of starting a second scan.
+func withIndexLock(sourceID, label string, fn func() error) error {
+	store, err := openStore()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(store.Dir, 0o755); err != nil {
+		return userErr("couldn't create the folder for saved indexes", "check the folder is writable: "+store.Dir, err)
+	}
+	release, err := agent.AcquireLock(store.LockPath(sourceID))
+	if errors.Is(err, agent.ErrLocked) {
+		name := label
+		if name == "" {
+			name = sourceID
+		}
+		return userErr(fmt.Sprintf("%s is already being indexed by another DriveDex process", name),
+			"wait a moment (the background agent may be doing it) and try again; a leftover lock expires after 10 minutes", err)
+	}
+	if err != nil {
+		return userErr("couldn't take the indexing lock", "check the index folder is writable: "+store.Dir, err)
+	}
+	defer release()
+	return fn()
 }

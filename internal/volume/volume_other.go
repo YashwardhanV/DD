@@ -12,3 +12,6 @@ func List() ([]Volume, error) { return nil, errors.ErrUnsupported }
 
 // ForPath is not available outside Windows.
 func ForPath(path string) (Volume, error) { return Volume{}, errors.ErrUnsupported }
+
+// ListLocal is not available outside Windows.
+func ListLocal() ([]Volume, error) { return nil, errors.ErrUnsupported }
