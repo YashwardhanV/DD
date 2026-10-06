@@ -1,0 +1,75 @@
+name: CI
+
+# On every push and pull request: vet, test and build on Windows (the platform
+# DriveDex is for). On a tag like v1.0.0 the build output is attached to a
+# GitHub Release.
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows - vet, test, build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # `git describe` needs the tags to name the version
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      - name: Build the programs and the release zips
+        shell: pwsh
+        run: ./scripts/build.ps1 -SkipChecks
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drivedex-windows
+          path: bin/*.zip
+          if-no-files-found: error
+
+  # The race detector needs CGO and a C compiler, which the Linux runner has.
+  # (DriveDex itself is built without CGO.) Windows-only code is skipped here;
+  # everything else - index, search, query, copier, scanners - is tested for data races.
+  race:
+    name: Linux - race detector
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: go test -race
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race ./...
+
+  release:
+    name: Attach zips to the GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, race]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload files
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: drivedex-windows
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true

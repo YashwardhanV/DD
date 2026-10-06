@@ -37,7 +37,7 @@ func loadActiveConfig() error {
 func commandsWithoutConfig(cmd *cobra.Command) bool {
 	for c := cmd; c != nil; c = c.Parent() {
 		switch c.Name() {
-		case "config", "doctor", "version", "help", "completion", "__complete":
+		case "config", "doctor", "version", "help", "completion", "__complete", "install", "uninstall":
 			return true
 		}
 	}

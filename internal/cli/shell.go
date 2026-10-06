@@ -94,6 +94,12 @@ func runShellInstall(out io.Writer, in io.Reader, yes bool) error {
 	if err != nil {
 		return userErr("couldn't find where drivedex.exe is", "run with --debug for details", err)
 	}
+	return installShellEntries(out, in, yes, exe)
+}
+
+// installShellEntries adds the right-click entries so that they run exe. (`drivedex
+// install` calls it with the copy it just installed, not with the program that is running.)
+func installShellEntries(out io.Writer, in io.Reader, yes bool, exe string) error {
 	if !yes {
 		fmt.Fprintln(out, `This adds these entries to the right-click menu (for your user only, under HKEY_CURRENT_USER\`+shellint.ClassesRoot+`):`)
 		for _, e := range shellint.Entries(exe) {
@@ -107,7 +113,7 @@ func runShellInstall(out io.Writer, in io.Reader, yes bool) error {
 			return nil
 		}
 	}
-	err = shellint.Install(newShellRegistry(), exe)
+	err := shellint.Install(newShellRegistry(), exe)
 	if shellUnsupported(err) != nil {
 		return shellUnsupported(err)
 	}

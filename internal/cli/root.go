@@ -128,6 +128,8 @@ saved index instantly - even for drives that are not plugged in.`,
 	root.AddCommand(newShellCmd())
 	root.AddCommand(newDoctorCmd(version))
 	root.AddCommand(newConfigCmd())
+	root.AddCommand(newInstallCmd(version))
+	root.AddCommand(newUninstallCmd())
 	return root
 }
 

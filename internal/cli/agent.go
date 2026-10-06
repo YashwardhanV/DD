@@ -99,6 +99,12 @@ func runAgentStart(out io.Writer) error {
 	if err != nil {
 		return userErr("the background agent program wasn't found", "it should sit next to drivedex.exe - run scripts\\build.ps1 again, or reinstall DriveDex", err)
 	}
+	return startAgentProgram(out, dir, exe)
+}
+
+// startAgentProgram launches the agent at exe and waits for it to report in.
+// (`drivedex install` uses it to start the freshly installed copy.)
+func startAgentProgram(out io.Writer, dir, exe string) error {
 	if err := agentStart(exe); err != nil {
 		return userErr("couldn't start the background agent", "run with --debug for details", err)
 	}
@@ -238,6 +244,12 @@ func runStartupEnable(out io.Writer, in io.Reader, elevated, yes bool) error {
 	if err != nil {
 		return userErr("the background agent program wasn't found", "it should sit next to drivedex.exe - run scripts\\build.ps1 again, or reinstall DriveDex", err)
 	}
+	return enableStartup(out, in, elevated, yes, exe)
+}
+
+// enableStartup makes the agent at exe start at log-in. (`drivedex install`
+// calls it with the agent it just installed.)
+func enableStartup(out io.Writer, in io.Reader, elevated, yes bool, exe string) error {
 	if !yes {
 		if elevated {
 			fmt.Fprintln(out, "This creates a Windows scheduled task that starts the DriveDex agent with ADMINISTRATOR rights every time you log in.")
@@ -254,7 +266,7 @@ func runStartupEnable(out io.Writer, in io.Reader, elevated, yes bool) error {
 			return nil
 		}
 	}
-	err = agent.Enable(newStartupRegistry(), newStartupTasks(), exe, elevated)
+	err := agent.Enable(newStartupRegistry(), newStartupTasks(), exe, elevated)
 	switch {
 	case startupUnsupported(err) != nil:
 		return startupUnsupported(err)
