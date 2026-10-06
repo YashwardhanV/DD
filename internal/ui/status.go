@@ -29,6 +29,9 @@ type StatusLine struct {
 
 // NewStatusLine returns a status line writing to f (normally os.Stderr).
 func NewStatusLine(f *os.File) *StatusLine {
+	if f == nil {
+		return &StatusLine{} // permanently disabled
+	}
 	return &StatusLine{w: f, enabled: IsTerminal(f)}
 }
 

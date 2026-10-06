@@ -83,3 +83,27 @@ func lastSeenLetter(lastMount string) string {
 	}
 	return strings.TrimRight(lastMount, `\/`)
 }
+
+// DisplaySplit is DisplayPath cut into two parts for a two-colour display: the
+// FOLDER part (always ending in a separator) and the file NAME. For example
+// `E:\Docs\Jobs\` and `Resume.pdf`; for an unplugged drive
+// `[SANDISK 32GB · offline · last seen E:] \Old\` and `resume_old.pdf`.
+func DisplaySplit(h *Header, rel string, env Env) (dir, name string) {
+	parent, name := "", rel
+	if i := strings.LastIndexByte(rel, '\\'); i >= 0 {
+		parent, name = rel[:i], rel[i+1:]
+	}
+	dir = DisplayPath(h, parent, env)
+	dir = strings.TrimSuffix(dir, " · offline") // the row shows offline-ness itself
+	sep := string(filepath.Separator)
+	switch {
+	case h.SourceKind == KindPhone:
+		sep = "/"
+	case h.SourceKind == KindVolume && !env.Online(h):
+		sep = `\` // an unplugged drive's path is always shown Windows-style
+	}
+	if !strings.HasSuffix(dir, sep) && !strings.HasSuffix(dir, `\`) && !strings.HasSuffix(dir, "/") {
+		dir += sep
+	}
+	return dir, name
+}

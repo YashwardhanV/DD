@@ -86,12 +86,12 @@ func indexRoot(ctx context.Context, out io.Writer, root string, header index.Hea
 		return err
 	}
 	fmt.Fprintln(out, ui.Dim(note))
-	return runIndexJob(ctx, out, header, scanner, root)
+	return runIndexJob(ctx, out, header, scanner, root, opts.quiet)
 }
 
 // runIndexJob is the part every kind of source shares: run the scanner, save
 // the index atomically, and report. display is what to call the source in messages.
-func runIndexJob(ctx context.Context, out io.Writer, header index.Header, scanner scan.Scanner, display string) error {
+func runIndexJob(ctx context.Context, out io.Writer, header index.Header, scanner scan.Scanner, display string, quiet bool) error {
 	store, err := openStore()
 	if err != nil {
 		return err
@@ -107,6 +107,9 @@ func runIndexJob(ctx context.Context, out io.Writer, header index.Header, scanne
 	builder := index.NewBuilder(header)
 
 	status := ui.NewStatusLine(os.Stderr)
+	if quiet {
+		status = ui.NewStatusLine(nil) // disabled: something else owns the screen
+	}
 	start := time.Now()
 	err = scanner.Scan(ctx, builder, func(p scan.Progress) {
 		status.Update(fmt.Sprintf("Indexing %s … %s entries (%s/s)",

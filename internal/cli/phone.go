@@ -59,7 +59,7 @@ func runIndexPhone(ctx context.Context, out io.Writer, serial string) error {
 	header := phoneHeader(dev)
 	scanner := phone.NewScanner(adb, dev.Serial, phone.DefaultRoot)
 	fmt.Fprintln(out, ui.Dim(fmt.Sprintf("Reading the file list straight from %s over USB debugging…", dev.Name())))
-	return runIndexJob(ctx, out, header, scanner, "phone "+dev.Name())
+	return runIndexJob(ctx, out, header, scanner, "phone "+dev.Name(), false)
 }
 
 // phoneSelectionError explains why no phone could be chosen.

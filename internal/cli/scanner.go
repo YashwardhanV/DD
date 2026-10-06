@@ -21,6 +21,7 @@ type scanOptions struct {
 	workers      string // auto | a number
 	withMetadata bool   // NTFS turbo mode: also read every size and date
 	full         bool   // NTFS turbo mode: skip the incremental refresh
+	quiet        bool   // no live status line (used while the full-screen UI owns the terminal)
 }
 
 // addScanFlags registers --mode, --workers and the turbo-mode flags on a command.

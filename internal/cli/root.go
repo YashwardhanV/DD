@@ -24,6 +24,7 @@ import (
 var (
 	flagDebug   bool
 	flagNoColor bool
+	rootTUI     tuiFlags // flags of plain `drivedex` (same as `drivedex tui`)
 )
 
 // UserError is an error that is safe to show to the owner as-is: one friendly
@@ -69,11 +70,15 @@ saved index instantly - even for drives that are not plugged in.`,
 		// We print errors ourselves (see printError) so they are friendly.
 		SilenceErrors: true,
 		SilenceUsage:  true,
+		// `drivedex` with no arguments opens the interactive search.
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error { return startTUI(cmd.Context(), rootTUI) },
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
 			ui.SetColor(!flagNoColor)
 		},
 	}
 
+	addTUIFlags(root, &rootTUI)
 	root.PersistentFlags().BoolVar(&flagDebug, "debug", false, "show technical details when something fails")
 	root.PersistentFlags().BoolVar(&flagNoColor, "no-color", false, "turn off colored output")
 
@@ -87,6 +92,7 @@ saved index instantly - even for drives that are not plugged in.`,
 	root.AddCommand(newBenchScanCmd())
 	root.AddCommand(newJournalCmd())
 	root.AddCommand(newCopyCmd())
+	root.AddCommand(newTUICmd())
 	return root
 }
 

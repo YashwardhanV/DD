@@ -124,7 +124,7 @@ func indexMFT(ctx context.Context, out io.Writer, root string, header index.Head
 	// 2. Full MFT scan.
 	sc := &ntfs.MFTScanner{Session: sess, Root: root, WithMetadata: opts.withMetadata}
 	fmt.Fprintln(out, ui.Dim("Using NTFS turbo mode (reading the master file table)"))
-	err = runIndexJob(ctx, out, header, sc, root)
+	err = runIndexJob(ctx, out, header, sc, root, opts.quiet)
 	switch {
 	case err == nil:
 		printTurboNotes(out, root, sc, opts)
