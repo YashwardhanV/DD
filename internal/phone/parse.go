@@ -2,6 +2,7 @@ package phone
 
 import (
 	"fmt"
+	"path"
 	"strconv"
 	"strings"
 
@@ -53,12 +54,28 @@ func (p *Parser) malformed(line string) {
 
 // relPath removes the scanned root from a remote path.
 func (p *Parser) relPath(remote string) string {
-	if rel, ok := strings.CutPrefix(remote, p.prefix); ok {
-		return rel
+	rel, ok := strings.CutPrefix(remote, p.prefix)
+	if !ok {
+		// find sometimes prints the root itself without the trailing slash, or a
+		// path under a differently-spelled root; keep what we can.
+		rel = remote
 	}
-	// find sometimes prints the root itself without the trailing slash, or a
-	// path under a differently-spelled root; keep what we can.
-	return strings.TrimLeft(remote, "/")
+	return cleanRel(rel)
+}
+
+// cleanRel tidies a path relative to the root: "a//b", "./a" and "a/../b"
+// would otherwise create folders with empty or "."/".." names. A path that
+// ends in "/" keeps that slash, so addFile can see it isn't a file.
+func cleanRel(rel string) string {
+	if rel == "" {
+		return ""
+	}
+	trailing := strings.HasSuffix(rel, "/")
+	c := strings.TrimLeft(path.Clean("/"+rel), "/")
+	if trailing && c != "" {
+		c += "/"
+	}
+	return c
 }
 
 // ParseStatLine handles one line of `stat -c '%s|%Y|%n'`: size|mtime|path.

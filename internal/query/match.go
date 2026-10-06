@@ -151,15 +151,12 @@ func (m *Matcher) Match(ix *index.Index, slot int) bool {
 // the plain words; a query of only filters ranks everything equally).
 func (m *Matcher) Score(ix *index.Index, slot int) int { return m.scorer.Score(ix, slot) }
 
-// hasExt reports whether the lowercase file name ends in one of the extensions.
+// hasExt reports whether the lowercase file name ends in one of the
+// extensions. Multi-part extensions work too: ext:tar.gz matches
+// "backup.tar.gz".
 func hasExt(lowerName string, exts []string) bool {
-	dot := strings.LastIndexByte(lowerName, '.')
-	if dot < 0 || dot == len(lowerName)-1 {
-		return false
-	}
-	ext := lowerName[dot+1:]
 	for _, e := range exts {
-		if ext == e {
+		if len(lowerName) >= len(e)+1 && strings.HasSuffix(lowerName, e) && lowerName[len(lowerName)-len(e)-1] == '.' {
 			return true
 		}
 	}

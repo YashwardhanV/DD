@@ -203,3 +203,16 @@ func TestMarshalRoundTrips(t *testing.T) {
 		t.Errorf("round trip: %+v %v\n%s", cfg, err, text)
 	}
 }
+
+// A huge stale_after in days used to overflow into a NEGATIVE duration, which
+// made every index count as stale - the opposite of what was asked.
+func TestHugeStaleAfterMeansNeverStale(t *testing.T) {
+	for _, s := range []string{"300000d", "1e10d", "Infd"} {
+		c := Defaults()
+		c.StaleAfter = s
+		d, err := c.StaleDuration()
+		if err != nil || d < 100*365*24*time.Hour {
+			t.Errorf("stale_after %q = %v, %v; want a huge positive duration", s, d, err)
+		}
+	}
+}

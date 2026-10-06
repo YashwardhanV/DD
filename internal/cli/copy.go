@@ -315,6 +315,10 @@ func resolveDestination(arg string) (string, error) {
 }
 
 func planError(srcArg string, err error) error {
+	if errors.Is(err, copier.ErrDestinationInsideSource) {
+		return userErr(fmt.Sprintf("can't copy %s into itself", srcArg),
+			"choose a destination folder outside the folder being copied", err)
+	}
 	if errors.Is(err, copier.ErrRemoteNotFound) {
 		return userErr(fmt.Sprintf("%s doesn't exist on the phone", srcArg),
 			"paths are relative to the phone's storage, e.g. phone:/DCIM/Camera; search with 'drivedex search' to find the exact folder", err)

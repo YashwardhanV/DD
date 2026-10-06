@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -242,7 +243,12 @@ func (c Config) StaleDuration() (time.Duration, error) {
 	if strings.HasSuffix(s, "d") {
 		var days float64
 		if _, err := fmt.Sscanf(strings.TrimSuffix(s, "d"), "%g", &days); err == nil && days >= 0 {
-			return time.Duration(days * float64(24*time.Hour)), nil
+			// More days than a Duration can hold (about 106,000) would wrap
+			// around to a negative age; such a setting means "never stale".
+			if d := days * float64(24*time.Hour); d < math.MaxInt64 {
+				return time.Duration(d), nil
+			}
+			return time.Duration(math.MaxInt64), nil
 		}
 	}
 	d, err := time.ParseDuration(s)

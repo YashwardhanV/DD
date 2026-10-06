@@ -185,6 +185,9 @@ func (f *FS) pull(ctx context.Context, args []string) (string, error) {
 			continue
 		}
 		dst := filepath.Join(local, path.Base(r))
+		if st, err := os.Stat(local); len(remotes) == 1 && (err != nil || !st.IsDir()) {
+			dst = local // like adb: one file pulled to a path that isn't a folder is saved under that name
+		}
 		if err := os.WriteFile(dst, []byte(file.Content), 0o644); err != nil {
 			return "", err
 		}

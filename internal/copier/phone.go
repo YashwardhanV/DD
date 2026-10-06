@@ -62,7 +62,7 @@ func PlanPhone(ctx context.Context, adb *phone.ADB, serial, remote, dstRoot, pol
 	}
 
 	if !info.IsDir {
-		job := Job{Src: remote, Rel: path.Base(remote), Size: info.Size, ModTime: info.ModTime}
+		job := Job{Src: remote, Rel: SafeName(path.Base(remote)), Size: info.Size, ModTime: info.ModTime}
 		plan := finalize(dstRoot, nil, []Job{job}, policy, 1)
 		plan.Phone = src
 		return plan, nil
@@ -76,12 +76,13 @@ func PlanPhone(ctx context.Context, adb *phone.ADB, serial, remote, dstRoot, pol
 	}
 	ix := b.Index()
 
+	name = SafeName(name)
 	dirs := []string{name}
 	var jobs []Job
 	cache := map[uint64]string{}
 	for slot := 0; slot < ix.Len(); slot++ {
 		relBack := ix.RelPathCached(slot, cache)
-		rel := filepath.Join(name, strings.ReplaceAll(relBack, `\`, string(filepath.Separator)))
+		rel := filepath.Join(name, SafeRel(relBack))
 		if ix.Flags[slot]&index.FlagDir != 0 {
 			dirs = append(dirs, rel)
 			continue
@@ -105,9 +106,14 @@ type pullBatch struct{ items []*Item }
 // each group into batches that respect the command-line limits.
 func makeBatches(p *Plan) []pullBatch {
 	groups := map[string][]*Item{}
+	var batches []pullBatch
 	for i := range p.Items {
 		it := &p.Items[i]
 		if it.Decision.Skipped() || it.Blocked != "" {
+			continue
+		}
+		if base := path.Base(it.Src); SafeName(base) != base {
+			batches = append(batches, pullBatch{items: []*Item{it}}) // pulled alone, to a safe name
 			continue
 		}
 		dir := path.Dir(it.Src)
@@ -119,7 +125,6 @@ func makeBatches(p *Plan) []pullBatch {
 	}
 	sort.Strings(dirs)
 
-	var batches []pullBatch
 	for _, d := range dirs {
 		var cur pullBatch
 		chars := 0
@@ -250,13 +255,23 @@ func pullAndPlace(ctx context.Context, p *Plan, files []*Item, st *state) (faile
 	for i, it := range files {
 		srcs[i] = it.Src
 	}
-	err = p.Phone.ADB.Pull(ctx, p.Phone.Serial, srcs, staging)
+	// A name Windows can't store (such as "a:b.jpg") is pulled on its own, to
+	// an explicit safe local name; makeBatches gives such files a batch each.
+	unsafe := len(files) == 1 && SafeName(path.Base(files[0].Src)) != path.Base(files[0].Src)
+	if unsafe {
+		err = p.Phone.ADB.PullFile(ctx, p.Phone.Serial, files[0].Src, filepath.Join(staging, SafeName(path.Base(files[0].Src))))
+	} else {
+		err = p.Phone.ADB.Pull(ctx, p.Phone.Serial, srcs, staging)
+	}
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
 
 	for _, it := range files {
 		staged := filepath.Join(staging, path.Base(it.Src))
+		if unsafe {
+			staged = filepath.Join(staging, SafeName(path.Base(it.Src)))
+		}
 		info, statErr := os.Stat(staged)
 		if statErr != nil || info.IsDir() {
 			failed = append(failed, it)
@@ -281,8 +296,15 @@ func pullAndPlace(ctx context.Context, p *Plan, files []*Item, st *state) (faile
 // PlanPhoneJobs plans pulling an explicit list of files (for example every
 // search match on one phone) into dstRoot. Each Job.Src must be an absolute
 // path on the phone.
+//
+// Each Job.Rel is made safe for Windows (see SafeRel): phone file names may
+// contain characters such as ':' that Windows doesn't allow.
 func PlanPhoneJobs(adb *phone.ADB, serial string, jobs []Job, dstRoot, policy string, workers int) *Plan {
-	plan := finalize(dstRoot, nil, append([]Job(nil), jobs...), policy, workers)
+	jobs = append([]Job(nil), jobs...)
+	for i := range jobs {
+		jobs[i].Rel = SafeRel(jobs[i].Rel)
+	}
+	plan := finalize(dstRoot, nil, jobs, policy, workers)
 	plan.Phone = &PhoneSource{ADB: adb, Serial: serial}
 	return plan
 }
@@ -303,4 +325,59 @@ func PhonePathRoot(p, root string) string {
 		root = "/sdcard"
 	}
 	return path.Clean(root + p)
+}
+
+// SafeName makes one phone file or folder name storable on Windows. Android
+// allows names Windows doesn't: a ':' would even silently write an NTFS
+// "alternate data stream" instead of a file. So:
+//
+//   - < > : " | ? * \ and control characters become '_'
+//   - trailing dots and spaces (which Windows strips) become '_'
+//   - reserved device names (CON, NUL, COM1, LPT1, ... even with an
+//     extension, like "aux.txt") get a '_' in front
+//
+// A name that is already fine is returned unchanged.
+func SafeName(name string) string {
+	var b strings.Builder
+	changed := false
+	for _, r := range name {
+		if r < 0x20 || strings.ContainsRune(`<>:"|?*\`, r) {
+			b.WriteByte('_')
+			changed = true
+			continue
+		}
+		b.WriteRune(r)
+	}
+	s := name
+	if changed {
+		s = b.String()
+	}
+	if t := strings.TrimRight(s, ". "); t != s {
+		s = t + strings.Repeat("_", len(s)-len(t))
+	}
+	if s == "" {
+		return "_"
+	}
+	stem := s
+	if i := strings.IndexByte(stem, '.'); i >= 0 {
+		stem = stem[:i]
+	}
+	switch strings.ToUpper(strings.TrimRight(stem, " ")) {
+	case "CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
+		s = "_" + s
+	}
+	return s
+}
+
+// SafeRel applies SafeName to every part of a relative path (separated by
+// this OS's separator or by the index's `\`) and joins them with this OS's
+// separator.
+func SafeRel(rel string) string {
+	parts := strings.FieldsFunc(rel, func(r rune) bool { return r == '\\' || r == filepath.Separator })
+	for i, p := range parts {
+		parts[i] = SafeName(p)
+	}
+	return filepath.Join(parts...)
 }

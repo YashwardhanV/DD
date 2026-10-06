@@ -7,6 +7,7 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -55,8 +56,15 @@ func HumanSizeU(n uint64) string {
 		v /= unit
 		i++
 	}
+	// Rounding can carry into the next unit: 1,048,575 bytes is 1023.999 KB,
+	// which must print as "1.0 MB", not "1024 KB".
+	if math.Round(v) >= unit && i < len(units)-1 {
+		v /= unit
+		i++
+	}
 	// Small numbers get one decimal ("4.2 MB"); big ones don't ("212 KB").
-	if v < 100 {
+	// (99.96 rounds to 100, so it is a big one: "100 KB", not "100.0 KB".)
+	if math.Round(v*10) < 1000 {
 		return fmt.Sprintf("%.1f %s", v, units[i])
 	}
 	return fmt.Sprintf("%.0f %s", v, units[i])

@@ -19,6 +19,7 @@ package query
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -254,7 +255,17 @@ func parseSizeValue(s string) (int64, error) {
 		return 0, fmt.Errorf("can't understand the size %q in size: - try size:>100mb, size:<1kb or size:10mb..1gb", s)
 	}
 	n, _ := strconv.ParseFloat(m[1], 64)
-	return int64(n * sizeUnits[strings.ToLower(m[2])]), nil
+	return saturate(n * sizeUnits[strings.ToLower(m[2])]), nil
+}
+
+// saturate converts a non-negative float to int64, capping it at MaxInt64.
+// (Converting a too-big float straight to int64 gives a garbage - often
+// negative - number, which would turn size:>99999tb into "every file".)
+func saturate(f float64) int64 {
+	if f >= math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(f)
 }
 
 // parseSize understands >100mb  <1kb  >=1gb  <=5mb  =0  10mb..1gb  ..1gb  10mb..
@@ -291,6 +302,9 @@ func parseSize(v string) (*Range, error) {
 	}
 	switch op {
 	case ">":
+		if n == math.MaxInt64 { // nothing is bigger; n+1 would wrap around to "everything"
+			return &Range{Min: n, Max: n - 1, HasMin: true, HasMax: true}, nil
+		}
 		return &Range{Min: n + 1, HasMin: true}, nil
 	case ">=":
 		return &Range{Min: n, HasMin: true}, nil
@@ -354,8 +368,11 @@ func parseModified(v string, now time.Time) (*Range, error) {
 
 	if m := relativeRe.FindStringSubmatch(val); m != nil {
 		n, _ := strconv.ParseFloat(m[1], 64)
-		unit := map[string]time.Duration{"h": time.Hour, "d": 24 * time.Hour, "w": 7 * 24 * time.Hour}[strings.ToLower(m[2])]
-		cutoff := now.Add(-time.Duration(n * float64(unit))).Unix()
+		unit := map[string]float64{"h": 3600, "d": 24 * 3600, "w": 7 * 24 * 3600}[strings.ToLower(m[2])]
+		// Count back in seconds, not time.Duration: a Duration tops out at
+		// about 292 years, so modified:<300000d would silently mean "<292 years".
+		// Half of MaxInt64 seconds is far beyond any date and can't overflow.
+		cutoff := now.Unix() - min(saturate(n*unit), math.MaxInt64/2)
 		switch op {
 		case "<", "<=": // younger than N days: modified AFTER the cutoff
 			return &Range{Min: cutoff, HasMin: true}, nil

@@ -124,3 +124,23 @@ func TestHumanPairAndRate(t *testing.T) {
 		}
 	}
 }
+
+// Rounding used to stop at the unit boundary: "1024 KB" instead of "1.0 MB",
+// and "100.0 KB" instead of "100 KB".
+func TestHumanSizeRoundsAcrossUnits(t *testing.T) {
+	for n, want := range map[int64]string{
+		1048575:             "1.0 MB",
+		1048524:             "1.0 MB",
+		1<<30 - 1:           "1.0 GB",
+		102349:              "100 KB",
+		102300:              "99.9 KB",
+		1023:                "1023 B",
+		1024:                "1.0 KB",
+		1 << 60:             "1024 PB",
+		9223372036854775807: "8192 PB",
+	} {
+		if got := HumanSize(n); got != want {
+			t.Errorf("HumanSize(%d) = %q, want %q", n, got, want)
+		}
+	}
+}

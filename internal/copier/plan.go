@@ -264,6 +264,10 @@ func PlanLocal(ctx context.Context, src, dstRoot, policy string, workers int) (*
 		return finalize(dstRoot, nil, []Job{job}, policy, 1), nil
 	}
 
+	if inside(src, dstRoot) {
+		return nil, fmt.Errorf("%w: %s is inside %s", ErrDestinationInsideSource, dstRoot, src)
+	}
+
 	name := srcName(src)
 	sc := scan.NewParallel(src, workers)
 	b := index.NewBuilder(index.Header{})
@@ -289,6 +293,21 @@ func PlanLocal(ctx context.Context, src, dstRoot, policy string, workers int) (*
 		})
 	}
 	return finalize(dstRoot, dirs, jobs, policy, workers), nil
+}
+
+// ErrDestinationInsideSource means a folder would be copied into itself (or
+// one of its own sub-folders). Explorer refuses that too: every run would copy
+// the previous copy again, nesting one level deeper each time.
+var ErrDestinationInsideSource = errors.New("the destination is inside the folder being copied")
+
+// inside reports whether path is dir itself or somewhere below it. (On Windows
+// filepath.Rel ignores case, as the file system does.)
+func inside(dir, path string) bool {
+	rel, err := filepath.Rel(filepath.Clean(dir), filepath.Clean(path))
+	if err != nil || filepath.IsAbs(rel) {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 // PlanJobs plans copying an explicit list of files (for example every match of

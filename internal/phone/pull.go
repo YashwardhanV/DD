@@ -57,3 +57,15 @@ func (a *ADB) Pull(ctx context.Context, serial string, remotes []string, localDi
 	}
 	return nil
 }
+
+// PullFile copies ONE file from the phone to the local file path localFile
+// (which may have a different name than on the phone) with `adb pull -a`.
+func (a *ADB) PullFile(ctx context.Context, serial, remote, localFile string) error {
+	if _, err := a.run.Output(ctx, "-s", serial, "pull", "-a", remote, localFile); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("adb pull: %w", err)
+	}
+	return nil
+}

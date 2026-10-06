@@ -52,6 +52,22 @@ func copyMatches(ctx context.Context, in io.Reader, out *bufio.Writer, indexes [
 		return err
 	}
 
+	// Two drives can have the same label (many pen drives are just "USB
+	// DRIVE"). Their files must not land in one folder and overwrite each
+	// other, so a shared name gets the drive's id added - for every index
+	// with that name, so the folder doesn't depend on which drive matched first.
+	nameCount := map[string]int{}
+	for _, ix := range indexes {
+		nameCount[strings.ToLower(sourceDirName(&ix.Header))]++
+	}
+	dirName := func(h *index.Header) string {
+		name := sourceDirName(h)
+		if nameCount[strings.ToLower(name)] > 1 {
+			name += " (" + strings.Trim(invalidNameChars.Replace(h.SourceID), ". ") + ")"
+		}
+		return name
+	}
+
 	groups := map[int]*copyGroup{} // by index position
 	var folders, offline, unreadable int
 	offlineNames := map[string]bool{}
@@ -64,7 +80,7 @@ func copyMatches(ctx context.Context, in io.Reader, out *bufio.Writer, indexes [
 		}
 		g := groups[h.Index]
 		if g == nil {
-			g = &copyGroup{index: ix, label: sourceDirName(hd)}
+			g = &copyGroup{index: ix, label: dirName(hd)}
 			if hd.SourceKind == index.KindPhone {
 				g.serial = strings.TrimPrefix(hd.SourceID, "adb-")
 			}

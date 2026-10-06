@@ -20,6 +20,29 @@ Legend: `[x]` done and verified · `[~]` code complete and tested in the cloud c
 ## Current status
 Stage: 12 code complete (owner checks pending) — all 13 stages are built. Next: the owner runs the hardware checks below, then decides on tagging `v1.0.0` (not tagged: BUILD.md says ask first).
 
+## Stress test (2026-10-06)
+A hardening pass after stage 12: fuzzing, adversarial unit tests, a randomized cancel/resume stress test and an end-to-end run on 200,000 files. **9 bugs found and fixed**, each with a test that fails on the old code and passes now:
+
+| # | Bug | Effect | Test |
+|---|-----|--------|------|
+| 1 | `drivedex copy E:\Photos E:\Photos\Backup` was allowed | every re-run copied the previous copy again, one level deeper (`Backup\Photos\Backup\Photos\...`), so "resume" never finished. Now refused, like Explorer: *can't copy ... into itself* | `TestCopyRefusesADestinationInsideTheSource`, `TestPlanLocalRefusesCopyingIntoItself` |
+| 2 | `search --copy-to` put two drives with the same label (e.g. two "USB DRIVE" pen drives) into one folder | same-named files overwrote/skipped each other. A shared label now gets the drive id added: `USB DRIVE (vol-1A2B3C4D)` | `TestSearchCopyToKeepsSameLabelSourcesApart` |
+| 3 | Phone file names Windows can't store (`meeting 10:30.txt`, `what?.txt`, `con.txt`) were copied as-is | a `:` on NTFS silently writes an *alternate data stream* of a file called `meeting 10` instead of the file; `?`/`*` failed. Now `<>:"\|?*`, backslashes, control chars and trailing dots/spaces become `_`, device names get a `_` prefix, and such files are pulled one at a time to the safe name (`adb pull -a <remote> <local file>`) | `TestPhoneCopyMakesNamesSafeForWindows`, `TestSafeName` |
+| 4 | `size:>99999999999tb` / `size:>9223372036854775807` overflowed int64 | wrapped round to a negative minimum: matched **every** file instead of none | `TestHugeSizesDoNotWrapAround` |
+| 5 | `modified:<300000d` overflowed `time.Duration` (max ~292 years) | silently meant "< 292 years" | `TestHugeRelativeDates` |
+| 6 | `ext:tar.gz` compared only the text after the last dot | multi-part extensions never matched anything | `TestMultiPartExtensions` |
+| 7 | Phone listings with `//`, `./` or `../` in a path (found by the fuzzer) | folders with an empty name (shown as `DCIM\\Camera`), and two spellings of one folder became two folders | `TestOddPathSpellingsShareOneFolder`, `FuzzParser` |
+| 8 | `stale_after = "300000d"` (meant as "never") overflowed to a negative duration | every index was reported stale on every run | `TestHugeStaleAfterMeansNeverStale` |
+| 9 | Sizes at a unit boundary printed as `1024 KB` / `100.0 KB` | should be `1.0 MB` / `100 KB` | `TestHumanSizeRoundsAcrossUnits` |
+
+What was run (all in the cloud container, Linux, Go 1.26):
+- **Fuzzing** (new `Fuzz*` tests; their seeds also run on every `go test`): `.ddx` index reader (`FuzzRead`, ~4M inputs - corrupt files always give `ErrCorruptIndex`, never a panic, and anything that loads round-trips), NTFS USN record parser (`FuzzParseRecords`, ~5.4M), phone `find`/`stat` parser (`FuzzParser`, ~4.4M after the fix) and `adb devices` parser (`FuzzParseDevices`, ~4.8M), query language (`FuzzParse`, ~1M twice). Run one with e.g. `go test ./internal/index -run '^$' -fuzz FuzzRead -fuzztime 60s`.
+- **Randomized cancel/resume stress** (`TestStressCancelAndResume`, skipped with `-short`): 1,500 files sized around the 1 MB copy buffer (0, 1, 1 MB-1, 1 MB, 1 MB+1, 3 MB+7 bytes, random), copy cancelled at a random file 4 times (with and without `--verify`), then completed: byte-identical, no `.ddxpart` leftovers, a re-run writes nothing. Passed 3x under `-race`.
+- **End-to-end with the real binary, 200,000-file fixture** (202,720 entries): walk and parallel scanners both indexed exactly what `find` sees (1.0 s / 352 ms); 11 queries (`ext:`, `type:`, `size:` ranges, `!word`, `re:`, `modified:`, `path:`) returned exactly the same counts as an independent Python implementation; full copy interrupted with Ctrl+C after 14,695 files, re-run copied the remaining 185,305 → `diff -r` identical, third run "Everything is already there"; 25 files edited → `--dry-run` said "overwrite 25", `--verify` copied exactly those; `search ext:jpg --copy-to` copied all 49,550 matches; corrupted / truncated / empty `.ddx` files → a warning with the fix, other indexes still searched, `list` shows `(unreadable)`.
+- Whole suite: `go vet` (linux, windows/amd64, windows/arm64), `go test ./...` 4x (3x with `-shuffle=on`), `go test -race ./...`, Windows cross-builds of both programs and of the test binaries.
+
+Noticed but left alone (not bugs, or not worth the code): `doctor` reports "N indexes saved" without flagging an unreadable one (`list` and every search already do); a phone file named `a:b.jpg` and another named `a_b.jpg` in the same folder would map to the same Windows name.
+
 ## Decisions
 - 2026-10-06: module path = `github.com/yashwardhanv/dd` (matches the actual GitHub repo `YashwardhanV/DD`, so `go install` paths work). BUILD.md suggested `github.com/<user>/drivedex`.
 - 2026-10-06: repo layout from BUILD.md section 6 lives at the repo root (not inside a `drivedex/` subfolder).
