@@ -1,6 +1,7 @@
 package phone
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"strings"
@@ -111,5 +112,27 @@ func TestDeviceHints(t *testing.T) {
 	}
 	if SourceID("R58") != "adb-R58" {
 		t.Error("SourceID")
+	}
+}
+
+func TestVersionReturnsFirstLine(t *testing.T) {
+	var got []string
+	adb := NewADBWithRunner(runnerFunc(func(ctx context.Context, args ...string) ([]byte, error) {
+		got = args
+		return []byte("Android Debug Bridge version 1.0.41\r\nVersion 35.0.2-12147458\r\nInstalled as C:\\adb.exe\r\n"), nil
+	}))
+	v, err := adb.Version(context.Background())
+	if err != nil || v != "Android Debug Bridge version 1.0.41" {
+		t.Errorf("v=%q err=%v", v, err)
+	}
+	if len(got) != 1 || got[0] != "version" {
+		t.Errorf("args = %v", got)
+	}
+}
+
+func TestVersionError(t *testing.T) {
+	adb := NewADBWithRunner(runnerFunc(func(context.Context, ...string) ([]byte, error) { return nil, errors.New("not running") }))
+	if _, err := adb.Version(context.Background()); err == nil {
+		t.Error("an adb failure must be reported")
 	}
 }

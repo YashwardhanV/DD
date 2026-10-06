@@ -23,6 +23,10 @@ func newJournalCmd() *cobra.Command {
 journal"). DriveDex reads that diary to refresh an index in milliseconds. These
 commands show whether a drive has one and let you switch it on. They need an
 Administrator terminal.`,
+		Example: `  drivedex journal status C:
+  drivedex journal enable E:`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error { return cmd.Help() },
 	}
 	cmd.AddCommand(newJournalStatusCmd(), newJournalEnableCmd())
 	return cmd
@@ -30,10 +34,14 @@ Administrator terminal.`,
 
 func newJournalStatusCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:     "status <drive>",
-		Short:   "Show whether a drive's change journal is on",
-		Example: `  drivedex journal status C:`,
-		Args:    cobra.ExactArgs(1),
+		Use:   "status <drive>",
+		Short: "Show whether a drive's change journal is on",
+		Long: `Reports whether the NTFS drive has an active change journal, and if so its
+size and position. Needs an Administrator terminal because Windows only lets
+administrators open a drive for raw reading.`,
+		Example: `  drivedex journal status C:
+  drivedex journal status E:`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runJournalStatus(cmd.OutOrStdout(), args[0])
 		},
@@ -48,8 +56,9 @@ func newJournalEnableCmd() *cobra.Command {
 		Long: `Creates the NTFS change journal on a drive that doesn't have one, so DriveDex
 can use turbo mode and fast refreshes there. It adds a small (32 MB) change log
 to the drive's file system.`,
-		Example: `  drivedex journal enable E:`,
-		Args:    cobra.ExactArgs(1),
+		Example: `  drivedex journal enable E:
+  drivedex journal enable E: --yes`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runJournalEnable(cmd.OutOrStdout(), cmd.InOrStdin(), args[0], yes)
 		},

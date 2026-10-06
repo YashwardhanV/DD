@@ -49,7 +49,7 @@ for speed, DriveDex does not force every file to be flushed to the disk.`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runCopy(cmd.Context(), cmd.OutOrStdout(), args[0], args[1], copyFlags{
-				workers: workers, onConflict: onConflict, verify: verify, dryRun: dryRun,
+				workers: effectiveWorkers(cmd, workers), onConflict: onConflict, verify: verify, dryRun: dryRun,
 			})
 		},
 	}
@@ -137,7 +137,7 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 			workers = copier.AutoWorkers(false, true, dstPenalty, dstKnown)
 			why = autoWhy(workers)
 		}
-		remote := copier.PhonePath(spec.path)
+		remote := copier.PhonePathRoot(spec.path, activePhoneRoot())
 		status.Update("Reading the file list from " + dev.Name() + " …")
 		plan, err = copier.PlanPhone(ctx, adb, dev.Serial, remote, dst, f.onConflict, max(workers, 4))
 		status.Clear()
@@ -171,6 +171,25 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 		}
 	}
 
+	return finishPlan(ctx, out, status, plan, planRun{
+		workers: workers, why: why, verify: f.verify, dryRun: f.dryRun, dstArg: dstArg,
+	})
+}
+
+// planRun are the options for carrying out a finished plan.
+type planRun struct {
+	workers int
+	why     string // why that many workers (for the message)
+	verify  bool
+	dryRun  bool
+	dstArg  string // the destination as the user typed it (for messages)
+}
+
+// finishPlan checks, announces, (dry-)runs and reports one copy plan. Both
+// `copy` and `search --copy-to` use it, so they behave identically.
+func finishPlan(ctx context.Context, out *bufio.Writer, status *ui.StatusLine, plan *copier.Plan, o planRun) error {
+	dst, dstArg, workers, why := plan.DstRoot, o.dstArg, o.workers, o.why
+	f := copyFlags{verify: o.verify, dryRun: o.dryRun}
 	counts := plan.Counts()
 	if counts.Files == 0 {
 		fmt.Fprintln(out, "Nothing to copy: the source has no files.")

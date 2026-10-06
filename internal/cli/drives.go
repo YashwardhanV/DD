@@ -22,8 +22,9 @@ func newDrivesCmd() *cobra.Command {
 		Long: `Shows every drive currently connected - pen drives, external disks, internal
 disks - with its file system, size and free space, and whether DriveDex has an
 index for it.`,
-		Example: `  drivedex drives`,
-		Args:    cobra.NoArgs,
+		Example: `  drivedex drives
+  drivedex index E:   (index a drive you see here)`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runDrives(cmd.OutOrStdout())
 		},

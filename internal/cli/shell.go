@@ -40,13 +40,22 @@ func newShellCmd() *cobra.Command {
 empty space inside a folder, and "Index with DriveDex" to drives. Everything is
 stored for your user only (HKEY_CURRENT_USER), so no administrator rights are
 needed, and 'drivedex shell uninstall' removes exactly what was added.`,
+		Example: `  drivedex shell install
+  drivedex shell status
+  drivedex shell uninstall`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error { return cmd.Help() },
 	}
 	var yes bool
 	install := &cobra.Command{
-		Use:     "install",
-		Short:   "Add the right-click menu entries",
-		Example: "  drivedex shell install",
-		Args:    cobra.NoArgs,
+		Use:   "install",
+		Short: "Add the right-click menu entries",
+		Long: `Adds the DriveDex entries to Explorer's right-click menu. It first lists exactly
+which registry keys it will create (all under your own user) and asks before
+changing anything.`,
+		Example: `  drivedex shell install
+  drivedex shell install --yes`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runShellInstall(cmd.OutOrStdout(), cmd.InOrStdin(), yes)
 		},
@@ -54,11 +63,19 @@ needed, and 'drivedex shell uninstall' removes exactly what was added.`,
 	install.Flags().BoolVarP(&yes, "yes", "y", false, "don't ask for confirmation")
 	cmd.AddCommand(install,
 		&cobra.Command{
-			Use: "uninstall", Short: "Remove the right-click menu entries", Example: "  drivedex shell uninstall", Args: cobra.NoArgs,
+			Use: "uninstall", Short: "Remove the right-click menu entries", Args: cobra.NoArgs,
+			Long: `Removes the right-click entries DriveDex added, and only those. Keys that
+belong to something else are never touched.`,
+			Example: `  drivedex shell uninstall
+  drivedex shell status`,
 			RunE: func(cmd *cobra.Command, args []string) error { return runShellUninstall(cmd.OutOrStdout()) },
 		},
 		&cobra.Command{
-			Use: "status", Short: "Show which right-click entries are installed", Example: "  drivedex shell status", Args: cobra.NoArgs,
+			Use: "status", Short: "Show which right-click entries are installed", Args: cobra.NoArgs,
+			Long: `Lists each right-click entry and whether it is installed, missing, or points
+at a drivedex.exe somewhere else (because the program was moved).`,
+			Example: `  drivedex shell status
+  drivedex shell install`,
 			RunE: func(cmd *cobra.Command, args []string) error { return runShellStatus(cmd.OutOrStdout()) },
 		},
 	)

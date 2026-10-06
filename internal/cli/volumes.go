@@ -18,10 +18,6 @@ var (
 	volumeForPath = volume.ForPath
 )
 
-// staleAfter is how old a mounted drive's index may be before `search`
-// suggests refreshing it. (Becomes configurable in stage 11.)
-const staleAfter = 24 * time.Hour
-
 // phoneCheckTimeout bounds the "which phones are connected?" check that runs
 // during search/list, so a stuck adb can never make searching hang.
 const phoneCheckTimeout = 5 * time.Second

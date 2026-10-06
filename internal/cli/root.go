@@ -17,6 +17,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/yashwardhanv/dd/internal/config"
 	"github.com/yashwardhanv/dd/internal/ui"
 	"github.com/yashwardhanv/dd/internal/volume"
 )
@@ -92,8 +93,17 @@ saved index instantly - even for drives that are not plugged in.`,
 		// `drivedex` with no arguments opens the interactive search.
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error { return startTUI(cmd.Context(), rootTUI) },
-		PersistentPreRun: func(cmd *cobra.Command, args []string) {
-			ui.SetColor(!flagNoColor)
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			// Settings first (they decide colors, limits, skip lists ...). The commands
+			// that help you fix a broken settings file still work with the defaults.
+			if commandsWithoutConfig(cmd) {
+				activeConfig = config.Defaults()
+				applyColor()
+				return nil
+			}
+			err := loadActiveConfig()
+			applyColor()
+			return err
 		},
 	}
 
@@ -116,17 +126,21 @@ saved index instantly - even for drives that are not plugged in.`,
 	root.AddCommand(newAgentCmd())
 	root.AddCommand(newStartupCmd())
 	root.AddCommand(newShellCmd())
+	root.AddCommand(newDoctorCmd(version))
+	root.AddCommand(newConfigCmd())
 	return root
 }
 
 // newVersionCmd implements `drivedex version`.
 func newVersionCmd(version string) *cobra.Command {
 	return &cobra.Command{
-		Use:     "version",
-		Short:   "Print the DriveDex version",
-		Long:    "Prints the version, the operating system / CPU it was built for, and the Go version.",
-		Example: `  drivedex version`,
-		Args:    cobra.NoArgs,
+		Use:   "version",
+		Short: "Print the DriveDex version",
+		Long: `Prints the DriveDex version, the operating system and CPU it was built for,
+and the Go version it was built with. Include this when reporting a problem.`,
+		Example: `  drivedex version
+  drivedex doctor`,
+		Args: cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			fmt.Fprintf(cmd.OutOrStdout(), "drivedex %s (%s/%s, %s)\n",
 				version, runtime.GOOS, runtime.GOARCH, runtime.Version())

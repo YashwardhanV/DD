@@ -15,6 +15,20 @@ func SetColor(enabled bool) {
 	colorOn = enabled && os.Getenv("NO_COLOR") == "" && IsTerminal(os.Stdout) && ansiSupported
 }
 
+// SetColorMode is SetColor with an override for the "color = always" setting:
+// force turns colors on even when stdout is not a terminal (still only if the
+// console can display them). enabled=false always wins.
+func SetColorMode(enabled, force bool) {
+	switch {
+	case !enabled:
+		colorOn = false
+	case force:
+		colorOn = ansiSupported
+	default:
+		SetColor(true)
+	}
+}
+
 // IsTerminal reports whether f is an interactive console (not a pipe or file).
 func IsTerminal(f *os.File) bool {
 	st, err := f.Stat()

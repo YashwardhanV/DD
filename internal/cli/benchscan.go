@@ -30,8 +30,9 @@ is saved and the drive is only read.
 Windows keeps recently read folder listings in memory, so the second and later
 runs look faster than the drive really is. For honest numbers, unplug and replug
 the drive between runs and compare only the first run of each setting.`,
-		Example: `  drivedex bench-scan E: --workers 1,4,16`,
-		Args:    cobra.ExactArgs(1),
+		Example: `  drivedex bench-scan E: --workers 1,4,16
+  drivedex bench-scan D:`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runBenchScan(cmd.Context(), cmd.OutOrStdout(), args[0], workers)
 		},

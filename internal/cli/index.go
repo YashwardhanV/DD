@@ -44,6 +44,7 @@ in seconds) and refreshes later from its change journal in milliseconds.`,
   drivedex index E: --mode mft --with-metadata   (Administrator terminal)`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			opts.workers = effectiveWorkers(cmd, opts.workers)
 			return runIndex(cmd.Context(), cmd.OutOrStdout(), args[0], opts)
 		},
 	}

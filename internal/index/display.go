@@ -107,3 +107,37 @@ func DisplaySplit(h *Header, rel string, env Env) (dir, name string) {
 	}
 	return dir, name
 }
+
+// LocalPath returns where an entry is on THIS PC right now, so it can be
+// opened or copied. ok is false when it can't be reached: an unplugged drive,
+// or a phone (whose paths are not files on this PC).
+func LocalPath(h *Header, rel string, env Env) (path string, ok bool) {
+	switch h.SourceKind {
+	case KindVolume:
+		root, mounted := env.Mounts[h.SourceID]
+		if !mounted {
+			return "", false
+		}
+		return JoinRoot(root, rel), true
+	case KindFolder:
+		return JoinRoot(h.RootPath, rel), true
+	}
+	return "", false
+}
+
+// CopyPath is the path to hand to people and scripts for a result: its real
+// path when the drive is connected, the path where it was last seen when it
+// isn't, and "phone:/<path>" for a phone file (which can be pasted straight
+// into `drivedex copy`).
+func CopyPath(h *Header, rel string, env Env) string {
+	if p, ok := LocalPath(h, rel, env); ok {
+		return p
+	}
+	switch h.SourceKind {
+	case KindPhone:
+		return "phone:/" + strings.ReplaceAll(rel, `\`, "/")
+	case KindVolume:
+		return JoinRoot(h.LastMount, rel)
+	}
+	return JoinRoot(h.RootPath, rel)
+}

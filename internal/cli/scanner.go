@@ -54,15 +54,21 @@ func chooseScanner(root string, o scanOptions) (scan.Scanner, string, error) {
 	}
 	switch strings.ToLower(strings.TrimSpace(o.mode)) {
 	case "walk":
-		return scan.NewWalk(root), "Using the single-threaded walk scanner", nil
+		w := scan.NewWalk(root)
+		w.SkipDirs = activeSkipDirs()
+		return w, "Using the single-threaded walk scanner", nil
 	case "", "auto", "parallel":
 		// (NTFS turbo mode "mft" is chosen before we get here; see useTurbo.)
 		if !auto {
-			return scan.NewParallel(root, n), fmt.Sprintf("Using %d workers (set with --workers)", n), nil
+			p := scan.NewParallel(root, n)
+			p.SkipDirs = activeSkipDirs()
+			return p, fmt.Sprintf("Using %d workers (set with --workers)", n), nil
 		}
 		penalty, known := seekPenaltyFor(root)
 		n, why := scan.AutoWorkers(penalty, known)
-		return scan.NewParallel(root, n), fmt.Sprintf("Using %d workers (%s)", n, why), nil
+		p := scan.NewParallel(root, n)
+		p.SkipDirs = activeSkipDirs()
+		return p, fmt.Sprintf("Using %d workers (%s)", n, why), nil
 	default:
 		return nil, "", userErr(fmt.Sprintf("--mode %q isn't valid", o.mode), "use auto, walk, parallel or mft", nil)
 	}

@@ -81,6 +81,9 @@ func (f *FS) handle(ctx context.Context, args []string) (string, error) {
 	if len(args) > 0 && args[0] == "devices" {
 		return DevicesOutput(f.Devices...), nil
 	}
+	if len(args) == 1 && args[0] == "version" {
+		return "Android Debug Bridge version 1.0.41\nVersion 35.0.2-12147458\nInstalled as C:\\platform-tools\\adb.exe\n", nil
+	}
 	if len(args) < 3 || args[0] != "-s" {
 		return "", fmt.Errorf("phonetest: unexpected adb call %q", args)
 	}

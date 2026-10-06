@@ -15,7 +15,7 @@ import (
 // openADB finds adb and returns a handle for it. A variable so tests can
 // supply a fake phone.
 var openADB = func() (*phone.ADB, error) {
-	path, err := phone.FindADB("") // stage 11 passes the adb_path config value here
+	path, err := phone.FindADB(activeAdbPath())
 	if err != nil {
 		return nil, adbNotFound(err)
 	}
@@ -35,7 +35,7 @@ func phoneHeader(d phone.Device) index.Header {
 		SourceID:   phone.SourceID(d.Serial),
 		Label:      d.Name(),
 		FileSystem: "android",
-		RootPath:   "/sdcard",
+		RootPath:   activePhoneRootPath(),
 		LastMount:  d.Serial,
 		Scanner:    "adb",
 	}
@@ -57,7 +57,7 @@ func runIndexPhone(ctx context.Context, out io.Writer, serial string) error {
 	}
 
 	header := phoneHeader(dev)
-	scanner := phone.NewScanner(adb, dev.Serial, phone.DefaultRoot)
+	scanner := phone.NewScanner(adb, dev.Serial, activePhoneRoot())
 	fmt.Fprintln(out, ui.Dim(fmt.Sprintf("Reading the file list straight from %s over USB debugging…", dev.Name())))
 	return withIndexLock(header.SourceID, header.Label, func() error {
 		return runIndexJob(ctx, out, header, scanner, "phone "+dev.Name(), false)

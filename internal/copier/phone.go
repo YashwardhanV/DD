@@ -42,16 +42,7 @@ var ErrRemoteNotFound = errors.New("that path doesn't exist on the phone")
 // on the phone. Paths are relative to the phone's shared storage, the way
 // DriveDex shows them ("/DCIM/Camera" means "/sdcard/DCIM/Camera"); paths that
 // already start with /sdcard/ or /storage/ are used as they are.
-func PhonePath(p string) string {
-	p = strings.ReplaceAll(strings.TrimSpace(p), `\`, "/")
-	if !strings.HasPrefix(p, "/") {
-		p = "/" + p
-	}
-	if p == "/sdcard" || strings.HasPrefix(p, "/sdcard/") || strings.HasPrefix(p, "/storage/") || p == "/storage" {
-		return path.Clean(p)
-	}
-	return path.Clean("/sdcard" + p)
-}
+func PhonePath(p string) string { return PhonePathRoot(p, "/sdcard") }
 
 // PlanPhone plans copying a file or folder from the phone into dstRoot.
 // remote must be an absolute path on the phone (see PhonePath).
@@ -285,4 +276,31 @@ func pullAndPlace(ctx context.Context, p *Plan, files []*Item, st *state) (faile
 		st.filesDone.Add(1)
 	}
 	return failed, err
+}
+
+// PlanPhoneJobs plans pulling an explicit list of files (for example every
+// search match on one phone) into dstRoot. Each Job.Src must be an absolute
+// path on the phone.
+func PlanPhoneJobs(adb *phone.ADB, serial string, jobs []Job, dstRoot, policy string, workers int) *Plan {
+	plan := finalize(dstRoot, nil, append([]Job(nil), jobs...), policy, workers)
+	plan.Phone = &PhoneSource{ADB: adb, Serial: serial}
+	return plan
+}
+
+// PhonePathRoot is PhonePath for a phone whose indexed folder is root (the
+// phone_root setting): a path such as "/DCIM/Camera" means root + "/DCIM/Camera".
+// Paths that already start with /sdcard/ or /storage/ are used as they are.
+func PhonePathRoot(p, root string) string {
+	p = strings.ReplaceAll(strings.TrimSpace(p), `\`, "/")
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	if p == "/sdcard" || strings.HasPrefix(p, "/sdcard/") || p == "/storage" || strings.HasPrefix(p, "/storage/") {
+		return path.Clean(p)
+	}
+	root = strings.TrimRight(strings.TrimSpace(root), "/")
+	if root == "" {
+		root = "/sdcard"
+	}
+	return path.Clean(root + p)
 }

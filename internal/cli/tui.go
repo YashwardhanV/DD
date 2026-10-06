@@ -91,8 +91,9 @@ func buildTUIConfig(ctx context.Context, f tuiFlags) (tui.Config, error) {
 			l, err := store.LoadAll()
 			return tui.Loaded{Indexes: l.Indexes, Warnings: l.Warnings}, err
 		},
-		Env:     func(ixs []*index.Index) index.Env { return currentEnv(hasPhone(ixs)) },
-		Actions: tuiActions(),
+		Env:        func(ixs []*index.Index) index.Env { return currentEnv(hasPhone(ixs)) },
+		Actions:    tuiActions(),
+		HideHidden: !activeConfig.ShowHidden,
 	}
 
 	if f.drive != "" {
@@ -117,7 +118,7 @@ func buildTUIConfig(ctx context.Context, f tuiFlags) (tui.Config, error) {
 // it is on a drive we can identify, otherwise just that folder. It runs while
 // the full-screen UI is up, so it prints nothing.
 func indexForScope(ctx context.Context, abs string) error {
-	opts := scanOptions{quiet: true}
+	opts := scanOptions{quiet: true, workers: string(activeConfig.Workers)}
 	if v, err := volumeForPath(abs); err == nil && v.Ready && v.Serial != 0 {
 		return indexRoot(ctx, io.Discard, v.Root, volumeHeader(v), opts)
 	}

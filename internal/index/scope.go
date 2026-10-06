@@ -139,3 +139,19 @@ func relativeTo(root, abs string) (string, bool) {
 	}
 	return strings.ReplaceAll(a[len(prefix):], sep, `\`), true
 }
+
+// SourceFilter restricts another matcher to a single index (`--drive E:`,
+// `--source vol-1A2B3C4D`).
+type SourceFilter struct {
+	Inner    Matcher
+	SourceID string
+}
+
+// Applies implements Matcher.
+func (s *SourceFilter) Applies(h *Header) bool { return h.SourceID == s.SourceID && s.Inner.Applies(h) }
+
+// Match implements Matcher.
+func (s *SourceFilter) Match(ix *Index, slot int) bool { return s.Inner.Match(ix, slot) }
+
+// Score implements Matcher.
+func (s *SourceFilter) Score(ix *Index, slot int) int { return s.Inner.Score(ix, slot) }

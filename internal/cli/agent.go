@@ -40,18 +40,37 @@ itself, so you never have to remember to run 'drivedex index'. It writes a log
 you can read with 'drivedex agent status'.
 
 To make it start every time you log in, use 'drivedex startup enable'.`,
+		Example: `  drivedex agent start
+  drivedex agent status
+  drivedex agent stop`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error { return cmd.Help() },
 	}
 	cmd.AddCommand(
 		&cobra.Command{
-			Use: "start", Short: "Start the background agent", Example: "  drivedex agent start", Args: cobra.NoArgs,
+			Use: "start", Short: "Start the background agent", Args: cobra.NoArgs,
+			Long: `Starts the agent in the background with no window. If it is already running
+nothing happens. From then on, plugging in a USB drive or phone refreshes
+its index automatically.`,
+			Example: `  drivedex agent start
+  drivedex agent start && drivedex agent status`,
 			RunE: func(cmd *cobra.Command, args []string) error { return runAgentStart(cmd.OutOrStdout()) },
 		},
 		&cobra.Command{
-			Use: "stop", Short: "Stop the background agent", Example: "  drivedex agent stop", Args: cobra.NoArgs,
+			Use: "stop", Short: "Stop the background agent", Args: cobra.NoArgs,
+			Long: `Stops the background agent. Your saved indexes are not touched; drives just
+stop being refreshed automatically until you start the agent again.`,
+			Example: `  drivedex agent stop
+  drivedex agent stop && drivedex agent start   (restart after changing config.toml)`,
 			RunE: func(cmd *cobra.Command, args []string) error { return runAgentStop(cmd.OutOrStdout()) },
 		},
 		&cobra.Command{
-			Use: "status", Short: "Show whether the agent is running and what it did recently", Example: "  drivedex agent status", Args: cobra.NoArgs,
+			Use: "status", Short: "Show whether the agent is running and what it did recently", Args: cobra.NoArgs,
+			Long: `Says whether the agent is running, whether it starts with Windows, and shows
+the last lines of its log - a good first stop if a plugged-in drive wasn't
+indexed.`,
+			Example: `  drivedex agent status
+  drivedex doctor`,
 			RunE: func(cmd *cobra.Command, args []string) error { return runAgentStatus(cmd.OutOrStdout()) },
 		},
 	)
@@ -163,11 +182,19 @@ func newStartupCmd() *cobra.Command {
 log in. 'enable' adds a per-user entry (no administrator rights needed);
 'enable --elevated' instead creates a scheduled task that starts the agent with
 administrator rights, which lets it use NTFS turbo mode in the background.`,
+		Example: `  drivedex startup enable
+  drivedex startup status
+  drivedex startup disable`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error { return cmd.Help() },
 	}
 	var elevated, yes bool
 	enable := &cobra.Command{
 		Use:   "enable",
 		Short: "Start the agent at log-in",
+		Long: `Makes the background agent start every time you log in to Windows. It first
+shows exactly what it will add and asks. Without --elevated it only adds a
+per-user entry, so no administrator rights are needed.`,
 		Example: `  drivedex startup enable
   drivedex startup enable --elevated   (run from an Administrator terminal)`,
 		Args: cobra.NoArgs,
@@ -180,11 +207,19 @@ administrator rights, which lets it use NTFS turbo mode in the background.`,
 
 	cmd.AddCommand(enable,
 		&cobra.Command{
-			Use: "disable", Short: "Stop the agent starting at log-in", Example: "  drivedex startup disable", Args: cobra.NoArgs,
+			Use: "disable", Short: "Stop the agent starting at log-in", Args: cobra.NoArgs,
+			Long: `Removes whatever 'startup enable' added (the per-user entry and/or the
+scheduled task). The agent keeps running until you log out or stop it.`,
+			Example: `  drivedex startup disable
+  drivedex agent stop`,
 			RunE: func(cmd *cobra.Command, args []string) error { return runStartupDisable(cmd.OutOrStdout()) },
 		},
 		&cobra.Command{
-			Use: "status", Short: "Show how the agent starts at log-in", Example: "  drivedex startup status", Args: cobra.NoArgs,
+			Use: "status", Short: "Show how the agent starts at log-in", Args: cobra.NoArgs,
+			Long: `Says whether the agent starts when you log in, and if so whether through the
+per-user entry or the elevated scheduled task.`,
+			Example: `  drivedex startup status
+  drivedex agent status`,
 			RunE: func(cmd *cobra.Command, args []string) error { return runStartupStatus(cmd.OutOrStdout()) },
 		},
 	)

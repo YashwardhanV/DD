@@ -21,8 +21,9 @@ func newListCmd() *cobra.Command {
 		Long: `Shows all indexes DriveDex has saved: which drive or folder each one is for,
 how many entries it holds, when it was last updated and whether the drive is
 connected right now.`,
-		Example: `  drivedex list`,
-		Args:    cobra.NoArgs,
+		Example: `  drivedex list
+  drivedex forget vol-1A2B3C4D   (remove an index you no longer need)`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runList(cmd.OutOrStdout())
 		},

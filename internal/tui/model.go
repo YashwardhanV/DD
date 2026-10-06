@@ -21,6 +21,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/yashwardhanv/dd/internal/index"
+	"github.com/yashwardhanv/dd/internal/query"
 )
 
 // Loaded is everything read from disk at startup.
@@ -65,6 +66,9 @@ type Config struct {
 	Debounce time.Duration
 	// Limit caps how many results are kept for scrolling (default 500).
 	Limit int
+	// HideHidden leaves hidden and system files out of the results
+	// (config show_hidden = false).
+	HideHidden bool
 	// StaticCursor turns off the blinking text cursor (its timer messages make
 	// tests slow and noisy).
 	StaticCursor bool
@@ -114,6 +118,12 @@ type searchDoneMsg struct {
 	rows  []Row
 	took  time.Duration
 	terms []string
+	// queryErr is set when the text isn't (yet) a valid search, e.g. "size:>".
+	// The previous results stay on screen while the user finishes typing.
+	queryErr string
+	// noMeta counts entries skipped because the search filters on size/date
+	// and the index doesn't know them.
+	noMeta int64
 }
 
 type actionDoneMsg struct{ status string }
@@ -135,16 +145,18 @@ type Model struct {
 	scope    *index.ScopeMatcher // nil = no --scope
 	errText  string
 
-	query   string
-	terms   []string
-	seq     int // bumped on every change of the text; used to drop stale work
-	rows    []Row
-	total   int
-	covered int // indexes searched
-	took    time.Duration
-	cursor  int
-	offset  int
-	status  string
+	query    string
+	queryErr string // why the current text isn't a valid search ("" = fine)
+	noMeta   int64
+	terms    []string
+	seq      int // bumped on every change of the text; used to drop stale work
+	rows     []Row
+	total    int
+	covered  int // indexes searched
+	took     time.Duration
+	cursor   int
+	offset   int
+	status   string
 }
 
 // New creates the screen's model.
@@ -235,7 +247,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.seq != m.seq {
 			return m, nil // an older search finishing late must not overwrite newer results
 		}
-		m.rows, m.total, m.covered, m.took, m.terms = msg.rows, msg.res.Total, msg.res.Indexes, msg.took, msg.terms
+		m.queryErr = msg.queryErr
+		if msg.queryErr != "" {
+			return m, nil // keep showing the last good results while the user finishes the filter
+		}
+		m.rows, m.total, m.covered, m.took, m.terms, m.noMeta = msg.rows, msg.res.Total, msg.res.Indexes, msg.took, msg.terms, msg.noMeta
 		m.cursor, m.offset = 0, 0
 		m.ensureMeta()
 		return m, nil
@@ -342,6 +358,7 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	m.query = m.input.Value()
 	if strings.TrimSpace(m.query) == "" {
 		m.rows, m.total, m.cursor, m.offset, m.terms = nil, 0, 0, 0, nil
+		m.queryErr, m.noMeta = "", 0
 		return m, cmd
 	}
 	seq := m.seq
@@ -402,7 +419,7 @@ func (m Model) indexCmd() tea.Cmd {
 // searchCmd runs the search on a background goroutine and tags the answer with
 // seq, so Update can tell whether the user has typed again since.
 func (m Model) searchCmd(seq int) tea.Cmd {
-	query := m.input.Value()
+	text := m.input.Value()
 	indexes, env, limit := m.indexes, m.env, m.cfg.Limit
 	driveID := m.cfg.DriveSourceID
 	var scope *index.ScopeMatcher
@@ -410,22 +427,38 @@ func (m Model) searchCmd(seq int) tea.Cmd {
 		c := *m.scope
 		scope = &c
 	}
+	hideHidden := m.cfg.HideHidden
 	return func() tea.Msg {
-		term := index.NewTermMatcher(query)
-		if len(term.Terms) == 0 {
+		q, err := query.Parse(text, time.Now())
+		if err != nil {
+			return searchDoneMsg{seq: seq, queryErr: err.Error()}
+		}
+		if q.IsEmpty() {
 			return searchDoneMsg{seq: seq}
 		}
-		term.SourceID = driveID
-		var matcher index.Matcher = term
+		qm := q.Matcher(env)
+		qm.HideHidden = hideHidden
+		var matcher index.Matcher = qm
+		if driveID != "" {
+			matcher = &index.SourceFilter{Inner: matcher, SourceID: driveID}
+		}
 		if scope != nil {
-			scope.Inner = term
+			scope.Inner = matcher
 			matcher = scope
 		}
 		start := time.Now()
 		res := index.Search(indexes, matcher, index.SearchOptions{Limit: limit})
-		return searchDoneMsg{seq: seq, res: res, rows: buildRows(indexes, env, res), took: time.Since(start), terms: term.Terms}
+		var noMeta int64
+		if q.UsesMetadata() {
+			noMeta = qm.SkippedNoMeta()
+		}
+		return searchDoneMsg{seq: seq, res: res, rows: buildRows(indexes, env, res), took: time.Since(start), terms: highlightTerms(q), noMeta: noMeta}
 	}
 }
+
+// highlightTerms are the words to highlight in the results: the name words and
+// phrases of the search (not the excluded ones).
+func highlightTerms(q *query.Query) []string { return q.Terms }
 
 // buildRows turns search hits into displayable rows.
 func buildRows(indexes []*index.Index, env index.Env, res index.SearchResult) []Row {

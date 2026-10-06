@@ -45,6 +45,23 @@ func (d Device) Hint() string {
 // devicesTimeout stops a stuck adb server from hanging DriveDex forever.
 const devicesTimeout = 15 * time.Second
 
+// Version returns the first line of `adb version`, such as
+// "Android Debug Bridge version 1.0.41".
+func (a *ADB) Version(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, devicesTimeout)
+	defer cancel()
+	out, err := a.run.Output(ctx, "version")
+	if err != nil {
+		return "", fmt.Errorf("running 'adb version': %w", err)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			return line, nil
+		}
+	}
+	return "", nil
+}
+
 // Devices lists the phones adb can see.
 func (a *ADB) Devices(ctx context.Context) ([]Device, error) {
 	ctx, cancel := context.WithTimeout(ctx, devicesTimeout)

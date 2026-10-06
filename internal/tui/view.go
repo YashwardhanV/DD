@@ -90,6 +90,12 @@ func (m Model) footerLine() (string, lipgloss.Style) {
 		}
 		return fmt.Sprintf("Type to search %s entries in %s", ui.Thousands(int64(entries)), sourcesText(len(m.indexes), offline)), lipgloss.NewStyle()
 	}
+	if m.queryErr != "" {
+		return m.queryErr, warnStyle
+	}
+	if m.noMeta > 0 {
+		return fmt.Sprintf("%s matches · some NTFS entries have no size/date: run 'drivedex index E: --with-metadata'", ui.Thousands(int64(m.total))), warnStyle
+	}
 	return fmt.Sprintf("%s matches · %s · %s", ui.Thousands(int64(m.total)), ui.FormatMillis(m.took), sourcesText(m.covered, offline)), lipgloss.NewStyle()
 }
 

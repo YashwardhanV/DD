@@ -50,6 +50,7 @@ func runScan(ctx context.Context, stdout io.Writer, arg string, countOnly bool, 
 	}
 
 	w := scan.NewWalk(root)
+	w.SkipDirs = activeSkipDirs()
 	out := bufio.NewWriterSize(stdout, 64*1024)
 	defer out.Flush()
 

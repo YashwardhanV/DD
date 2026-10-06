@@ -155,7 +155,10 @@ func ReadJournal(ctx context.Context, d Device, journalID uint64, startUsn int64
 type Session struct {
 	Dev     Device
 	RootFRN uint64 // the file reference number of the drive's root folder
-	closer  func()
+	// SkipDirs are folder names left out when replaying the change journal
+	// (nil = scan.DefaultSkipDirs). Set it to the same list the full scan used.
+	SkipDirs []string
+	closer   func()
 }
 
 // NewSession wraps a Device (used by the Windows opener and by tests).
@@ -202,7 +205,7 @@ func Refresh(ctx context.Context, s *Session, ix *index.Index) (RefreshResult, e
 		return res, fmt.Errorf("%w: the last index is older than the change journal's history", ErrNeedFullRebuild)
 	}
 
-	ap := NewApplier(ix, s.RootFRN, nil)
+	ap := NewApplier(ix, s.RootFRN, s.SkipDirs)
 	next, err := ReadJournal(ctx, s.Dev, jd.ID, h.NextUsn, ap.Apply)
 	if errors.Is(err, ErrJournalEntryDeleted) {
 		return res, fmt.Errorf("%w: the change journal no longer holds the entries since the last index", ErrNeedFullRebuild)

@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/yashwardhanv/dd/internal/config"
 	"github.com/yashwardhanv/dd/internal/index"
 	"github.com/yashwardhanv/dd/internal/phone"
 	"github.com/yashwardhanv/dd/internal/volume"
@@ -61,8 +62,29 @@ func Main(ctx context.Context, version string) int {
 		log.Errorf("couldn't start: %v", err)
 		return 1
 	}
-	New(deps, DefaultSettings(), log).Run(ctx)
+	set := DefaultSettings()
+	if path, err := config.Path(); err == nil {
+		if cfg, err := config.Load(path); err != nil {
+			log.Errorf("%v - using the default settings", err)
+		} else {
+			set = SettingsFrom(cfg)
+			deps.Devices = (&adbFinder{path: cfg.AdbPath}).devices
+		}
+	}
+	New(deps, set, log).Run(ctx)
 	return 0
+}
+
+// SettingsFrom takes the agent's options from the config file. Everything the
+// file doesn't cover (polling intervals ...) keeps its default.
+func SettingsFrom(cfg config.Config) Settings {
+	s := DefaultSettings()
+	s.Notifications = cfg.Notifications
+	s.AutoIndex = append([]string(nil), cfg.AutoIndex...)
+	if d, err := cfg.StaleDuration(); err == nil {
+		s.StaleAfter = d
+	}
+	return s
 }
 
 // RealDeps wires the agent to the real system.
@@ -89,11 +111,14 @@ func RealDeps(log *Logger) (Deps, error) {
 
 // adbFinder looks for adb lazily, so installing Platform-Tools while the agent
 // is running is noticed without restarting it.
-type adbFinder struct{ adb *phone.ADB }
+type adbFinder struct {
+	path string // the adb_path setting ("" = look for it)
+	adb  *phone.ADB
+}
 
 func (f *adbFinder) devices(ctx context.Context) ([]phone.Device, error) {
 	if f.adb == nil {
-		path, err := phone.FindADB("")
+		path, err := phone.FindADB(f.path)
 		if err != nil {
 			return nil, nil // no adb installed: nothing to watch, and nothing to complain about
 		}
