@@ -1,0 +1,17 @@
+# Build output
+bin/
+*.exe
+
+# DriveDex data and scratch files
+*.ddx
+*.tmp
+*.ddxpart
+testdata/generated/
+
+# Windows resource objects (go-winres) - decided in stage 12
+*.syso
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
