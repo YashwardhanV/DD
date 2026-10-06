@@ -9,7 +9,7 @@ Legend: `[x]` done and verified · `[~]` code complete and tested in the cloud c
 - [~] 3 Drive identity & offline search
 - [~] 4 Parallel scanner
 - [~] 5 Android via ADB
-- [ ] 6 NTFS MFT + USN
+- [~] 6 NTFS MFT + USN
 - [ ] 7 Fast copy
 - [ ] 8 Interactive UI
 - [ ] 9 Auto-index agent
@@ -18,7 +18,7 @@ Legend: `[x]` done and verified · `[~]` code complete and tested in the cloud c
 - [ ] 12 Packaging & release
 
 ## Current status
-Stage: 5 code complete (owner checks pending) — next: stage 6
+Stage: 6 code complete (owner checks pending) — next: stage 7
 
 ## Decisions
 - 2026-10-06: module path = `github.com/yashwardhanv/dd` (matches the actual GitHub repo `YashwardhanV/DD`, so `go install` paths work). BUILD.md suggested `github.com/<user>/drivedex`.
@@ -31,6 +31,12 @@ Stage: 5 code complete (owner checks pending) — next: stage 6
 - Stage 1: `internal/index/model.go` and `path.go` were created in stage 1 (BUILD.md lists them under stage 2) because the `Scanner` interface (section 7.5) takes an `*index.Builder`. Stage 2 adds the file format, store and search on top.
 - Stage 1: added `internal/fixture` (the generator logic) so `cmd/genfixture` and unit tests share one implementation. `cmd/genfixture` is a thin wrapper.
 - Stage 1: `ui` also contains console setup (ANSI colors + UTF-8 code page on Windows, restored on exit) and the one-line status display; BUILD.md describes these later but every command needs them from the start.
+- Stage 6: the NTFS logic is split so almost all of it is testable off-Windows: `ntfs.Device` (a one-method interface: `IOControl(code, in, out)`) hides `DeviceIoControl`; Windows error numbers are translated to sentinel errors (`ErrEOF`, `ErrJournalNotActive`, `ErrJournalEntryDeleted`, `ErrNeedAdmin`, ...) in `mft_windows.go`. `internal/ntfs/ntfstest` is an in-memory fake NTFS volume (MFT, metafiles, System Volume Information, a real journal with trim/reset) used by the ntfs and cli tests. The only code that cannot run here is the ~60-line `mft_windows.go` + `IsElevated` — it is type-checked with `GOOS=windows go vet/build`.
+- Stage 6: the skip list (System Volume Information, $RECYCLE.BIN) is applied at **any depth** in MFT mode, matching `walk`/`parallel` (BUILD.md says "root level"); results stay comparable between scanners.
+- Stage 6: collected MFT records are kept in a slice, not the `map[uint64]rec` BUILD.md suggests — a map for millions of records costs far more memory; reachability uses one `map[frn]slot` plus a memoized state array.
+- Stage 6: journal replay drops (and un-indexes) any record whose parent folder isn't in the index — otherwise constant churn inside System Volume Information would pollute the index with `?\` orphans on a real C: drive. "N changes applied" counts *distinct* files changed, not journal records (one file save writes several records).
+- Stage 6: `--mode mft` that can't be honoured (not Administrator / not NTFS / no journal) is an **error with a fix**; `--mode auto` falls back silently-with-a-note instead. Added `--full` (skip incremental refresh) next to the specified `--with-metadata`. `--with-metadata` never uses the refresh shortcut (a refresh would lose the metadata).
+- Stage 6: lazy size/date lookup (`index.FillMeta`) runs for displayed `search` results of connected volume/folder sources; phones are skipped. Not persisted.
 - Stage 5: all adb access goes through a small `phone.Runner` interface (real one = `ExecRunner`, tests use `internal/phone/phonetest`), so every adb behaviour is unit-tested without a phone, including on Windows CI (the `ExecRunner` tests start the Go test binary itself as a stand-in adb).
 - Stage 5: fallback to the names-only `find` triggers when the stat listing produced **no usable lines** and either exited non-zero *or* printed only unparseable lines (BUILD.md only mentions non-zero exit; the extra case covers a stat that prints an error but exits 0). A non-zero exit that *did* produce lines is accepted (find exits 1 when any folder, e.g. `Android/data`, is protected).
 - Stage 5: `adb` is only started during `search`/`list` when at least one phone index exists, with a 5 s timeout, so people without phones never pay for it; if adb is missing, phones simply show as `· offline` (never an error).
@@ -52,6 +58,7 @@ Stage: 5 code complete (owner checks pending) — next: stage 6
 - Hardware / admin acceptance criteria (real drives, phone, Administrator terminal, Explorer timings) can't be run in the cloud container. They are listed per stage below as "owner to verify" and are NOT marked passed.
 
 ## Owner to verify (hardware-dependent checks)
+- **Stage 6 (all in an *Administrator* PowerShell):** (a) `drivedex journal status C:`. (b) `drivedex index C: --mode mft` — record entries + time (target < ~15 s per million files); (c) `drivedex index E: --mode mft` on an NTFS external drive (read-only, safe); also `drivedex index E: --mode parallel` and check the two entry counts are within ±2% — note the differences (hidden/system items, protected folders the walker can't read). (d) Pick 20 random paths from `drivedex search ... --limit 20` on the C: index and check they exist. (e) Create/rename/delete a few files on E:, then `drivedex index E:` → must print `Refreshed E:\ from change journal — N changes applied in X ms`; search must show the changes. (f) In a *normal* (non-admin) terminal `drivedex index E:` must fall back to the parallel scanner and print the Administrator tip once. (g) If a drive has no journal: `drivedex journal enable E:` (answer y) then index again.
 - **Stage 5:** set up the phone (BUILD.md stage 5 steps; the error message prints them if adb is missing), then `adb devices -l` should show `device`. Run `drivedex index phone` and record time + entry count; time an Explorer search of the phone (or note "gave up after N min"); unplug and run `drivedex search IMG_2024 --limit 5` → results must end with `· offline`. Also try `drivedex index phone:<serial>` if two phones are connected, and a phone locked/unauthorized (should print the "tap Allow" hint).
 - **Stage 4:** (a) `drivedex index E: --mode walk`, replug, `drivedex index E: --mode parallel` (replug between runs — Windows caches folder listings) and record both times in Benchmarks. (b) `drivedex index E:` prints which worker count it chose and why ("flash/SSD detected" / "spinning hard disk detected" / "drive type unknown") — note what it said for each drive you try, especially a USB hard disk (is HDD detected, or unknown?). (c) Optional: `drivedex bench-scan E: --workers 1,4,16`. Also run `go test ./internal/volume/` on Windows (the seek-penalty test just checks it doesn't crash).
 - **Stage 3:** (a) `drivedex drives`, then `drivedex index E:` for a pen drive; `drivedex list`. (b) Unplug the drive and run `drivedex search <known file>` → result must show `[LABEL · offline · last seen E:]`. (c) Plug it into another port/letter → result shows the new letter. (d) `drivedex forget E:` removes only the index (check the drive's files are intact). Also run `go test ./internal/volume/` on Windows (checks `C:\` is NTFS with a serial).

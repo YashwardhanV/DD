@@ -104,6 +104,7 @@ func runSearch(stdout io.Writer, query string, f searchFlags) error {
 		}
 		rel := ix.RelPathCached(h.Slot, caches[h.Index])
 		path := index.DisplayPath(&ix.Header, rel, env)
+		lazyMetadata(ix, h.Slot, rel, env)
 
 		size := "<dir>"
 		if ix.Flags[h.Slot]&index.FlagDir == 0 {
@@ -171,4 +172,23 @@ func hasPhone(indexes []*index.Index) bool {
 		}
 	}
 	return false
+}
+
+// lazyMetadata fills in the size and date of a displayed result whose index
+// doesn't have them (NTFS turbo mode stores names only). Only the few results
+// being shown are looked up, and only when the drive is connected - so this
+// costs next to nothing. Phones are skipped: their paths aren't files on this PC.
+func lazyMetadata(ix *index.Index, slot int, rel string, env index.Env) {
+	if ix.Flags[slot]&index.FlagNoMeta == 0 {
+		return
+	}
+	h := &ix.Header
+	switch h.SourceKind {
+	case index.KindVolume:
+		if root, mounted := env.Mounts[h.SourceID]; mounted {
+			ix.FillMeta(slot, index.JoinRoot(root, rel))
+		}
+	case index.KindFolder:
+		ix.FillMeta(slot, index.JoinRoot(h.RootPath, rel))
+	}
 }

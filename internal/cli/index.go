@@ -30,12 +30,17 @@ drive - even when the drive is unplugged. Run it again to refresh.
 
 For an Android phone use 'phone' (or 'phone:<serial>' when several are
 connected). The phone lists its own files over USB debugging (ADB), which is
-far faster than browsing it in Explorer.`,
+far faster than browsing it in Explorer.
+
+On an NTFS drive, run this in an Administrator terminal to use "turbo mode":
+DriveDex then reads the drive's master file table directly (millions of files
+in seconds) and refreshes later from its change journal in milliseconds.`,
 		Example: `  drivedex index D:\Projects
   drivedex index E:
   drivedex index phone
   drivedex index E: --workers 8
-  drivedex index E: --mode walk`,
+  drivedex index E: --mode walk
+  drivedex index E: --mode mft --with-metadata   (Administrator terminal)`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runIndex(cmd.Context(), cmd.OutOrStdout(), args[0], opts)
@@ -64,6 +69,18 @@ func runIndex(ctx context.Context, out io.Writer, arg string, opts scanOptions) 
 // described by header. (Split from runIndex so tests can index a plain folder
 // "as if" it were a drive.)
 func indexRoot(ctx context.Context, out io.Writer, root string, header index.Header, opts scanOptions) error {
+	if _, _, err := parseWorkers(opts.workers); err != nil { // reject a bad --workers before any slow work
+		return err
+	}
+	turbo, err := useTurbo(out, header, opts)
+	if err != nil {
+		return err
+	}
+	if turbo {
+		if handled, err := indexMFT(ctx, out, root, header, opts); handled || err != nil {
+			return err
+		}
+	}
 	scanner, note, err := chooseScanner(root, opts)
 	if err != nil {
 		return err

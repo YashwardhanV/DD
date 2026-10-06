@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/spf13/pflag"
+
 	"github.com/yashwardhanv/dd/internal/scan"
 	"github.com/yashwardhanv/dd/internal/volume"
 )
@@ -15,16 +17,18 @@ var seekPenaltyFor = volume.SeekPenalty
 
 // scanOptions are the --mode / --workers flags shared by commands that scan.
 type scanOptions struct {
-	mode    string // auto | walk | parallel
-	workers string // auto | a number
+	mode         string // auto | walk | parallel | mft
+	workers      string // auto | a number
+	withMetadata bool   // NTFS turbo mode: also read every size and date
+	full         bool   // NTFS turbo mode: skip the incremental refresh
 }
 
-// addScanFlags registers --mode and --workers on a command.
-func addScanFlags(f interface {
-	StringVar(p *string, name string, value string, usage string)
-}, o *scanOptions) {
-	f.StringVar(&o.mode, "mode", "auto", "how to scan: auto, walk (one thread) or parallel")
+// addScanFlags registers --mode, --workers and the turbo-mode flags on a command.
+func addScanFlags(f *pflag.FlagSet, o *scanOptions) {
+	f.StringVar(&o.mode, "mode", "auto", "how to scan: auto, walk (one thread), parallel, or mft (NTFS turbo mode, Administrator)")
 	f.StringVar(&o.workers, "workers", "auto", "parallel readers: auto (picked from the drive type) or a number")
+	f.BoolVar(&o.withMetadata, "with-metadata", false, "NTFS turbo mode: also read every file size and date (slower, but complete)")
+	f.BoolVar(&o.full, "full", false, "NTFS turbo mode: re-read the whole file table instead of refreshing from the change journal")
 }
 
 // parseWorkers turns "auto" or "8" into (n, isAuto).
@@ -51,7 +55,7 @@ func chooseScanner(root string, o scanOptions) (scan.Scanner, string, error) {
 	case "walk":
 		return scan.NewWalk(root), "Using the single-threaded walk scanner", nil
 	case "", "auto", "parallel":
-		// auto currently means parallel; stage 6 adds NTFS "mft" turbo mode.
+		// (NTFS turbo mode "mft" is chosen before we get here; see useTurbo.)
 		if !auto {
 			return scan.NewParallel(root, n), fmt.Sprintf("Using %d workers (set with --workers)", n), nil
 		}
@@ -59,6 +63,6 @@ func chooseScanner(root string, o scanOptions) (scan.Scanner, string, error) {
 		n, why := scan.AutoWorkers(penalty, known)
 		return scan.NewParallel(root, n), fmt.Sprintf("Using %d workers (%s)", n, why), nil
 	default:
-		return nil, "", userErr(fmt.Sprintf("--mode %q isn't valid", o.mode), "use auto, walk or parallel", nil)
+		return nil, "", userErr(fmt.Sprintf("--mode %q isn't valid", o.mode), "use auto, walk, parallel or mft", nil)
 	}
 }
