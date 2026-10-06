@@ -40,12 +40,22 @@ func runIndex(ctx context.Context, out io.Writer, arg string) error {
 	if err != nil {
 		return err
 	}
+	header, err := headerFor(arg, root)
+	if err != nil {
+		return err
+	}
+	return indexRoot(ctx, out, root, header)
+}
+
+// indexRoot scans root and saves the result as the index described by header.
+// (Split from runIndex so tests can index a plain folder "as if" it were a drive.)
+func indexRoot(ctx context.Context, out io.Writer, root string, header index.Header) error {
 	store, err := openStore()
 	if err != nil {
 		return err
 	}
+	arg := root
 
-	header := index.FolderHeader(root)
 	now := time.Now()
 	header.CreatedAt, header.UpdatedAt = now, now
 	// Refreshing keeps the original creation time.

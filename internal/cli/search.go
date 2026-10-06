@@ -11,13 +11,14 @@ import (
 
 	"github.com/yashwardhanv/dd/internal/index"
 	"github.com/yashwardhanv/dd/internal/ui"
+	"github.com/yashwardhanv/dd/internal/volume"
 )
 
 // newSearchCmd implements `drivedex search <terms…>`: search every saved index
 // in memory. This is the payoff of indexing - it never touches a drive.
 func newSearchCmd() *cobra.Command {
 	var limit int
-	var source string
+	var source, drive string
 	var filesOnly, dirsOnly bool
 
 	cmd := &cobra.Command{
@@ -28,6 +29,7 @@ sensitive). Results from drives that are not plugged in are included and marked
 offline. Put "double quotes" around a phrase to keep its words together.`,
 		Example: `  drivedex search resume
   drivedex search foto jpg --limit 10
+  drivedex search invoice --drive E:
   drivedex search "final report" --files`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -35,12 +37,13 @@ offline. Put "double quotes" around a phrase to keep its words together.`,
 				return userErr("--files and --dirs can't be used together", "pick one (or neither)", nil)
 			}
 			return runSearch(cmd.OutOrStdout(), strings.Join(args, " "), searchFlags{
-				limit: limit, source: source, filesOnly: filesOnly, dirsOnly: dirsOnly,
+				limit: limit, source: source, drive: drive, filesOnly: filesOnly, dirsOnly: dirsOnly,
 			})
 		},
 	}
 	cmd.Flags().IntVar(&limit, "limit", 50, "show at most N results (0 = all)")
 	cmd.Flags().StringVar(&source, "source", "", "only search this index (an id from 'drivedex list')")
+	cmd.Flags().StringVar(&drive, "drive", "", "only search the drive currently at this letter, e.g. E:")
 	cmd.Flags().BoolVar(&filesOnly, "files", false, "only show files")
 	cmd.Flags().BoolVar(&dirsOnly, "dirs", false, "only show folders")
 	return cmd
@@ -49,6 +52,7 @@ offline. Put "double quotes" around a phrase to keep its words together.`,
 type searchFlags struct {
 	limit     int
 	source    string
+	drive     string
 	filesOnly bool
 	dirsOnly  bool
 }
@@ -71,8 +75,16 @@ func runSearch(stdout io.Writer, query string, f searchFlags) error {
 		return nil
 	}
 
+	env := currentEnv()
 	m := index.NewTermMatcher(query)
 	m.SourceID, m.OnlyFiles, m.OnlyDirs = f.source, f.filesOnly, f.dirsOnly
+	if f.drive != "" {
+		id, err := sourceIDForLetter(f.drive)
+		if err != nil {
+			return err
+		}
+		m.SourceID = id
+	}
 	if len(m.Terms) == 0 {
 		return userErr("the search is empty", `type at least one word, e.g. drivedex search resume`, nil)
 	}
@@ -84,7 +96,6 @@ func runSearch(stdout io.Writer, query string, f searchFlags) error {
 	out := bufio.NewWriterSize(stdout, 64*1024)
 	defer out.Flush()
 
-	env := buildEnv()
 	caches := make([]map[uint64]string, len(loaded.Indexes)) // folder-path caches, one per index
 	for _, h := range res.Hits {
 		ix := loaded.Indexes[h.Index]
@@ -104,6 +115,7 @@ func runSearch(stdout io.Writer, query string, f searchFlags) error {
 	fmt.Fprintf(out, "\n%s of %s matches · %s · searched %s entries in %d %s\n",
 		ui.Thousands(int64(len(res.Hits))), ui.Thousands(int64(res.Total)), ui.FormatMillis(searchTime),
 		ui.Thousands(int64(res.Searched)), res.Indexes, plural(res.Indexes, "index", "indexes"))
+	printStaleTips(out, loaded.Indexes, m, env, time.Now())
 	if flagDebug {
 		fmt.Fprintln(out, ui.Dim("loaded indexes in "+ui.FormatDuration(loadTime)))
 	}
@@ -116,4 +128,37 @@ func plural(n int, one, many string) string {
 		return one
 	}
 	return many
+}
+
+// sourceIDForLetter finds the index ID of the drive currently at a letter.
+func sourceIDForLetter(arg string) (string, error) {
+	letter, ok := volume.NormalizeLetter(arg)
+	if !ok {
+		return "", userErr(fmt.Sprintf("%q isn't a drive letter", arg), "use something like --drive E:", nil)
+	}
+	vols, _ := listVolumes()
+	for _, v := range vols {
+		if v.Ready && strings.EqualFold(v.Letter(), letter) {
+			return volume.SourceID(v), nil
+		}
+	}
+	return "", userErr(fmt.Sprintf("drive %s isn't connected", letter),
+		"for an unplugged drive use --source <id> (see 'drivedex list')", nil)
+}
+
+// printStaleTips reminds the user to refresh the index of any connected drive
+// that was last indexed more than staleAfter ago.
+func printStaleTips(out io.Writer, indexes []*index.Index, m *index.TermMatcher, env index.Env, now time.Time) {
+	for _, ix := range indexes {
+		h := &ix.Header
+		root, mounted := env.Mounts[h.SourceID]
+		if h.SourceKind != index.KindVolume || !mounted || !m.Applies(h) {
+			continue
+		}
+		if age := now.Sub(h.UpdatedAt); age > staleAfter {
+			letter := strings.TrimRight(root, `\/`)
+			fmt.Fprintln(out, ui.Dim(fmt.Sprintf("tip: %s was indexed %s — run 'drivedex index %s' to refresh",
+				root, ui.Ago(h.UpdatedAt, now), letter)))
+		}
+	}
 }

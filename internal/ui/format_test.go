@@ -81,3 +81,12 @@ func TestFormatMillis(t *testing.T) {
 		}
 	}
 }
+
+func TestCompact(t *testing.T) {
+	cases := map[int64]string{0: "0", 950: "950", 1000: "1k", 182334: "182k", 999999: "1000k", 2400000: "2.4M"}
+	for in, want := range cases {
+		if got := Compact(in); got != want {
+			t.Errorf("Compact(%d) = %q, want %q", in, got, want)
+		}
+	}
+}

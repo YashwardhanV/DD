@@ -24,10 +24,3 @@ func printWarnings(w io.Writer, warnings []error) {
 		fmt.Fprintln(w, ui.Dim("  Fix: re-index that drive with 'drivedex index <drive>' (or remove the file with 'drivedex forget')."))
 	}
 }
-
-// buildEnv works out which drives and phones are connected right now, so
-// results can show the current drive letter or an "offline" marker. Later
-// stages fill in volumes (stage 3) and phones (stage 5).
-func buildEnv() index.Env {
-	return index.Env{}
-}

@@ -125,3 +125,16 @@ func PerSecond(n int64, elapsed time.Duration) int64 {
 	}
 	return int64(float64(n) / elapsed.Seconds())
 }
+
+// Compact abbreviates a count for tables: 950 -> "950", 182334 -> "182k",
+// 2400000 -> "2.4M".
+func Compact(n int64) string {
+	switch {
+	case n < 1000:
+		return strconv.FormatInt(n, 10)
+	case n < 1_000_000:
+		return fmt.Sprintf("%dk", (n+500)/1000)
+	default:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	}
+}

@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/yashwardhanv/dd/internal/ui"
+	"github.com/yashwardhanv/dd/internal/volume"
 )
 
 // Global flags shared by every command. They are filled in by cobra before a
@@ -46,6 +47,8 @@ func Execute(ctx context.Context, version string) int {
 	// Make the Windows console show colors and Unicode properly (undone on exit).
 	restore := ui.SetupConsole()
 	defer restore()
+	// Stop Windows popping up "There is no disk in the drive" for empty card readers.
+	volume.InitProcess()
 
 	root := NewRootCmd(version)
 	if err := root.ExecuteContext(ctx); err != nil {
@@ -77,6 +80,9 @@ saved index instantly - even for drives that are not plugged in.`,
 	root.AddCommand(newScanCmd())
 	root.AddCommand(newIndexCmd())
 	root.AddCommand(newSearchCmd())
+	root.AddCommand(newDrivesCmd())
+	root.AddCommand(newListCmd())
+	root.AddCommand(newForgetCmd())
 	return root
 }
 
