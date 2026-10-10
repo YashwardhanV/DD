@@ -18,7 +18,7 @@ Legend: `[x]` done and verified · `[~]` code complete and tested in the cloud c
 - [~] 12 Packaging & release
 
 ## Current status
-Stage: 12 code complete (owner checks pending) — all 13 stages are built. Next: the owner runs the hardware checks below, then decides on tagging `v1.0.0` (not tagged: BUILD.md says ask first).
+Stage: 12 — `v1.0.0` tagged on `f8367fc` and released with both Windows zips (2026-10-10); `main` is the default branch and the repo is public. The hardware checks this PC could run were run on 2026-10-10 (below): two bugs found and fixed after the tag. Still open: the checks that need a pen drive, a phone or a person watching the screen.
 
 ## Stress test (2026-10-06)
 A hardening pass after stage 12: fuzzing, adversarial unit tests, a randomized cancel/resume stress test and an end-to-end run on 200,000 files. **9 bugs found and fixed**, each with a test that fails on the old code and passes now:
@@ -43,6 +43,21 @@ What was run (all in the cloud container, Linux, Go 1.26):
 
 Noticed but left alone (not bugs, or not worth the code): `doctor` reports "N indexes saved" without flagging an unreadable one (`list` and every search already do); a phone file named `a:b.jpg` and another named `a_b.jpg` in the same folder would map to the same Windows name.
 
+## Hardware check run (2026-10-10)
+Run on the owner's PC (Windows 11, PowerShell 5.1, Administrator; NVMe SSD for C:, SATA hard disk for D:/E: behind Intel RST `iaStorAC`; no pen drive, phone or adb attached). Install/uninstall used the published `v1.0.0` zip; PATH and registry were backed up first and are back to how they were.
+
+**Bugs found and fixed:**
+
+| # | Bug | Effect | Fix / test |
+|---|-----|--------|------------|
+| 1 | Asking a **volume** (`\\.\C:`) how it is connected fails with *Incorrect function* under Intel RST (`iaStorAC`); the physical disk answers fine | every drive showed as "unknown connection" in `doctor`, scans used the middle worker count (4 instead of 16 on the NVMe SSD), and the agent logged an ERROR per drive at start-up | `queryStorageProperty` (`internal/volume/storage_windows.go`) falls back to `\\.\PhysicalDriveN` found with `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`; `TestBusTypeAnswersForSystemDrive` |
+| 2 | `TestRightClickPathsWithATrailingSpaceAreAccepted` used `E:\` as "a drive that doesn't exist" | `go test` (and so `build.ps1`) failed on any PC that has an E: drive | the test picks an unused letter (`missingDrive`) |
+
+**Passed:** 12(a) fresh clone + `build.ps1` under PowerShell 5.1, both zips hold the 5 files; 12(b) `install.ps1 --yes`, PATH gets one entry at the end, earlier entries kept, value stays `REG_EXPAND_SZ`, `drivedex version` works in a new shell; 12(c) re-install adds no second PATH entry, answering n changes nothing; 12(d) `uninstall --yes`: no menu keys, no Run value, PATH back to the original, program folder gone seconds later, indexes kept; 12(e) CI green; 12(f) README renders on GitHub (3 tables, the demo-GIF comment hidden). 11(a) `doctor` lines checked against the real hardware (this is how bug 1 was found); 11(c) `--json` parses with `path`/`name`/`size`; 11(d) `default_limit = 5` gives 5 results, `config show` prints the values (edited the file directly, Notepad not opened); 11(e) completion in PowerShell 5.1 via `TabExpansion2` (`se` → `search`, `search --j` → `--json`, `agent ` → start/status/stop; PowerShell 7 isn't installed); 11(g) turbo index of C: (1,002,874 entries in 19.3 s) then `size:>1gb` prints the `--with-metadata` tip once. 10(c) the exact `Index with DriveDex` command line on a folder with spaces works and waits for Enter; 10(d) `shell status` shows 4 × installed, and from a different exe 4 × `points to a different drivedex.exe`; 10(e) uninstall leaves no DriveDex key. 9(c) a second `drivedex-agent.exe` exits (one process); 9(d) `startup disable` removes the Run value; 9(e) `drivedex-agent.exe` is a GUI-subsystem exe, so it cannot open a console window.
+
+**Small things noticed, not changed:** `shell status` run from a different exe ends with "Not installed. Add it with: drivedex shell install" although entries exist (they point elsewhere) - "run 'drivedex shell install' to point them here" would be clearer.
+
+**Not run (needs hardware or a person at the screen):** everything with a pen drive or phone (9a, 9b, 9f, 11b), Explorer right-click clicks (10a, 10b), the interactive search screen (12b's `drivedex`, 11f), Notepad from `config edit` (11d), the demo GIF (12g).
 ## Decisions
 - 2026-10-06: module path = `github.com/yashwardhanv/dd` (matches the actual GitHub repo `YashwardhanV/DD`, so `go install` paths work). BUILD.md suggested `github.com/<user>/drivedex`.
 - 2026-10-06: repo layout from BUILD.md section 6 lives at the repo root (not inside a `drivedex/` subfolder).

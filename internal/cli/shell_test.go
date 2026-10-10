@@ -184,8 +184,22 @@ func TestRightClickPathsWithATrailingSpaceAreAccepted(t *testing.T) {
 		t.Errorf("index with a trailing space: %v", err)
 	}
 	var ue *UserError
-	_, err := resolveRoot(`E:\ `)
+	_, err := resolveRoot(missingDrive(t) + `\ `)
 	if err == nil || !errors.As(err, &ue) {
 		t.Errorf("a missing drive is still a friendly error: %v", err)
 	}
+}
+
+// missingDrive returns a drive letter such as "Q:" that isn't in use on this PC,
+// so tests about unplugged drives don't break on a PC that really has an E:.
+func missingDrive(t *testing.T) string {
+	t.Helper()
+	for c := 'Z'; c >= 'D'; c-- {
+		d := string(c) + ":"
+		if _, err := os.Stat(d + `\`); err != nil {
+			return d
+		}
+	}
+	t.Skip("every drive letter from D: to Z: is in use")
+	return ""
 }

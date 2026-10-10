@@ -40,3 +40,16 @@ func TestSeekPenaltyDoesNotCrash(t *testing.T) {
 		t.Error("network paths should be unknown")
 	}
 }
+
+// Some storage drivers (Intel RST's iaStorAC) refuse the question on the volume
+// with "Incorrect function"; BusType then asks the physical disk, so the system
+// drive must always give an answer.
+func TestBusTypeAnswersForSystemDrive(t *testing.T) {
+	info, err := BusType(`C:\`)
+	if err != nil || info.Bus == 0 {
+		t.Errorf(`BusType(C:\) = %+v, %v`, info, err)
+	}
+	if _, err := volumeDisk("C:"); err != nil {
+		t.Errorf("volumeDisk(C:): %v", err)
+	}
+}
