@@ -69,8 +69,8 @@ func copyMatches(ctx context.Context, in io.Reader, out *bufio.Writer, indexes [
 	}
 
 	groups := map[int]*copyGroup{} // by index position
-	var folders, offline, unreadable int
-	offlineNames := map[string]bool{}
+	var folders, offline, unreadable, onDevice int
+	offlineNames, deviceNames := map[string]bool{}, map[string]bool{}
 
 	forEachHit(indexes, res, env, func(ix *index.Index, h index.Hit, rel string) {
 		hd := &ix.Header
@@ -90,6 +90,11 @@ func copyMatches(ctx context.Context, in io.Reader, out *bufio.Writer, indexes [
 		job := copier.Job{Rel: filepath.Join(g.label, relOS), Size: ix.Sizes[h.Slot], ModTime: ix.MTimes[h.Slot]}
 
 		switch hd.SourceKind {
+		case index.KindDevice:
+			// Read through Windows, not a file path: DriveDex finds these but doesn't copy them.
+			onDevice++
+			deviceNames[hd.Label] = true
+			return
 		case index.KindPhone:
 			if !env.Online(hd) {
 				offline++
@@ -144,6 +149,16 @@ func copyMatches(ctx context.Context, in io.Reader, out *bufio.Writer, indexes [
 		sort.Strings(names)
 		fmt.Fprintln(out, ui.Yellow("note:")+fmt.Sprintf(" %d matching %s on drives that aren't connected (%s) and %s skipped.",
 			offline, plural(offline, "file is", "files are"), strings.Join(names, ", "), plural(offline, "was", "were")))
+	}
+	if onDevice > 0 {
+		var names []string
+		for n := range deviceNames {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		fmt.Fprintln(out, ui.Yellow("note:")+fmt.Sprintf(" %d matching %s on %s and %s skipped: copy %s in Explorer (This PC → %s).",
+			onDevice, plural(onDevice, "file is", "files are"), strings.Join(names, ", "), plural(onDevice, "was", "were"),
+			plural(onDevice, "it", "them"), names[0]))
 	}
 	if unreadable > 0 {
 		fmt.Fprintln(out, ui.Yellow("note:")+fmt.Sprintf(" %d %s couldn't be read from the drive and %s skipped.", unreadable, plural(unreadable, "file", " files"), plural(unreadable, "was", "were")))

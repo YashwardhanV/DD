@@ -13,6 +13,7 @@ import (
 
 	"github.com/yashwardhanv/dd/internal/index"
 	"github.com/yashwardhanv/dd/internal/phone"
+	"github.com/yashwardhanv/dd/internal/portable"
 	"github.com/yashwardhanv/dd/internal/volume"
 )
 
@@ -26,6 +27,8 @@ type world struct {
 	busErr   map[string]error
 	devs     []phone.Device
 	devsErr  error
+	ports    []portable.Device
+	portsErr error
 	headers  map[string]index.Header
 	locked   map[string]bool
 	indexErr map[string]error
@@ -96,6 +99,12 @@ func (w *world) deps() Deps {
 			defer w.mu.Unlock()
 			return append([]phone.Device(nil), w.devs...), w.devsErr
 		},
+		Portables: func() ([]portable.Device, error) {
+			w.mu.Lock()
+			defer w.mu.Unlock()
+			return append([]portable.Device(nil), w.ports...), w.portsErr
+		},
+		SystemDrive: "C:",
 		Index: func(ctx context.Context, t Target) (Outcome, error) {
 			n := w.running.Add(1)
 			defer w.running.Add(-1)
@@ -197,7 +206,7 @@ func TestNewUSBDriveIsIndexedWithItsLabelAndLetter(t *testing.T) {
 	}
 }
 
-func TestOnlyUSBDrivesAreAutoIndexedUnlessListed(t *testing.T) {
+func TestOnlyExternalDrivesAreAutoIndexedUnlessListed(t *testing.T) {
 	w := newWorld(t)
 	a, _ := w.agent(t, func(s *Settings) { s.AutoIndex = []string{"d", `G:\`} })
 	a.Prime(context.Background())
@@ -216,7 +225,7 @@ func TestOnlyUSBDrivesAreAutoIndexedUnlessListed(t *testing.T) {
 	if strings.Join(ids, ",") != "G:,D:,E:" {
 		t.Errorf("auto-indexed = %v, want G: D: E: (C: and H: are internal SATA/NVMe drives that aren't listed)", ids)
 	}
-	if !strings.Contains(w.logText(t), "ignoring C: (Windows): not a USB drive (NVMe)") {
+	if !strings.Contains(w.logText(t), "ignoring C: (Windows): internal drive (NVMe)") {
 		t.Errorf("ignored drives should be logged:\n%s", w.logText(t))
 	}
 }
@@ -293,21 +302,60 @@ func TestLabelFallbacks(t *testing.T) {
 	}
 }
 
-func TestBusQueryFailureMeansNotUSBAndIsLoggedOnce(t *testing.T) {
+func TestBusQueryFailureJudgesByDriveTypeAndIsLoggedOnce(t *testing.T) {
 	w := newWorld(t)
 	a, _ := w.agent(t)
 	a.Prime(context.Background())
-	w.plug(usbDrive("E:", "PEN", 0x1), usb)
+	disk := volume.Volume{Root: `E:\`, Label: "DISK", Serial: 0x1, DriveType: volume.DriveFixed, Ready: true}
+	w.plug(disk, usb)
 	w.busErr[`E:\`] = errors.New("access denied")
 	for i := 0; i < 3; i++ {
 		if got := a.PollVolumes(context.Background()); len(got) != 0 {
-			t.Errorf("a drive whose bus is unknown must not be auto-indexed: %+v", got)
+			t.Errorf("a fixed drive whose bus is unknown must not be auto-indexed: %+v", got)
 		}
 		w.unplug("E:")
-		w.plug(usbDrive("E:", "PEN", 0x1), usb)
+		w.plug(disk, usb)
+	}
+	// A "removable" drive (pen drive, memory card) is external whatever its bus.
+	w.plug(usbDrive("F:", "PEN", 0x2), usb)
+	w.busErr[`F:\`] = errors.New("access denied")
+	if got := a.PollVolumes(context.Background()); len(got) != 1 || got[0].Arg != "F:" {
+		t.Errorf("a removable drive must be auto-indexed even if its bus is unknown: %+v", got)
 	}
 	if n := strings.Count(w.logText(t), "couldn't tell how E: is connected"); n != 1 {
 		t.Errorf("the problem should be logged once, not %d times", n)
+	}
+}
+
+func TestEveryKindOfExternalDiskIsAutoIndexed(t *testing.T) {
+	w := newWorld(t)
+	a, _ := w.agent(t)
+	a.Prime(context.Background())
+	fixed := func(letter, label string, serial uint32) volume.Volume {
+		return volume.Volume{Root: letter + `\`, Label: label, Serial: serial, DriveType: volume.DriveFixed, Ready: true}
+	}
+	w.plug(fixed("E:", "USB HDD", 0xE0), volume.BusInfo{Bus: volume.BusTypeUsb})
+	w.plug(fixed("F:", "T7 THUNDERBOLT", 0xF0), volume.BusInfo{Bus: volume.BusTypeNvme, Hotplug: true})
+	w.plug(fixed("G:", "ESATA", 0x60), volume.BusInfo{Bus: volume.BusTypeSata, Hotplug: true})
+	w.plug(fixed("H:", "SD CARD", 0x70), volume.BusInfo{Bus: volume.BusTypeSd}) // laptop's built-in card reader
+	w.plug(fixed("D:", "DATA", 0xD0), volume.BusInfo{Bus: volume.BusTypeSata})  // internal: left alone
+	w.plug(fixed("V:", "VHD", 0x50), volume.BusInfo{Bus: volume.BusTypeFileBackedVirtual, Hotplug: true})
+
+	var args []string
+	for _, tg := range a.PollVolumes(context.Background()) {
+		args = append(args, tg.Arg)
+	}
+	if strings.Join(args, ",") != "G:,H:,E:,F:" {
+		t.Errorf("auto-indexed = %v, want the USB, Thunderbolt, eSATA and SD drives (not the internal disk or the .vhdx)", args)
+	}
+}
+
+func TestTheWindowsDriveIsNeverAutoIndexed(t *testing.T) {
+	w := newWorld(t)
+	w.plug(volume.Volume{Root: `C:\`, Label: "Windows To Go", Serial: 0xC0, DriveType: volume.DriveFixed, Ready: true}, usb)
+	a, _ := w.agent(t)
+	if got := a.Prime(context.Background()); len(got) != 0 {
+		t.Errorf("Windows running from a USB disk must not index its own system drive: %+v", got)
 	}
 }
 
@@ -404,6 +452,170 @@ func TestAdbProblemsAreLoggedOnceAndDontStopTheAgent(t *testing.T) {
 	d.Devices = nil
 	if got := New(d, DefaultSettings(), nil).PollPhones(context.Background()); got != nil {
 		t.Errorf("got %+v", got)
+	}
+}
+
+// ---- portable devices (MTP/PTP) -----------------------------------------------------------
+
+var galaxy = portable.Device{
+	InterfacePath: `\\?\usb#vid_04e8&pid_6860&ms_comp_mtp&samsung_android#6&2b5c4a3c&0&0000#{6ac27878-a6fa-4155-ba85-f98f491d4f33}`,
+	InstanceID:    `USB\VID_04E8&PID_6860&MS_COMP_MTP&SAMSUNG_ANDROID\6&2B5C4A3C&0&0000`,
+	Serial:        "R58M12345", Name: "Galaxy S21",
+}
+
+var camera = portable.Device{InstanceID: `USB\VID_04A9&PID_32D9\6&1&0&0`, Name: "Canon EOS R50"}
+
+func TestPortableDeviceArrival(t *testing.T) {
+	w := newWorld(t)
+	a, _ := w.agent(t)
+	a.Prime(context.Background())
+
+	w.ports = []portable.Device{galaxy}
+	got := a.PollPortables(context.Background())
+	want := Target{Kind: index.KindDevice, ID: galaxy.SourceID(), Label: "Galaxy S21", Arg: "device:" + galaxy.SourceID(), Display: "device Galaxy S21"}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("arrival = %+v, want %+v", got, want)
+	}
+	if again := a.PollPortables(context.Background()); len(again) != 0 {
+		t.Error("a connected device must not arrive repeatedly")
+	}
+	w.ports = append(w.ports, camera)
+	if got := a.PollPortables(context.Background()); len(got) != 1 || got[0].Label != "Canon EOS R50" {
+		t.Errorf("second device = %+v", got)
+	}
+	w.ports = nil
+	a.PollPortables(context.Background())
+	w.ports = []portable.Device{galaxy}
+	if got := a.PollPortables(context.Background()); len(got) != 1 {
+		t.Error("replugging a device is a new arrival")
+	}
+}
+
+func TestAPhoneThatAdbCanReadIsNotReadTwice(t *testing.T) {
+	w := newWorld(t)
+	a, _ := w.agent(t)
+	a.Prime(context.Background())
+
+	// USB debugging is on: adb reports the phone, and the same phone shows up as a portable device.
+	w.devs = []phone.Device{{Serial: "r58m12345", State: "device", Model: "SM-G991B"}}
+	w.ports = []portable.Device{galaxy}
+	if got := a.PollPhones(context.Background()); len(got) != 1 || got[0].Kind != index.KindPhone {
+		t.Fatalf("adb arrival = %+v", got)
+	}
+	if got := a.PollPortables(context.Background()); len(got) != 0 {
+		t.Errorf("the phone is already indexed over adb (faster): %+v", got)
+	}
+	if !strings.Contains(w.logText(t), "Galaxy S21 is connected with USB debugging") {
+		t.Errorf("the choice should be logged:\n%s", w.logText(t))
+	}
+	// An unauthorized adb phone can't be read by adb: the portable device is used.
+	w2 := newWorld(t)
+	b, _ := w2.agent(t)
+	b.Prime(context.Background())
+	w2.devs = []phone.Device{{Serial: "R58M12345", State: "unauthorized"}}
+	w2.ports = []portable.Device{galaxy}
+	b.PollPhones(context.Background())
+	if got := b.PollPortables(context.Background()); len(got) != 1 {
+		t.Errorf("unauthorized adb: the portable device should be indexed: %+v", got)
+	}
+}
+
+func TestALockedPhoneIsRetriedWithBackoff(t *testing.T) {
+	w := newWorld(t)
+	w.indexErr[galaxy.SourceID()] = errors.New("the device isn't showing any storage")
+	a, _ := w.agent(t)
+	a.Prime(context.Background())
+	w.ports = []portable.Device{galaxy}
+
+	got := a.PollPortables(context.Background())
+	if len(got) != 1 {
+		t.Fatalf("arrival = %+v", got)
+	}
+	a.Handle(context.Background(), got[0]) // fails: the phone is locked
+	if !strings.Contains(w.logText(t), "will try device Galaxy S21 again in 30.0s") {
+		t.Errorf("the retry should be logged:\n%s", w.logText(t))
+	}
+	if got := a.PollPortables(context.Background()); len(got) != 0 {
+		t.Error("not retried before 30 s")
+	}
+	w.now = w.now.Add(30 * time.Second)
+	got = a.PollPortables(context.Background())
+	if len(got) != 1 {
+		t.Fatal("retried after 30 s")
+	}
+	if again := a.PollPortables(context.Background()); len(again) != 0 {
+		t.Error("a queued retry must not be queued again")
+	}
+	a.Handle(context.Background(), got[0]) // still locked: wait twice as long
+	w.now = w.now.Add(59 * time.Second)
+	if got := a.PollPortables(context.Background()); len(got) != 0 {
+		t.Error("the second retry waits 60 s")
+	}
+	w.now = w.now.Add(time.Second)
+	got = a.PollPortables(context.Background())
+	if len(got) != 1 {
+		t.Fatal("retried after 60 s")
+	}
+	// The user unlocks the phone: it is indexed, and not retried again.
+	delete(w.indexErr, galaxy.SourceID())
+	a.Handle(context.Background(), got[0])
+	w.now = w.now.Add(time.Hour)
+	if got := a.PollPortables(context.Background()); len(got) != 0 {
+		t.Errorf("an indexed device must not be retried: %+v", got)
+	}
+	if len(w.notified) != 1 || w.notified[0][0] != "Galaxy S21 indexed" {
+		t.Errorf("notified = %v", w.notified)
+	}
+}
+
+func TestRetryDelayIsCapped(t *testing.T) {
+	w := newWorld(t)
+	a, _ := w.agent(t)
+	tg := deviceTarget(camera)
+	for i := 0; i < 10; i++ {
+		a.deviceFailed(tg)
+	}
+	if d := a.retries[tg.ID].delay; d != 5*time.Minute {
+		t.Errorf("delay = %v, want the 5 min cap", d)
+	}
+	// Unplugging forgets the backoff.
+	w.ports = nil
+	a.PollPortables(context.Background())
+	if _, ok := a.retries[tg.ID]; ok {
+		t.Error("an unplugged device's retry must be dropped")
+	}
+}
+
+func TestPrimeCatchUpForPortableDevices(t *testing.T) {
+	w := newWorld(t)
+	w.ports = []portable.Device{galaxy, camera}
+	w.headers[camera.SourceID()] = index.Header{UpdatedAt: w.now.Add(-time.Hour)}
+	a, _ := w.agent(t)
+	got := a.Prime(context.Background())
+	if len(got) != 1 || got[0].ID != galaxy.SourceID() {
+		t.Errorf("catch-up = %+v (the camera was indexed an hour ago)", got)
+	}
+	if again := a.PollPortables(context.Background()); len(again) != 0 {
+		t.Errorf("devices present at start-up are not arrivals: %+v", again)
+	}
+}
+
+func TestPortableListingProblemsAreLoggedOnce(t *testing.T) {
+	w := newWorld(t)
+	a, _ := w.agent(t)
+	w.portsErr = errors.New("cfgmgr32 said no")
+	for i := 0; i < 3; i++ {
+		if got := a.PollPortables(context.Background()); got != nil {
+			t.Errorf("got %+v", got)
+		}
+	}
+	if n := strings.Count(w.logText(t), "cfgmgr32 said no"); n != 1 {
+		t.Errorf("logged %d times", n)
+	}
+	d := w.deps()
+	d.Portables = nil
+	if got := New(d, DefaultSettings(), nil).PollPortables(context.Background()); got != nil {
+		t.Errorf("without a lister nothing is watched: %+v", got)
 	}
 }
 
@@ -566,5 +778,37 @@ func TestDefaultSettingsMatchTheSpec(t *testing.T) {
 	s := DefaultSettings()
 	if !s.Notifications || s.Settle != 3*time.Second || s.DrivePoll != 2*time.Second || s.PhonePoll != 5*time.Second || s.StaleAfter != 24*time.Hour {
 		t.Errorf("defaults = %+v", s)
+	}
+}
+
+func TestRunIndexesAPortableDeviceWhenItIsPluggedIn(t *testing.T) {
+	w := newWorld(t)
+	a, _ := w.agent(t, func(s *Settings) { s.Settle, s.DrivePoll, s.PhonePoll = 0, time.Hour, 5*time.Millisecond })
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { a.Run(ctx); close(done) }()
+
+	time.Sleep(20 * time.Millisecond) // the agent is watching; now the phone is plugged in
+	w.mu.Lock()
+	w.ports = []portable.Device{galaxy}
+	w.mu.Unlock()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		w.mu.Lock()
+		n := len(w.notified)
+		w.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	if len(w.indexed) != 1 || w.indexed[0].Kind != index.KindDevice || w.indexed[0].Arg != galaxy.Arg() {
+		t.Errorf("indexed = %+v", w.indexed)
+	}
+	if len(w.notified) != 1 || w.notified[0][0] != "Galaxy S21 indexed" {
+		t.Errorf("notified = %v", w.notified)
 	}
 }

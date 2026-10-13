@@ -53,3 +53,20 @@ func TestBusTypeAnswersForSystemDrive(t *testing.T) {
 		t.Errorf("volumeDisk(C:): %v", err)
 	}
 }
+
+// The disk Windows runs from is never hot-pluggable, and the question must be
+// answered (through the physical disk if the volume refuses it) without error.
+func TestSystemDriveIsInternal(t *testing.T) {
+	info, err := BusType(`C:\`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf(`C:\ bus %s, hotplug %v`, BusName(info.Bus), info.Hotplug)
+	v, err := ForPath(`C:\`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if IsExternal(v, info, "C:") {
+		t.Error("the system drive must never count as external")
+	}
+}

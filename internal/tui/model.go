@@ -492,6 +492,12 @@ func buildRows(indexes []*index.Index, env index.Env, res index.SearchResult) []
 			r.PhonePath = strings.TrimRight(hd.RootPath, "/") + "/" + strings.ReplaceAll(rel, `\`, "/")
 			r.CopyPath = "phone:/" + strings.ReplaceAll(rel, `\`, "/")
 			r.NoMeta = false // a phone path isn't a file on this PC
+		case index.KindDevice:
+			if !online {
+				r.Dir += " · offline"
+			}
+			r.CopyPath = index.DevicePath(hd, rel)
+			r.NoMeta = false // nor is a portable device's
 		case index.KindVolume:
 			if root, mounted := env.Mounts[hd.SourceID]; mounted {
 				r.LocalPath = index.JoinRoot(root, rel)
@@ -522,7 +528,18 @@ func offlineMessage(r Row) string {
 	if r.Kind == index.KindPhone {
 		return fmt.Sprintf("Phone %q isn't connected — plug it in.", r.Label)
 	}
+	if r.Kind == index.KindDevice {
+		return fmt.Sprintf("%q isn't connected — plug it in.", r.Label)
+	}
 	return fmt.Sprintf("Drive %q isn't connected — plug it in.", r.Label)
+}
+
+// notLocalMessage explains what to do with a result that isn't a file on this PC.
+func notLocalMessage(r Row) string {
+	if r.Kind == index.KindDevice {
+		return fmt.Sprintf("That result is on %s: open it in Explorer under This PC (Ctrl+Y copies its path).", r.Label)
+	}
+	return "That result is on a phone: press Ctrl+P to copy it to your Downloads folder."
 }
 
 func (m Model) doOpen() (tea.Model, tea.Cmd) {
@@ -535,7 +552,7 @@ func (m Model) doOpen() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if r.LocalPath == "" {
-		m.status = "That result is on a phone: press Ctrl+P to copy it to your Downloads folder."
+		m.status = notLocalMessage(r)
 		return m, nil
 	}
 	open := m.cfg.Actions.Open
@@ -560,7 +577,7 @@ func (m Model) doShow() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if r.LocalPath == "" {
-		m.status = "That result is on a phone: press Ctrl+P to copy it to your Downloads folder."
+		m.status = notLocalMessage(r)
 		return m, nil
 	}
 	show := m.cfg.Actions.ShowInFolder

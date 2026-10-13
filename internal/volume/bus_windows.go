@@ -7,12 +7,16 @@ import (
 	"path/filepath"
 )
 
-// propertyDevice is STORAGE_PROPERTY_ID StorageDeviceProperty.
-const propertyDevice = 0
+const (
+	// propertyDevice is STORAGE_PROPERTY_ID StorageDeviceProperty.
+	propertyDevice = 0
+	// ioctlStorageGetHotplugInfo asks whether a disk can be unplugged while the PC runs.
+	ioctlStorageGetHotplugInfo = 0x002D0C14
+)
 
 // BusType asks Windows how the drive holding root is connected (USB, SATA,
-// NVMe ...) and what it calls itself. Like SeekPenalty it needs no
-// Administrator rights.
+// NVMe ...), whether it is hot-pluggable, and what it calls itself. Like
+// SeekPenalty it needs no Administrator rights.
 func BusType(root string) (BusInfo, error) {
 	vol := filepath.VolumeName(root)
 	if len(vol) != 2 || vol[1] != ':' {
@@ -22,5 +26,13 @@ func BusType(root string) (BusInfo, error) {
 	if err != nil {
 		return BusInfo{}, fmt.Errorf("asking %s how it is connected: %w", vol, err)
 	}
-	return ParseDeviceDescriptor(out)
+	info, err := ParseDeviceDescriptor(out)
+	if err != nil {
+		return info, err
+	}
+	// Not every driver answers the hotplug question; no answer means "not hot-pluggable".
+	if hp, err := queryDisk(vol, ioctlStorageGetHotplugInfo, nil, 8); err == nil {
+		info.Hotplug, _ = ParseHotplugInfo(hp)
+	}
+	return info, nil
 }

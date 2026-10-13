@@ -1,6 +1,6 @@
 # DriveDex
 
-**Instant search and fast copy for external drives, pen drives and Android phones — even when they're unplugged.**
+**Instant search and fast copy for external drives, pen drives, memory cards, phones and cameras — even when they're unplugged.**
 A single Windows program written in Go (no CGO, no extra DLLs).
 
 <!--
@@ -24,11 +24,11 @@ A single Windows program written in Go (no CGO, no extra DLLs).
 
 - **Indexes once, searches in milliseconds.** The list of every file is saved on your PC. Search never touches the drive, so it also works for drives that are *not plugged in* (results are marked `offline` with the drive's name and last letter).
 - **Knows drives by their serial number, not by letter.** The pen drive that is `E:` today and `G:` tomorrow is still the same index.
-- **Reads phones over ADB** (one `find` command on the phone instead of thousands of MTP requests).
+- **Reads phones over ADB** (one `find` command on the phone instead of thousands of MTP requests), and **any other portable device** — a phone in plain "File transfer" mode, an iPhone, a camera — through Windows, with nothing to set up.
 - **NTFS "turbo mode":** reads the drive's Master File Table directly (millions of files in seconds) and then refreshes from the NTFS change journal in milliseconds.
 - **Tunes itself to the drive:** few parallel readers for a spinning hard disk, many for flash.
 - **Fast, resumable copy** with parallel workers, atomic file writes, free-space and FAT32 (4 GiB) pre-checks, optional CRC-32 verification — from drives, folders and phones.
-- **A background agent** re-indexes USB drives and phones the moment you plug them in.
+- **A background agent** maps out anything you plug in, by itself: USB disks and pen drives, memory cards (also in the laptop's own card reader), eSATA/Thunderbolt/FireWire disks, phones, iPhones and cameras. A locked phone is tried again until you unlock it. Internal disks are left alone unless you list them in `auto_index`.
 - **Explorer right-click menu**, an interactive type-as-you-search screen, a power query language, `--json` output for scripts, and a `doctor` that explains why things are slow.
 
 ## Performance
@@ -69,14 +69,14 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1   # vet + test + buil
 ## Quick start
 
 ```powershell
-drivedex drives                       # which drives are connected, and which are indexed
+drivedex drives                       # which drives and devices are connected, how, and which are indexed
 drivedex index E:                     # scan the pen drive once (use an Administrator terminal for NTFS turbo mode)
 drivedex search invoice ext:pdf       # instant search of everything indexed - plugged in or not
 drivedex                              # the interactive type-as-you-search screen
 drivedex copy E:\Photos D:\Backup     # fast, resumable copy (add --dry-run to preview)
 ```
 
-More: `drivedex index phone` (Android), `drivedex search IMG --paths-only`, `drivedex doctor --bench E:`, `drivedex agent start`, `drivedex shell install`. Every command has `--help` with examples.
+More: `drivedex index phone` (Android over USB debugging), `drivedex index device` (any phone, iPhone or camera in Explorer's This PC), `drivedex search IMG --paths-only`, `drivedex doctor --bench E:`, `drivedex agent start`, `drivedex shell install`. Every command has `--help` with examples.
 
 ## Search syntax
 
@@ -91,7 +91,7 @@ Words must all appear in the file name (not case sensitive). Combine anything:
 | `type:file` / `type:dir` | only files / only folders | `type:dir photos` |
 | `size:>100mb` `size:<1kb` `size:10mb..1gb` | size (b/kb/mb/gb, 1024-based) | `size:>1gb ext:mp4` |
 | `modified:>2025-01-01` `modified:<30d` | date, or "within the last N days" | `modified:<7d` |
-| `drive:E` `drive:phone` `drive:"SANDISK 32GB"` | one drive (letter, any phone, or label) | `drive:phone IMG` |
+| `drive:E` `drive:phone` `drive:device` `drive:"SANDISK 32GB"` | one drive (letter, any phone, any portable device, or label) | `drive:phone IMG` |
 | `path:word` | match the whole path, not just the name | `path:whatsapp` |
 | `re:<regex>` | Go regular expression on the name | `re:^IMG_\d{8}` |
 
@@ -107,7 +107,8 @@ drivedex search ext:jpg size:>2mb --json | ConvertFrom-Json | Select-Object -Fir
 2. **Paths are rebuilt from parent IDs.** An entry stores only its name and its parent's ID, so the index stays small and renaming a folder changes one entry, not a million paths.
 3. **NTFS turbo mode** enumerates the Master File Table (`FSCTL_ENUM_USN_DATA`), then replays the change journal (`FSCTL_READ_USN_JOURNAL`) to refresh — "read the library catalogue, then only the diary entries since last time".
 4. **The scanner adapts to the drive:** it asks Windows whether the drive has a seek penalty (spinning disk) and picks 2 / many / 4 workers for HDD / flash / unknown.
-5. **Phones use ADB**, not MTP: one `find … -exec stat` runs on the phone and streams back the whole list.
+5. **Phones use ADB**, not MTP: one `find … -exec stat` runs on the phone and streams back the whole list. Devices without USB debugging (and iPhones, cameras) are read through the Windows Shell instead — slower, folder by folder, which is why the agent does it in the background.
+6. **What counts as external:** USB, FireWire and SD/MMC drives, anything Windows calls removable, and any disk Windows reports as hot-pluggable (eSATA, Thunderbolt enclosures). Never the Windows drive or a mounted `.vhdx`.
 
 The long, beginner-friendly version (file systems, MFT, USN journal, MTP vs ADB, HDD vs flash…) is in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
 
@@ -141,7 +142,7 @@ Start with `drivedex doctor` — it checks everything below and prints the fix.
 
 ## Limitations
 
-- **iPhone is not supported** (no ADB equivalent); Android only.
+- **iPhones, cameras and phones without USB debugging** are indexed and searchable, but DriveDex doesn't copy files *off* them — open them in Explorer (This PC → the device). An iPhone shows only its photos (`DCIM`), as in Explorer.
 - **NTFS turbo mode needs an Administrator terminal** (Windows only lets administrators read a drive's file table). Everything else works without.
 - **Cloned drives share a serial number**, so they share one index. Reformatting a drive gives it a new serial (and a new index).
 - **Only files on a phone are listed** by `find -type f`; folders that contain no files don't appear. Android also hides some folders (such as `Android/data`) from ADB.
@@ -157,6 +158,7 @@ internal/query      the search language (parser + matcher)
 internal/scan       walk and parallel directory scanners
 internal/ntfs       MFT enumeration and USN-journal refresh (with an in-memory fake NTFS for tests)
 internal/phone      ADB: listing, stat, pull (with a fake phone for tests)
+internal/portable   phones, iPhones, cameras through Windows (MTP/PTP): detection and listing
 internal/volume     drive identity (serial, label, bus type, HDD/flash)
 internal/copier     plan/run copy engine
 internal/tui        the interactive screen (Bubble Tea)

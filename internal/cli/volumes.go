@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 var (
 	listVolumes   = volume.List
 	volumeForPath = volume.ForPath
+	systemDrive   = func() string { return os.Getenv("SystemDrive") }
 )
 
 // phoneCheckTimeout bounds the "which phones are connected?" check that runs
@@ -25,7 +27,7 @@ const phoneCheckTimeout = 5 * time.Second
 // currentEnv works out what is connected right now, so results can show the
 // drive's CURRENT letter (found by serial number) or an "offline" marker.
 func currentEnv(wantPhones bool) index.Env {
-	env := index.Env{Mounts: map[string]string{}, Phones: map[string]bool{}}
+	env := index.Env{Mounts: map[string]string{}, Phones: map[string]bool{}, Devices: map[string]bool{}}
 	vols, _ := listVolumes() // on error we simply know of no drives
 	for _, v := range vols {
 		if v.Ready && v.Serial != 0 {
@@ -35,6 +37,7 @@ func currentEnv(wantPhones bool) index.Env {
 	if wantPhones {
 		phoneEnv(&env) // asks adb once; the answer is used for the whole command
 	}
+	deviceEnv(&env)
 	return env
 }
 

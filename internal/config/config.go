@@ -101,7 +101,8 @@ stale_after     = "24h"
 # auto_index, run: drivedex agent stop   then   drivedex agent start)
 notifications   = true
 
-# Extra (non-USB) drives the background agent should index too, e.g. ["D:"].
+# The background agent indexes every external drive, phone and portable device
+# by itself. List internal drives here to have it keep those indexed too, e.g. ["D:"].
 auto_index      = []
 
 # Full path of adb.exe, if DriveDex can't find it by itself.

@@ -16,13 +16,23 @@ const ioctlVolumeGetVolumeDiskExtents = 0x00560000
 
 // queryStorageProperty asks the drive holding vol ("E:") the
 // IOCTL_STORAGE_QUERY_PROPERTY question prop and returns the reply.
+func queryStorageProperty(vol string, prop uint32, outSize int) ([]byte, error) {
+	// STORAGE_PROPERTY_QUERY: PropertyId uint32, QueryType uint32, 4 spare bytes.
+	var in [12]byte
+	binary.LittleEndian.PutUint32(in[0:], prop)
+	binary.LittleEndian.PutUint32(in[4:], queryStandard)
+	return queryDisk(vol, ioctlStorageQueryProperty, in[:], outSize)
+}
+
+// queryDisk sends the storage IOCTL code to the drive holding vol ("E:") and
+// returns the reply.
 //
 // It asks the volume first. Some storage drivers (Intel RST's iaStorAC, for
 // one) answer that with "Incorrect function" although the disk underneath
 // knows the answer, so it then asks the physical disk the volume lives on.
 // Both are opened with ZERO access rights, so no administrator rights are needed.
-func queryStorageProperty(vol string, prop uint32, outSize int) ([]byte, error) {
-	out, err := storageProperty(`\\.\`+strings.ToUpper(vol), prop, outSize)
+func queryDisk(vol string, code uint32, in []byte, outSize int) ([]byte, error) {
+	out, err := deviceIoctl(`\\.\`+strings.ToUpper(vol), code, in, outSize)
 	if err == nil {
 		return out, nil
 	}
@@ -30,29 +40,28 @@ func queryStorageProperty(vol string, prop uint32, outSize int) ([]byte, error) 
 	if derr != nil {
 		return nil, err
 	}
-	out, perr := storageProperty(fmt.Sprintf(`\\.\PhysicalDrive%d`, disk), prop, outSize)
+	out, perr := deviceIoctl(fmt.Sprintf(`\\.\PhysicalDrive%d`, disk), code, in, outSize)
 	if perr != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-// storageProperty sends IOCTL_STORAGE_QUERY_PROPERTY(prop, PropertyStandardQuery) to device.
-func storageProperty(device string, prop uint32, outSize int) ([]byte, error) {
+// deviceIoctl opens device for questions only and sends it one IOCTL.
+func deviceIoctl(device string, code uint32, in []byte, outSize int) ([]byte, error) {
 	h, err := openForQuery(device)
 	if err != nil {
 		return nil, err
 	}
 	defer windows.CloseHandle(h)
 
-	// STORAGE_PROPERTY_QUERY: PropertyId uint32, QueryType uint32, 4 spare bytes.
-	var in [12]byte
-	binary.LittleEndian.PutUint32(in[0:], prop)
-	binary.LittleEndian.PutUint32(in[4:], queryStandard)
-
+	var inPtr *byte
+	if len(in) > 0 {
+		inPtr = &in[0]
+	}
 	out := make([]byte, outSize)
 	var returned uint32
-	if err := windows.DeviceIoControl(h, ioctlStorageQueryProperty, &in[0], uint32(len(in)), &out[0], uint32(len(out)), &returned, nil); err != nil {
+	if err := windows.DeviceIoControl(h, code, inPtr, uint32(len(in)), &out[0], uint32(len(out)), &returned, nil); err != nil {
 		return nil, err
 	}
 	return out[:returned], nil

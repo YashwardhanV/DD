@@ -9,6 +9,7 @@ import (
 
 	"github.com/yashwardhanv/dd/internal/index"
 	"github.com/yashwardhanv/dd/internal/phone"
+	"github.com/yashwardhanv/dd/internal/portable"
 	"github.com/yashwardhanv/dd/internal/ui"
 	"github.com/yashwardhanv/dd/internal/volume"
 )
@@ -17,35 +18,43 @@ import (
 type Settings struct {
 	// Notifications shows a Windows pop-up when a drive has been indexed.
 	Notifications bool
-	// AutoIndex lists extra, non-USB drives to index automatically ("D:").
+	// AutoIndex lists extra, internal drives to index automatically ("D:").
+	// External drives are always indexed.
 	AutoIndex []string
 	// StaleAfter: at start-up, drives whose index is older than this are refreshed.
 	StaleAfter time.Duration
 	// Settle is how long to wait after a drive appears before reading it
 	// (Windows is still mounting it and Defender is looking at it).
 	Settle time.Duration
-	// DrivePoll / PhonePoll / MediaPoll are the polling intervals.
+	// DrivePoll / PhonePoll / MediaPoll are the polling intervals. Portable
+	// devices are checked together with phones.
 	DrivePoll, PhonePoll, MediaPoll time.Duration
+	// DeviceRetry is how long to wait before trying a portable device again
+	// after it couldn't be read (a locked phone shows no files); every further
+	// failure doubles the wait, up to DeviceRetryMax.
+	DeviceRetry, DeviceRetryMax time.Duration
 }
 
 // DefaultSettings are the values BUILD.md specifies.
 func DefaultSettings() Settings {
 	return Settings{
-		Notifications: true,
-		StaleAfter:    24 * time.Hour,
-		Settle:        3 * time.Second,
-		DrivePoll:     2 * time.Second,
-		PhonePoll:     5 * time.Second,
-		MediaPoll:     10 * time.Second,
+		Notifications:  true,
+		StaleAfter:     24 * time.Hour,
+		Settle:         3 * time.Second,
+		DrivePoll:      2 * time.Second,
+		PhonePoll:      5 * time.Second,
+		MediaPoll:      10 * time.Second,
+		DeviceRetry:    30 * time.Second,
+		DeviceRetryMax: 5 * time.Minute,
 	}
 }
 
 // Target is something worth (re-)indexing.
 type Target struct {
-	Kind    string // index.KindVolume or index.KindPhone
-	ID      string // the index's SourceID: "vol-1A2B3C4D" or "adb-<serial>"
+	Kind    string // index.KindVolume, index.KindPhone or index.KindDevice
+	ID      string // the index's SourceID: "vol-1A2B3C4D", "adb-<serial>" or "dev-<12 hex>"
 	Label   string // "SANDISK 32GB" - for messages
-	Arg     string // what to pass to `drivedex index`: "E:" or "phone:<serial>"
+	Arg     string // what to pass to `drivedex index`: "E:", "phone:<serial>" or "device:dev-<12 hex>"
 	Display string // "SANDISK 32GB (E:)" - for the log
 }
 
@@ -65,6 +74,11 @@ type Deps struct {
 	Bus func(root string) (volume.BusInfo, error)
 	// Devices lists phones; nil when adb isn't available.
 	Devices func(ctx context.Context) ([]phone.Device, error)
+	// Portables lists portable devices (phones in "File transfer" mode,
+	// iPhones, cameras); nil disables watching them.
+	Portables func() ([]portable.Device, error)
+	// SystemDrive is the drive Windows runs from ("C:"); it is never auto-indexed.
+	SystemDrive string
 	// Index (re-)indexes a target.
 	Index func(ctx context.Context, t Target) (Outcome, error)
 	// Locked reports whether another process is indexing the target right now.
@@ -79,7 +93,7 @@ type Deps struct {
 	Now func() time.Time
 }
 
-// Agent watches for drives and phones.
+// Agent watches for drives, phones and portable devices.
 type Agent struct {
 	d   Deps
 	set Settings
@@ -91,7 +105,16 @@ type Agent struct {
 	polls      int
 	known      map[string]string // ready volumes seen last time: SourceID -> letter
 	phones     map[string]string // phones seen last time: serial -> state
+	portables  map[string]bool   // portable devices seen last time, by SourceID
+	retries    map[string]retry  // portable devices that couldn't be read, by SourceID
 	loggedFail map[string]bool   // problems already logged (so a persistent one logs once)
+}
+
+// retry schedules another attempt at a portable device that couldn't be read.
+type retry struct {
+	at     time.Time
+	delay  time.Duration
+	queued bool // the attempt is waiting in (or going through) the queue
 }
 
 // New creates an Agent.
@@ -111,7 +134,8 @@ func New(d Deps, set Settings, log *Logger) *Agent {
 			}
 		}
 	}
-	return &Agent{d: d, set: set, log: log, known: map[string]string{}, phones: map[string]string{}, loggedFail: map[string]bool{}}
+	return &Agent{d: d, set: set, log: log, known: map[string]string{}, phones: map[string]string{},
+		portables: map[string]bool{}, retries: map[string]retry{}, loggedFail: map[string]bool{}}
 }
 
 // logOnce logs a problem the first time only, until clearFail resets it.
@@ -125,17 +149,19 @@ func (a *Agent) logOnce(key, format string, args ...any) {
 func (a *Agent) clearFail(key string) { delete(a.loggedFail, key) }
 
 // wantsAutoIndex decides whether a drive is one the agent should index by
-// itself: USB drives always, anything else only if listed in AutoIndex.
+// itself: every external drive (USB, FireWire, memory card, eSATA,
+// Thunderbolt - see volume.IsExternal), and internal drives only if listed in
+// AutoIndex.
 func (a *Agent) wantsAutoIndex(v volume.Volume) (volume.BusInfo, bool) {
 	var bus volume.BusInfo
 	if a.d.Bus != nil {
 		if b, err := a.d.Bus(v.Root); err == nil {
 			bus = b
 		} else {
-			a.logOnce("bus-"+v.Letter(), "couldn't tell how %s is connected (%v); treating it as not USB", v.Letter(), err)
+			a.logOnce("bus-"+v.Letter(), "couldn't tell how %s is connected (%v); judging it by its drive type alone", v.Letter(), err)
 		}
 	}
-	if bus.IsUSB() {
+	if volume.IsExternal(v, bus, a.d.SystemDrive) {
 		return bus, true
 	}
 	for _, l := range a.set.AutoIndex {
@@ -157,6 +183,13 @@ func volumeTarget(v volume.Volume, bus volume.BusInfo) Target {
 	return Target{
 		Kind: index.KindVolume, ID: volume.SourceID(v), Label: label, Arg: v.Letter(),
 		Display: fmt.Sprintf("%s (%s)", label, v.Letter()),
+	}
+}
+
+func deviceTarget(d portable.Device) Target {
+	return Target{
+		Kind: index.KindDevice, ID: d.SourceID(), Label: d.Label(), Arg: d.Arg(),
+		Display: fmt.Sprintf("device %s", d.Label()),
 	}
 }
 
@@ -227,6 +260,18 @@ func (a *Agent) Prime(ctx context.Context) []Target {
 			}
 		}
 	}
+	if a.d.Portables != nil {
+		if devs, err := a.d.Portables(); err != nil {
+			a.logOnce("portables", "couldn't list the portable devices: %v", err)
+		} else {
+			for _, d := range devs {
+				a.portables[d.SourceID()] = true
+				if !a.viaADB(d) && a.stale(d.SourceID()) {
+					catchUp = append(catchUp, deviceTarget(d))
+				}
+			}
+		}
+	}
 	sortTargets(catchUp)
 	return catchUp
 }
@@ -275,7 +320,7 @@ func (a *Agent) PollVolumes(ctx context.Context) []Target {
 		if bus, ok := a.wantsAutoIndex(v); ok {
 			arrivals = append(arrivals, volumeTarget(v, bus))
 		} else {
-			a.log.Infof("ignoring %s (%s): not a USB drive (%s)", v.Letter(), nonEmpty(v.Label, volume.SourceID(v)), volume.BusName(bus.Bus))
+			a.log.Infof("ignoring %s (%s): internal drive (%s)", v.Letter(), nonEmpty(v.Label, volume.SourceID(v)), volume.BusName(bus.Bus))
 		}
 	}
 	// Remember exactly what is here now: a drive that is unplugged and plugged
@@ -322,6 +367,93 @@ func (a *Agent) PollPhones(ctx context.Context) []Target {
 	return arrivals
 }
 
+// PollPortables checks for newly connected portable devices, and for devices
+// whose retry time has come. It runs after PollPhones, so a phone that adb
+// can already read (USB debugging on: much faster) isn't read a second way.
+func (a *Agent) PollPortables(ctx context.Context) []Target {
+	if a.d.Portables == nil {
+		return nil
+	}
+	devs, err := a.d.Portables()
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err != nil {
+		a.logOnce("portables", "couldn't list the portable devices: %v", err)
+		return nil
+	}
+	a.clearFail("portables")
+
+	now := a.d.Now()
+	var arrivals []Target
+	present := map[string]bool{}
+	for _, d := range devs {
+		id := d.SourceID()
+		present[id] = true
+		if a.viaADB(d) {
+			if !a.portables[id] {
+				a.log.Infof("%s is connected with USB debugging: indexing it as phone %s instead", d.Label(), d.Serial)
+			}
+			continue
+		}
+		r, retrying := a.retries[id]
+		switch {
+		case !a.portables[id]:
+			arrivals = append(arrivals, deviceTarget(d))
+		case retrying && !r.queued && !now.Before(r.at):
+			r.queued = true // the next failure (if any) schedules the next attempt
+			a.retries[id] = r
+			arrivals = append(arrivals, deviceTarget(d))
+		}
+	}
+	// A device that is unplugged and plugged in again is new the second time,
+	// and starts again from the shortest retry delay.
+	for id := range a.retries {
+		if !present[id] {
+			delete(a.retries, id)
+		}
+	}
+	a.portables = present
+	sortTargets(arrivals)
+	return arrivals
+}
+
+// viaADB reports whether adb can read this device itself (call with a.mu held).
+func (a *Agent) viaADB(d portable.Device) bool {
+	if d.Serial == "" {
+		return false
+	}
+	for serial, state := range a.phones {
+		if state == "device" && strings.EqualFold(serial, d.Serial) {
+			return true
+		}
+	}
+	return false
+}
+
+// deviceFailed schedules another attempt at a portable device: a phone that
+// is locked, or not yet switched to "File transfer", shows no files until it is.
+func (a *Agent) deviceFailed(t Target) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	r := a.retries[t.ID]
+	switch {
+	case r.delay == 0:
+		r.delay = a.set.DeviceRetry
+	case r.delay < a.set.DeviceRetryMax:
+		r.delay = min(2*r.delay, a.set.DeviceRetryMax)
+	}
+	r.at, r.queued = a.d.Now().Add(r.delay), false
+	a.retries[t.ID] = r
+	a.log.Infof("will try %s again in %s (unlock it, and on a phone choose \"File transfer\")", t.Display, ui.FormatDuration(r.delay))
+}
+
+func (a *Agent) deviceSucceeded(t Target) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.retries, t.ID)
+}
+
 // Handle re-indexes one target: wait for it to settle, skip it if someone else
 // is already indexing it, index it, log the result, and (optionally) show a
 // notification.
@@ -342,7 +474,13 @@ func (a *Agent) Handle(ctx context.Context, t Target) {
 			return
 		}
 		a.log.Errorf("indexing %s failed: %v", t.Display, err)
+		if t.Kind == index.KindDevice {
+			a.deviceFailed(t)
+		}
 		return
+	}
+	if t.Kind == index.KindDevice {
+		a.deviceSucceeded(t)
 	}
 	took := a.d.Now().Sub(start)
 	a.log.Infof("indexed %s: %s entries in %s", t.Display, ui.Thousands(int64(out.Entries)), ui.FormatDuration(took))
@@ -357,7 +495,7 @@ func (a *Agent) Handle(ctx context.Context, t Target) {
 }
 
 // Run watches until ctx ends. Indexing happens one drive at a time on a
-// single worker (several USB drives indexing at once would just fight over the
+// single worker (several drives indexing at once would just fight over the
 // bus), while polling carries on.
 func (a *Agent) Run(ctx context.Context) {
 	a.log.Infof("agent started")
@@ -421,6 +559,7 @@ loop:
 			enqueue(a.PollVolumes(ctx))
 		case <-phoneTick.C:
 			enqueue(a.PollPhones(ctx))
+			enqueue(a.PollPortables(ctx))
 		}
 	}
 	wg.Wait()

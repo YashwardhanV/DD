@@ -1,5 +1,6 @@
-// Command drivedex-agent is the background program that indexes USB drives and
-// Android phones automatically when they are plugged in.
+// Command drivedex-agent is the background program that indexes external
+// drives, phones and other portable devices automatically when they are
+// plugged in.
 //
 // It is built as a Windows "GUI" program (-ldflags -H=windowsgui) so it has no
 // console window at all. Start and stop it with `drivedex agent start|stop`.

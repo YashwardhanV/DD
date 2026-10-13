@@ -34,10 +34,19 @@ func newAgentCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "agent",
 		Short: "Control the background agent that indexes drives when you plug them in",
-		Long: `The agent is a small program with no window that watches for USB drives and
-Android phones. When one is plugged in it refreshes that drive's index by
-itself, so you never have to remember to run 'drivedex index'. It writes a log
-you can read with 'drivedex agent status'.
+		Long: `The agent is a small program with no window that watches for anything with
+files on it being plugged in, and indexes it by itself - so you never have to
+remember to run 'drivedex index':
+
+  - external drives: USB disks and pen drives, memory cards (including the
+    laptop's own card reader), FireWire, eSATA and Thunderbolt disks;
+  - phones, iPhones, cameras and other portable devices that Explorer shows
+    under This PC (on a phone, choose "File transfer" in its USB notification);
+  - Android phones with USB debugging on (read over adb, which is faster).
+
+Internal disks are left alone unless listed in auto_index ('drivedex config
+edit'). A locked phone is tried again until it is unlocked. The agent writes a
+log you can read with 'drivedex agent status'.
 
 To make it start every time you log in, use 'drivedex startup enable'.`,
 		Example: `  drivedex agent start
@@ -50,8 +59,8 @@ To make it start every time you log in, use 'drivedex startup enable'.`,
 		&cobra.Command{
 			Use: "start", Short: "Start the background agent", Args: cobra.NoArgs,
 			Long: `Starts the agent in the background with no window. If it is already running
-nothing happens. From then on, plugging in a USB drive or phone refreshes
-its index automatically.`,
+nothing happens. From then on, plugging in an external drive, a phone or
+another portable device refreshes its index automatically.`,
 			Example: `  drivedex agent start
   drivedex agent start && drivedex agent status`,
 			RunE: func(cmd *cobra.Command, args []string) error { return runAgentStart(cmd.OutOrStdout()) },
@@ -112,7 +121,7 @@ func startAgentProgram(out io.Writer, dir, exe string) error {
 	deadline := time.Now().Add(agentWait)
 	for time.Now().Before(deadline) {
 		if info, running := currentAgent(dir); running {
-			fmt.Fprintf(out, "Agent started (PID %d). It will index USB drives and phones when you plug them in.\n", info.PID)
+			fmt.Fprintf(out, "Agent started (PID %d). It will index external drives, phones and other devices when you plug them in.\n", info.PID)
 			fmt.Fprintln(out, ui.Dim("Log: "+agent.LogPath(dir)))
 			return nil
 		}

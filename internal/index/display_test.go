@@ -101,3 +101,33 @@ func TestSourceFilter(t *testing.T) {
 		t.Errorf("got %q %+v", got, res)
 	}
 }
+
+func TestPortableDevicePaths(t *testing.T) {
+	h := &Header{SourceKind: KindDevice, SourceID: "dev-0123456789ab", Label: "Galaxy S21"}
+	rel := `Internal storage\DCIM\Camera\IMG_1.jpg`
+	on := Env{Devices: map[string]bool{"dev-0123456789ab": true}}
+	off := Env{}
+
+	if got := DisplayPath(h, rel, on); got != `device:Galaxy S21\Internal storage\DCIM\Camera\IMG_1.jpg` {
+		t.Errorf("online = %q", got)
+	}
+	if got := DisplayPath(h, rel, off); got != `device:Galaxy S21\Internal storage\DCIM\Camera\IMG_1.jpg · offline` {
+		t.Errorf("offline = %q", got)
+	}
+	if !on.Online(h) || off.Online(h) {
+		t.Error("online-ness comes from Env.Devices")
+	}
+	dir, name := DisplaySplit(h, rel, off)
+	if dir != `device:Galaxy S21\Internal storage\DCIM\Camera\` || name != "IMG_1.jpg" {
+		t.Errorf("split = %q %q", dir, name)
+	}
+	if _, ok := LocalPath(h, rel, on); ok {
+		t.Error("a file on a device is not a path on this PC")
+	}
+	if got := CopyPath(h, rel, on); got != `device:Galaxy S21\Internal storage\DCIM\Camera\IMG_1.jpg` {
+		t.Errorf("copy path = %q", got)
+	}
+	if got := DevicePath(&Header{SourceID: "dev-x"}, ""); got != "device:dev-x" {
+		t.Errorf("no label, no rel = %q", got)
+	}
+}

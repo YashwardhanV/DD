@@ -3,12 +3,14 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 
 	"github.com/yashwardhanv/dd/internal/config"
 	"github.com/yashwardhanv/dd/internal/index"
 	"github.com/yashwardhanv/dd/internal/phone"
+	"github.com/yashwardhanv/dd/internal/portable"
 	"github.com/yashwardhanv/dd/internal/volume"
 )
 
@@ -95,12 +97,14 @@ func RealDeps(log *Logger) (Deps, error) {
 	}
 	finder := &adbFinder{}
 	return Deps{
-		Mask:    driveMask(),
-		Volumes: volume.ListLocal,
-		Bus:     volume.BusType,
-		Devices: finder.devices,
-		Index:   ChildIndexer(store),
-		Locked:  func(t Target) bool { return IsLocked(store.LockPath(t.ID)) },
+		Mask:        driveMask(),
+		Volumes:     volume.ListLocal,
+		Bus:         volume.BusType,
+		Devices:     finder.devices,
+		Portables:   portable.List,
+		SystemDrive: os.Getenv("SystemDrive"),
+		Index:       ChildIndexer(store),
+		Locked:      func(t Target) bool { return IsLocked(store.LockPath(t.ID)) },
 		Header: func(id string) (index.Header, bool) {
 			h, err := index.ReadHeaderFile(store.Path(id))
 			return h, err == nil
