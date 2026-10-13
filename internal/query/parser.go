@@ -10,7 +10,7 @@
 //	type:file | type:dir   only files / only folders
 //	size:>100mb  size:<1kb  size:10mb..1gb     (b, kb, mb, gb, tb - 1024-based)
 //	modified:>2025-01-01   modified:<30d       (a date, or a number of days: <30d = within the last 30 days)
-//	drive:E  drive:phone  drive:"SANDISK 32GB" which drive or phone
+//	drive:E  drive:phone  drive:device  drive:"SANDISK 32GB" which drive, phone or device
 //	path:word              match anywhere in the full path, not only the name
 //	re:<regex>             a Go regular expression (not case sensitive) on the name
 //
@@ -50,7 +50,8 @@ func (r Range) Contains(v int64) bool {
 // DriveFilter selects one source. Exactly one field is set.
 type DriveFilter struct {
 	Letter string // "E:" - the drive currently (or last) at that letter
-	Phone  bool   // any phone
+	Phone  bool   // any phone: over USB debugging, or as a portable device
+	Device bool   // any portable device (phone in "File transfer" mode, iPhone, camera...)
 	Name   string // a label, or an index id such as vol-1A2B3C4D (not case sensitive)
 }
 
@@ -410,6 +411,9 @@ func parseDrive(v string) DriveFilter {
 	v = strings.TrimSpace(v)
 	if strings.EqualFold(v, "phone") || strings.EqualFold(v, "phones") {
 		return DriveFilter{Phone: true}
+	}
+	if strings.EqualFold(v, "device") || strings.EqualFold(v, "devices") {
+		return DriveFilter{Device: true}
 	}
 	if len(v) <= 3 {
 		s := v

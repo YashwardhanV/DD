@@ -15,6 +15,8 @@ type Env struct {
 	// Phones is the set of phone SourceIDs ("adb-<serial>") that are connected
 	// and authorized.
 	Phones map[string]bool
+	// Devices is the set of portable-device SourceIDs ("dev-<12 hex>") that are connected.
+	Devices map[string]bool
 }
 
 // Online reports whether the source behind h can be reached right now.
@@ -26,6 +28,8 @@ func (e Env) Online(h *Header) bool {
 		return ok
 	case KindPhone:
 		return e.Phones[h.SourceID]
+	case KindDevice:
+		return e.Devices[h.SourceID]
 	default:
 		return true
 	}
@@ -37,6 +41,7 @@ func (e Env) Online(h *Header) bool {
 //	volume, plugged in   F:\Photos\2024\img.jpg           (current letter, found by serial)
 //	volume, unplugged    [SANDISK 32GB · offline · last seen E:] \Photos\2024\img.jpg
 //	phone                phone:Pixel 7/DCIM/Camera/IMG.jpg   (+ " · offline")
+//	portable device      device:Galaxy S21\Internal storage\DCIM\IMG.jpg   (+ " · offline")
 //	folder               <RootPath>\<rel>
 func DisplayPath(h *Header, rel string, env Env) string {
 	switch h.SourceKind {
@@ -47,6 +52,12 @@ func DisplayPath(h *Header, rel string, env Env) string {
 		return fmt.Sprintf(`[%s · offline · last seen %s] \%s`, volumeLabel(h), lastSeenLetter(h.LastMount), rel)
 	case KindPhone:
 		p := "phone:" + phoneLabel(h) + "/" + strings.ReplaceAll(rel, `\`, "/")
+		if !env.Online(h) {
+			p += " · offline"
+		}
+		return p
+	case KindDevice:
+		p := DevicePath(h, rel)
 		if !env.Online(h) {
 			p += " · offline"
 		}
@@ -67,6 +78,17 @@ func volumeLabel(h *Header) string {
 		return h.Label
 	}
 	return h.SourceID
+}
+
+// DevicePath is how a file on a portable device is named for people:
+// "device:Galaxy S21\Internal storage\DCIM\IMG.jpg" - the way Explorer shows
+// it under This PC. It is a name, not a path any program can open.
+func DevicePath(h *Header, rel string) string {
+	p := "device:" + phoneLabel(h)
+	if rel != "" {
+		p += `\` + rel
+	}
+	return p
 }
 
 func phoneLabel(h *Header) string {
@@ -99,8 +121,8 @@ func DisplaySplit(h *Header, rel string, env Env) (dir, name string) {
 	switch {
 	case h.SourceKind == KindPhone:
 		sep = "/"
-	case h.SourceKind == KindVolume && !env.Online(h):
-		sep = `\` // an unplugged drive's path is always shown Windows-style
+	case h.SourceKind == KindVolume && !env.Online(h), h.SourceKind == KindDevice:
+		sep = `\` // an unplugged drive's path is always shown Windows-style, and so is a device's
 	}
 	if !strings.HasSuffix(dir, sep) && !strings.HasSuffix(dir, `\`) && !strings.HasSuffix(dir, "/") {
 		dir += sep
@@ -110,7 +132,7 @@ func DisplaySplit(h *Header, rel string, env Env) (dir, name string) {
 
 // LocalPath returns where an entry is on THIS PC right now, so it can be
 // opened or copied. ok is false when it can't be reached: an unplugged drive,
-// or a phone (whose paths are not files on this PC).
+// or a phone or portable device (whose paths are not files on this PC).
 func LocalPath(h *Header, rel string, env Env) (path string, ok bool) {
 	switch h.SourceKind {
 	case KindVolume:
@@ -136,6 +158,8 @@ func CopyPath(h *Header, rel string, env Env) string {
 	switch h.SourceKind {
 	case KindPhone:
 		return "phone:/" + strings.ReplaceAll(rel, `\`, "/")
+	case KindDevice:
+		return DevicePath(h, rel)
 	case KindVolume:
 		return JoinRoot(h.LastMount, rel)
 	}

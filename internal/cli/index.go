@@ -13,6 +13,7 @@ import (
 	"github.com/yashwardhanv/dd/internal/agent"
 	"github.com/yashwardhanv/dd/internal/index"
 	"github.com/yashwardhanv/dd/internal/phone"
+	"github.com/yashwardhanv/dd/internal/portable"
 	"github.com/yashwardhanv/dd/internal/scan"
 	"github.com/yashwardhanv/dd/internal/ui"
 )
@@ -24,7 +25,7 @@ func newIndexCmd() *cobra.Command {
 	var opts scanOptions
 	cmd := &cobra.Command{
 		Use:   "index <path>",
-		Short: "Scan a folder, drive or Android phone and save its index for instant search",
+		Short: "Scan a folder, drive, phone or other portable device and save its index for instant search",
 		Long: `Reads every file name on a folder or drive once and saves the list on this PC.
 After that, 'drivedex search' answers in milliseconds without touching the
 drive - even when the drive is unplugged. Run it again to refresh.
@@ -33,12 +34,19 @@ For an Android phone use 'phone' (or 'phone:<serial>' when several are
 connected). The phone lists its own files over USB debugging (ADB), which is
 far faster than browsing it in Explorer.
 
+For a phone in "File transfer" mode (no USB debugging needed), an iPhone, a
+camera or any other device Explorer shows under This PC, use 'device' (or
+'device:<name>' when several are connected). The background agent does this
+by itself as soon as such a device is plugged in.
+
 On an NTFS drive, run this in an Administrator terminal to use "turbo mode":
 DriveDex then reads the drive's master file table directly (millions of files
 in seconds) and refreshes later from its change journal in milliseconds.`,
 		Example: `  drivedex index D:\Projects
   drivedex index E:
   drivedex index phone
+  drivedex index device
+  drivedex index "device:Galaxy S21"
   drivedex index E: --workers 8
   drivedex index E: --mode walk
   drivedex index E: --mode mft --with-metadata   (Administrator terminal)`,
@@ -55,6 +63,9 @@ in seconds) and refreshes later from its change journal in milliseconds.`,
 func runIndex(ctx context.Context, out io.Writer, arg string, opts scanOptions) error {
 	if serial, ok := phone.ParseTarget(arg); ok {
 		return runIndexPhone(ctx, out, serial)
+	}
+	if which, ok := portable.ParseTarget(arg); ok {
+		return runIndexDevice(ctx, out, which)
 	}
 	root, err := resolveRoot(arg)
 	if err != nil {
@@ -145,9 +156,12 @@ func runIndexJob(ctx context.Context, out io.Writer, header index.Header, scanne
 	fmt.Fprintf(out, "Indexed %s — %s entries in %s → saved (%s)\n",
 		display, ui.Thousands(int64(ix.Len())), ui.FormatDuration(elapsed), ui.HumanSize(size))
 	if sp, ok := scanner.(scan.StatsProvider); ok {
-		if header.SourceKind == index.KindPhone {
+		switch header.SourceKind {
+		case index.KindPhone:
 			printPhoneNotes(out, scanner, sp.Stats())
-		} else {
+		case index.KindDevice:
+			printDeviceNotes(out, sp.Stats())
+		default:
 			printScanErrors(out, sp.Stats())
 		}
 	}
@@ -159,6 +173,10 @@ func scanFailure(display string, h index.Header, err error) error {
 	if h.SourceKind == index.KindPhone {
 		return userErr(fmt.Sprintf("couldn't read the files on %s", display),
 			"unlock the phone, make sure USB debugging is allowed, then try again (run 'drivedex doctor' for a check-up)", err)
+	}
+	if h.SourceKind == index.KindDevice {
+		return userErr(fmt.Sprintf("couldn't read the files on %s", display),
+			"unlock it, and on a phone choose \"File transfer\" in the USB notification (iPhone: tap \"Trust\"), then try again", err)
 	}
 	return userErr(fmt.Sprintf("indexing %s failed", display), "check the drive is connected and readable", err)
 }

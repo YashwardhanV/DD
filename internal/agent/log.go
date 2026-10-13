@@ -1,5 +1,5 @@
 // Package agent is the background program that keeps indexes fresh by itself:
-// it notices when a USB drive or an Android phone is plugged in and re-indexes
+// it notices when an external drive, a phone or another portable device is plugged in and re-indexes
 // it, so the owner never has to remember to run `drivedex index`.
 //
 // The package is split so that nearly everything can be tested on any machine:

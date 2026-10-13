@@ -44,8 +44,8 @@ func (e Entry) IsDir() bool { return e.Flags&FlagDir != 0 }
 // .ddx file so new fields can be added without breaking old files.
 type Header struct {
 	FormatVersion int       `json:"format_version"` // 1
-	SourceKind    string    `json:"source_kind"`    // "folder" | "volume" | "phone"
-	SourceID      string    `json:"source_id"`      // "dir-<12 hex>" | "vol-1A2B3C4D" | "adb-<serial>"
+	SourceKind    string    `json:"source_kind"`    // "folder" | "volume" | "phone" | "device"
+	SourceID      string    `json:"source_id"`      // "dir-<12 hex>" | "vol-1A2B3C4D" | "adb-<serial>" | "dev-<12 hex>"
 	Label         string    `json:"label"`          // volume label, device product name, or phone model
 	FileSystem    string    `json:"file_system"`    // "NTFS" | "exFAT" | "FAT32" | "android" | ...
 	RootPath      string    `json:"root_path"`      // folder sources: absolute path; phone: "/sdcard"
@@ -65,6 +65,9 @@ const (
 	KindFolder = "folder"
 	KindVolume = "volume"
 	KindPhone  = "phone"
+	// KindDevice is a portable device read through Windows (MTP/PTP): a phone
+	// in "File transfer" mode, an iPhone, a camera. SourceID "dev-<12 hex>".
+	KindDevice = "device"
 )
 
 // Index is the whole file list of one source. All slices have the same length

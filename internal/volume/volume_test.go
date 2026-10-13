@@ -111,3 +111,57 @@ func TestBusName(t *testing.T) {
 		}
 	}
 }
+
+func TestExternalDrivesAreToldApartFromInternalOnes(t *testing.T) {
+	fixed := func(letter string) Volume {
+		return Volume{Root: letter + `\`, DriveType: DriveFixed, Serial: 1, Ready: true}
+	}
+	pen := Volume{Root: `F:\`, DriveType: DriveRemovable, Serial: 2, Ready: true}
+	cases := []struct {
+		name string
+		v    Volume
+		b    BusInfo
+		want bool
+		conn string
+	}{
+		{"USB hard disk", fixed("E:"), BusInfo{Bus: BusTypeUsb}, true, "USB · external"},
+		{"FireWire disk", fixed("E:"), BusInfo{Bus: BusType1394}, true, "FireWire · external"},
+		{"SD card in a built-in reader", fixed("E:"), BusInfo{Bus: BusTypeSd}, true, "SD · external"},
+		{"MMC card", fixed("E:"), BusInfo{Bus: BusTypeMmc}, true, "MMC · external"},
+		{"Thunderbolt NVMe enclosure", fixed("E:"), BusInfo{Bus: BusTypeNvme, Hotplug: true}, true, "NVMe · external (hot-plug)"},
+		{"eSATA disk", fixed("E:"), BusInfo{Bus: BusTypeSata, Hotplug: true}, true, "SATA · external (hot-plug)"},
+		{"internal SATA disk", fixed("D:"), BusInfo{Bus: BusTypeSata}, false, "SATA · internal"},
+		{"internal NVMe disk", fixed("D:"), BusInfo{Bus: BusTypeNvme}, false, "NVMe · internal"},
+		{"internal disk behind RAID/RST", fixed("D:"), BusInfo{Bus: BusTypeRaid}, false, "RAID · internal"},
+		{"pen drive whose bus is unknown", pen, BusInfo{}, true, "unknown · external"},
+		{"mounted .vhdx", fixed("V:"), BusInfo{Bus: BusTypeFileBackedVirtual, Hotplug: true}, false, "Virtual · internal"},
+		{"Storage Spaces", fixed("S:"), BusInfo{Bus: BusTypeSpaces}, false, "Storage Spaces · internal"},
+		{"the Windows drive, even if hot-pluggable", fixed("C:"), BusInfo{Bus: BusTypeUsb, Hotplug: true}, false, "USB · internal"},
+	}
+	for _, c := range cases {
+		if got := IsExternal(c.v, c.b, "C:"); got != c.want {
+			t.Errorf("%s: IsExternal = %v, want %v", c.name, got, c.want)
+		}
+		if got := Connection(c.v, c.b, "c:"); got != c.conn {
+			t.Errorf("%s: Connection = %q, want %q", c.name, got, c.conn)
+		}
+	}
+	// No system drive known (not Windows): nothing is excluded for being the system drive.
+	if !IsExternal(fixed("C:"), BusInfo{Bus: BusTypeUsb}, "") {
+		t.Error("an empty system drive must not exclude C:")
+	}
+}
+
+func TestParseHotplugInfo(t *testing.T) {
+	if hp, err := ParseHotplugInfo([]byte{8, 0, 0, 0, 0, 0, 1, 0}); err != nil || !hp {
+		t.Errorf("DeviceHotplug=1: %v, %v", hp, err)
+	}
+	if hp, err := ParseHotplugInfo([]byte{8, 0, 0, 0, 1, 1, 0, 0}); err != nil || hp {
+		t.Errorf("removable media is not a hot-pluggable device: %v, %v", hp, err)
+	}
+	for n := 0; n < 7; n++ {
+		if _, err := ParseHotplugInfo(make([]byte, n)); err == nil {
+			t.Errorf("%d bytes must be an error", n)
+		}
+	}
+}

@@ -43,7 +43,12 @@ func (m *Matcher) Applies(h *index.Header) bool {
 	for _, d := range m.q.Drives {
 		switch {
 		case d.Phone:
-			if h.SourceKind == index.KindPhone {
+			// Most portable devices are phones in "File transfer" mode.
+			if h.SourceKind == index.KindPhone || h.SourceKind == index.KindDevice {
+				return true
+			}
+		case d.Device:
+			if h.SourceKind == index.KindDevice {
 				return true
 			}
 		case d.Letter != "":

@@ -26,7 +26,7 @@ and marked offline. Words must all appear in the name (not case sensitive).
   type:file | type:dir        only files / only folders
   size:>100mb  size:<1kb  size:10mb..1gb
   modified:>2025-01-01  modified:<30d      (<30d = within the last 30 days)
-  drive:E  drive:phone  drive:"SANDISK 32GB"
+  drive:E  drive:phone  drive:device  drive:"SANDISK 32GB"
   path:whatsapp               look in the whole path, not just the name
   re:^IMG_\d{8}               a regular expression on the name
 

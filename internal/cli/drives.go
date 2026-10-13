@@ -18,10 +18,14 @@ import (
 func newDrivesCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "drives",
-		Short: "List connected drives and whether each one is indexed",
+		Short: "List connected drives and devices and whether each one is indexed",
 		Long: `Shows every drive currently connected - pen drives, external disks, internal
-disks - with its file system, size and free space, and whether DriveDex has an
-index for it.`,
+disks - with its file system, size and free space, how it is connected, and
+whether DriveDex has an index for it. Phones, cameras and other portable
+devices are listed below the drives.
+
+The background agent indexes every drive marked "external", and every
+portable device, as soon as it is plugged in.`,
 		Example: `  drivedex drives
   drivedex index E:   (index a drive you see here)`,
 		Args: cobra.NoArgs,
@@ -55,19 +59,43 @@ func runDrives(out io.Writer) error {
 	}
 
 	now := time.Now()
+	sys := systemDrive()
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "DRIVE\tLABEL\tFS\tTYPE\tSIZE\tFREE\tINDEXED?")
+	fmt.Fprintln(tw, "DRIVE\tLABEL\tFS\tTYPE\tCONNECTION\tSIZE\tFREE\tINDEXED?")
 	for _, v := range vols {
 		if !v.Ready {
-			fmt.Fprintf(tw, "%s\t(not ready)\t-\t%s\t-\t-\t-\n", v.Letter(), v.TypeName())
+			fmt.Fprintf(tw, "%s\t(not ready)\t-\t%s\t-\t-\t-\t-\n", v.Letter(), v.TypeName())
 			continue
 		}
 		indexed := "no"
 		if in, ok := byID[volume.SourceID(v)]; ok {
 			indexed = indexedSummary(in.Header, now)
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			v.Letter(), v.Label, v.FileSystem, v.TypeName(), ui.HumanSizeU(v.TotalBytes), ui.HumanSizeU(v.FreeBytes), indexed)
+		conn := "-"
+		if v.DriveType != volume.DriveRemote {
+			bus, _ := busTypeFor(v.Root) // unknown bus: judged on the drive type alone
+			conn = volume.Connection(v, bus, sys)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			v.Letter(), v.Label, v.FileSystem, v.TypeName(), conn, ui.HumanSizeU(v.TotalBytes), ui.HumanSizeU(v.FreeBytes), indexed)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+
+	devs, err := listDevices()
+	if err != nil || len(devs) == 0 {
+		return nil // nothing connected (or not Windows): say nothing
+	}
+	fmt.Fprintln(out)
+	tw = tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "DEVICE\tNAME\tINDEXED?")
+	for _, d := range devs {
+		indexed := "no"
+		if in, ok := byID[d.SourceID()]; ok {
+			indexed = indexedSummary(in.Header, now)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", d.Arg(), d.Label(), indexed)
 	}
 	return tw.Flush()
 }
