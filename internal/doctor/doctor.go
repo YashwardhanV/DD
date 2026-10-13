@@ -250,7 +250,8 @@ func phoneSection(f Facts) Section {
 	add := func(l Level, text, tip string) { s.Lines = append(s.Lines, Line{l, text, tip}) }
 	a := f.ADB
 	if !a.Found {
-		add(Info, "adb (Android Debug Bridge) was not found, so phones can't be used", "only needed for phones: run 'drivedex index phone' to see the setup steps (install Android \"platform-tools\", turn on USB debugging)")
+		add(Info, "adb (Android Debug Bridge) was not found: phones are still indexed through Windows (\"File transfer\" mode), just more slowly",
+			"optional, for faster phone indexing: run 'drivedex index phone' to see the setup steps (install Android \"platform-tools\", turn on USB debugging)")
 		return s
 	}
 	v := a.Version
@@ -263,7 +264,7 @@ func phoneSection(f Facts) Section {
 		return s
 	}
 	if len(a.Phones) == 0 {
-		add(Info, "no phone connected", "plug it in by USB, turn on USB debugging, and tap Allow on the phone")
+		add(Info, "no phone connected over USB debugging", "plug it in by USB, turn on USB debugging, and tap Allow on the phone (without USB debugging, phones are read through Windows instead)")
 		return s
 	}
 	for _, p := range a.Phones {
