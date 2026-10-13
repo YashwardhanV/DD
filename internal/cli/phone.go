@@ -24,8 +24,9 @@ var openADB = func() (*phone.ADB, error) {
 
 // adbNotFound is the friendly error for "adb isn't installed".
 func adbNotFound(cause error) error {
-	return userErr("adb (Android Debug Bridge) was not found, so phones can't be used yet",
-		"set the phone up like this:\n"+phone.SetupSteps, cause)
+	return userErr("adb (Android Debug Bridge) was not found, so 'drivedex index phone' can't be used yet",
+		"any phone in \"File transfer\" mode can be indexed without it: drivedex index device\n"+
+			"For the faster way, over USB debugging, set the phone up like this:\n"+phone.SetupSteps, cause)
 }
 
 // phoneHeader is the starting index header for a phone.
