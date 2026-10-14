@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/yashwardhanv/dd/internal/ui"
+	"github.com/yashwardhanv/dd/internal/volume"
 )
 
 // Level is how serious a line is.
@@ -130,6 +131,9 @@ type DriveFacts struct {
 	Media      Media
 	Index      *IndexFacts // nil = no saved index
 	Journal    JournalState
+	// USB is how a USB drive is linked (speed now, speed possible); nil for
+	// other drives or when Windows didn't say.
+	USB *volume.USBLink
 }
 
 // PhoneFacts is one device adb listed.
@@ -173,6 +177,9 @@ type Facts struct {
 
 	Drives    []DriveFacts
 	DrivesErr error
+
+	// Ports counts the PC's USB 3 sockets (Known is false off Windows).
+	Ports volume.PortSummary
 }
 
 // ---- building the report ----------------------------------------------------------------
@@ -181,6 +188,9 @@ type Facts struct {
 func Build(f Facts) Report {
 	var r Report
 	r.Sections = append(r.Sections, driveDexSection(f), privilegeSection(f), phoneSection(f))
+	if f.Ports.Known {
+		r.Sections = append(r.Sections, usbSection(f.Ports))
+	}
 	r.Sections = append(r.Sections, drivesSections(f)...)
 	return r
 }
@@ -335,6 +345,18 @@ func driveSection(d DriveFacts, f Facts) Section {
 		add(Info, "connected by "+bus+"; couldn't tell if it is a hard disk or flash, so DriveDex uses a middle setting", "")
 	}
 
+	if d.USB != nil {
+		text, tip := volume.Advice(*d.USB, f.Ports)
+		switch v := d.USB.Judge(); {
+		case v.Slow():
+			add(Warn, text, tip)
+		case v == volume.VerdictFull:
+			add(OK, text, "")
+		case v == volume.VerdictSlowMaybe:
+			add(Info, text, tip)
+		}
+	}
+
 	if d.Index == nil {
 		add(Warn, "not indexed yet", "index it with: drivedex index "+d.Letter)
 	} else {
@@ -361,6 +383,25 @@ func driveSection(d DriveFacts, f Facts) Section {
 				add(Info, "NTFS change journal not checked (needs Administrator)", "")
 			}
 		}
+	}
+	return s
+}
+
+func usbSection(p volume.PortSummary) Section {
+	s := Section{Title: "USB ports"}
+	switch {
+	case p.USB3 == 0:
+		s.Lines = append(s.Lines, Line{Info, "this PC reports no USB 3 ports: drives top out at USB 2.0 speed (about 40 MB/s) here",
+			"no software can make a USB 2.0 port faster; a USB 3 PCIe card (desktop) or a newer PC can"})
+	default:
+		text := fmt.Sprintf("this PC has %d USB 3 %s", p.USB3, plural(p.USB3, "port", "ports"))
+		if p.USB3TypeC > 0 {
+			text += fmt.Sprintf(" (%d USB-C)", p.USB3TypeC)
+		}
+		if p.USB2OnlyKnown && p.USB2Only > 0 {
+			text += fmt.Sprintf(" and %d USB 2.0-only", p.USB2Only)
+		}
+		s.Lines = append(s.Lines, Line{OK, text, "to find which socket is which: drivedex ports --watch, then move a drive between them"})
 	}
 	return s
 }

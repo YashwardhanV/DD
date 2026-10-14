@@ -27,8 +27,9 @@ A single Windows program written in Go (no CGO, no extra DLLs).
 - **Reads phones over ADB** (one `find` command on the phone instead of thousands of MTP requests), and **any other portable device** — a phone in plain "File transfer" mode, an iPhone, a camera — through Windows, with nothing to set up.
 - **NTFS "turbo mode":** reads the drive's Master File Table directly (millions of files in seconds) and then refreshes from the NTFS change journal in milliseconds.
 - **Tunes itself to the drive:** few parallel readers for a spinning hard disk, many for flash.
-- **Fast, resumable copy** with parallel workers, atomic file writes, free-space and FAT32 (4 GiB) pre-checks, optional CRC-32 verification — from drives, folders and phones.
+- **Fast, resumable copy** with parallel workers (at most two big files at once on USB, so an unplug loses little), space reserved up front, atomic file writes, free-space and FAT32 (4 GiB) pre-checks, optional CRC-32 verification — from drives, folders and phones.
 - **A background agent** maps out anything you plug in, by itself: USB disks and pen drives, memory cards (also in the laptop's own card reader), eSATA/Thunderbolt/FireWire disks, phones, iPhones and cameras. A locked phone is tried again until you unlock it. Internal disks are left alone unless you list them in `auto_index`.
+- **Spots a slow USB port.** A USB 3 pen drive in a USB 2.0 port crawls at ~40 MB/s instead of hundreds, and Windows rarely says so. DriveDex reads the USB hub driver's answers and tells you: *this drive can do 5 Gbps but runs at 480 Mbps — this port is USB 2.0 only* (or: a USB 2.0 hub/adapter is in the way, or the cable fell back), how many USB 3 / USB-C ports your PC has, and `drivedex ports --watch` finds them as you move the drive around. It warns before a long copy, and the agent pops up the moment you plug into a slow port.
 - **Explorer right-click menu**, an interactive type-as-you-search screen, a power query language, `--json` output for scripts, and a `doctor` that explains why things are slow.
 
 ## Performance
@@ -74,6 +75,7 @@ drivedex index E:                     # scan the pen drive once (use an Administ
 drivedex search invoice ext:pdf       # instant search of everything indexed - plugged in or not
 drivedex                              # the interactive type-as-you-search screen
 drivedex copy E:\Photos D:\Backup     # fast, resumable copy (add --dry-run to preview)
+drivedex ports --watch                # which ports are USB 3? plug the drive in each to see its speed
 ```
 
 More: `drivedex index phone` (Android over USB debugging), `drivedex index device` (any phone, iPhone or camera in Explorer's This PC), `drivedex search IMG --paths-only`, `drivedex doctor --bench E:`, `drivedex agent start`, `drivedex shell install`. Every command has `--help` with examples.
@@ -136,6 +138,7 @@ Start with `drivedex doctor` — it checks everything below and prints the fix.
 | `ERROR_JOURNAL_NOT_ACTIVE` / "no change journal" | `drivedex journal enable E:` (Administrator), or just use `--mode parallel`. |
 | Results show an old drive letter | Run `drivedex drives`; letters are resolved by serial number at search time. A reformatted drive is a new drive (new index). |
 | SmartScreen warns about the exe | Unsigned binaries trigger this: **More info → Run anyway**, or build it yourself. |
+| A USB 3 pen drive copies at only ~30–40 MB/s | `drivedex ports` — it is probably on a USB 2.0 port, hub or adapter; it says which, and `--watch` finds the USB 3 ports. No software can make a USB 2.0 port faster. If it's on USB 3 and still slow, `drivedex doctor --bench E:`: many cheap "USB 3" sticks write no faster than USB 2.0. |
 | Copy fails on files over 4 GB | The destination is FAT32. Reformat to exFAT/NTFS (back up first). |
 | Indexing is slow on a USB hard disk | Expected with a spinning disk. Use NTFS turbo mode (Administrator) and keep workers at 2. |
 | Right-click menu missing on Windows 11 | It is under **Show more options** (or hold Shift while right-clicking). |
@@ -159,7 +162,7 @@ internal/scan       walk and parallel directory scanners
 internal/ntfs       MFT enumeration and USN-journal refresh (with an in-memory fake NTFS for tests)
 internal/phone      ADB: listing, stat, pull (with a fake phone for tests)
 internal/portable   phones, iPhones, cameras through Windows (MTP/PTP): detection and listing
-internal/volume     drive identity (serial, label, bus type, HDD/flash)
+internal/volume     drive identity (serial, label, bus type, HDD/flash, USB link speed and ports)
 internal/copier     plan/run copy engine
 internal/tui        the interactive screen (Bubble Tea)
 internal/agent      background auto-index agent

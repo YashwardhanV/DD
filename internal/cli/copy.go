@@ -114,6 +114,7 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 
 	// --- plan -----------------------------------------------------------------
 	var plan *copier.Plan
+	srcRoot := "" // the local source, for the USB speed check ("" for a phone)
 	spec, isPhone, err := parsePhoneSource(srcArg)
 	if err != nil {
 		return err
@@ -153,6 +154,7 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 		if err != nil {
 			return err
 		}
+		srcRoot = src
 		if autoWorkers {
 			srcPenalty, srcKnown := seekPenaltyFor(src)
 			dstPenalty, dstKnown := seekPenaltyFor(dst)
@@ -172,7 +174,7 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 	}
 
 	return finishPlan(ctx, out, status, plan, planRun{
-		workers: workers, why: why, verify: f.verify, dryRun: f.dryRun, dstArg: dstArg,
+		workers: workers, why: why, verify: f.verify, dryRun: f.dryRun, dstArg: dstArg, srcRoot: srcRoot,
 	})
 }
 
@@ -183,6 +185,7 @@ type planRun struct {
 	verify  bool
 	dryRun  bool
 	dstArg  string // the destination as the user typed it (for messages)
+	srcRoot string // a local source folder, "" when there isn't one (phone, search results)
 }
 
 // finishPlan checks, announces, (dry-)runs and reports one copy plan. Both
@@ -213,6 +216,12 @@ func finishPlan(ctx context.Context, out *bufio.Writer, status *ui.StatusLine, p
 	if !f.dryRun {
 		fmt.Fprintln(out, ui.Dim(fmt.Sprintf("(%d workers: %s)", workers, why)))
 	}
+	// A USB 3 drive stuck at USB 2.0 speed is worth knowing BEFORE a long copy.
+	anyUSB := warnSlowUSB(out, []string{o.srcRoot, dst}, counts.WriteBytes)
+	bigLanes := 0
+	if anyUSB {
+		bigLanes = usbBigLanes
+	}
 
 	if f.dryRun {
 		return printDryRun(out, plan, counts)
@@ -225,8 +234,9 @@ func finishPlan(ctx context.Context, out *bufio.Writer, status *ui.StatusLine, p
 	// --- run ------------------------------------------------------------------
 	out.Flush()
 	res, err := copier.Run(ctx, plan, copier.Options{
-		Workers: workers,
-		Verify:  f.verify,
+		Workers:  workers,
+		BigLanes: bigLanes,
+		Verify:   f.verify,
 		Progress: func(p ui.CopyProgress) {
 			status.Update(ui.FormatCopyProgress(p))
 		},
@@ -266,6 +276,12 @@ func finishPlan(ctx context.Context, out *bufio.Writer, status *ui.StatusLine, p
 	fmt.Fprintln(out, ui.Dim("Tip: use \"Safely Remove Hardware\" before unplugging the destination drive."))
 	return nil
 }
+
+// usbBigLanes is how many big files are copied at once when a USB drive is
+// involved (the other workers keep going with small files). A USB link moves
+// one big stream as fast as eight, and finished files are what a resume after
+// an unplug keeps.
+const usbBigLanes = 2
 
 func autoWhy(workers int) string {
 	switch workers {

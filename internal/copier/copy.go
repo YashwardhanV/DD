@@ -46,7 +46,20 @@ type Options struct {
 	// RetryDelay is the wait between attempts (default 500 ms).
 	Retries    int
 	RetryDelay time.Duration
+	// BigLanes, when > 0, is how many BIG files (BigFileSize and up) are
+	// copied at once; the other workers keep copying small files meanwhile.
+	// For USB drives: the link moves one stream as fast as eight, so eight
+	// half-finished 4 GB films only mean more to lose if the drive is
+	// unplugged (resume restarts unfinished files) and more fragmentation on
+	// the destination. 0 = big files share all workers (the old behaviour).
+	BigLanes int
 }
+
+// BigFileSize is where BigLanes starts to apply.
+const BigFileSize = 32 << 20
+
+// bigFileSize is BigFileSize (a variable so tests can use small files).
+var bigFileSize int64 = BigFileSize
 
 func (o Options) retries() int {
 	if o.Retries <= 0 {
@@ -238,38 +251,62 @@ func runLocal(ctx context.Context, p *Plan, opt Options, st *state) {
 	if workers <= 0 {
 		workers = 4
 	}
-	queue := make(chan *Item)
+	bigLanes := opt.BigLanes
+	if bigLanes < 0 || bigLanes >= workers {
+		bigLanes = 0 // no point in a separate lane
+	}
+	isBig := func(it *Item) bool { return bigLanes > 0 && it.Size >= bigFileSize }
+
+	smallQ := make(chan *Item)
+	bigQ := make(chan *Item)
 	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			bufp := bufPool.Get().(*[]byte)
-			defer bufPool.Put(bufp)
-			for it := range queue {
+	work := func(queues ...chan *Item) {
+		defer wg.Done()
+		bufp := bufPool.Get().(*[]byte)
+		defer bufPool.Put(bufp)
+		for _, q := range queues {
+			for it := range q {
 				copyWithRetries(ctx, p.DstRoot, it, *bufp, opt, st)
 			}
-		}()
+		}
 	}
+	// Big-file workers help with the small files once the big ones are done.
+	for w := 0; w < bigLanes; w++ {
+		wg.Add(1)
+		go work(bigQ, smallQ)
+	}
+	for w := 0; w < workers-bigLanes; w++ {
+		wg.Add(1)
+		go work(smallQ)
+	}
+
 	// Dispatch largest-first (the plan is already sorted), and stop handing out
-	// work as soon as the user cancels.
-dispatch:
-	for i := range p.Items {
-		it := &p.Items[i]
-		if it.Decision.Skipped() {
-			continue
-		}
-		if it.Blocked != "" {
-			st.fail(it.Rel, errors.New(it.Blocked))
-			continue
-		}
-		select {
-		case queue <- it:
-		case <-ctx.Done():
-			break dispatch
+	// work as soon as the user cancels. Big and small files have their own
+	// dispatcher, so small files flow while the big lanes are busy.
+	var dwg sync.WaitGroup
+	dispatch := func(q chan *Item, mine func(*Item) bool) {
+		defer dwg.Done()
+		defer close(q)
+		for i := range p.Items {
+			it := &p.Items[i]
+			if it.Decision.Skipped() || !mine(it) {
+				continue
+			}
+			if it.Blocked != "" {
+				st.fail(it.Rel, errors.New(it.Blocked))
+				continue
+			}
+			select {
+			case q <- it:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
-	close(queue)
+	dwg.Add(2)
+	go dispatch(smallQ, func(it *Item) bool { return !isBig(it) })
+	go dispatch(bigQ, isBig)
+	dwg.Wait()
 	wg.Wait()
 }
 
@@ -339,6 +376,14 @@ func copyFile(ctx context.Context, src, dst string, mtime int64, buf []byte, ver
 	}
 	cleanup := func() { out.Close(); os.Remove(part) }
 
+	// Reserve the whole file's space up front: one allocation instead of
+	// growing the file a megabyte at a time. With several files written at
+	// once this keeps each file in one piece on the destination instead of
+	// interleaving them. Best effort: if it can't, the writes still work.
+	if info.Size() >= preallocMin {
+		preallocate(out, info.Size())
+	}
+
 	// struct{ io.Writer } hides *os.File's ReadFrom method; otherwise
 	// io.CopyBuffer would ignore our big buffer and use a small default one.
 	n, err := io.CopyBuffer(struct{ io.Writer }{out}, &ctxReader{ctx: ctx, r: in}, buf)
@@ -346,14 +391,25 @@ func copyFile(ctx context.Context, src, dst string, mtime int64, buf []byte, ver
 		cleanup()
 		return 0, fmt.Errorf("copying %s: %w", src, err)
 	}
+	// Set the time through the handle we already have, before closing. Doing
+	// it by name afterwards (os.Chtimes) opens the file a second time and
+	// rewrites its folder entry a second time - on a pen drive each of those
+	// is a slow little write, paid once per file.
+	t := time.Unix(mtime, 0)
+	timeSet, err := setModTime(out, t)
+	if err != nil {
+		cleanup()
+		return 0, fmt.Errorf("setting the time of %s: %w", part, err)
+	}
 	if err := out.Close(); err != nil {
 		os.Remove(part)
 		return 0, fmt.Errorf("writing %s: %w", part, err)
 	}
-	t := time.Unix(mtime, 0)
-	if err := os.Chtimes(part, t, t); err != nil {
-		os.Remove(part)
-		return 0, fmt.Errorf("setting the time of %s: %w", part, err)
+	if !timeSet {
+		if err := os.Chtimes(part, t, t); err != nil {
+			os.Remove(part)
+			return 0, fmt.Errorf("setting the time of %s: %w", part, err)
+		}
 	}
 	if err := os.Rename(part, dst); err != nil {
 		os.Remove(part)

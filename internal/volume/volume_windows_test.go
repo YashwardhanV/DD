@@ -70,3 +70,18 @@ func TestSystemDriveIsInternal(t *testing.T) {
 		t.Error("the system drive must never count as external")
 	}
 }
+
+// The USB questions must never crash, whatever this machine has (a CI
+// machine usually has no USB at all). C: is normally not USB.
+func TestUSBQuestionsDoNotCrash(t *testing.T) {
+	ports, err := USBPorts()
+	t.Logf("USB ports: %d (err %v), summary %+v", len(ports), err, Summarize(ports))
+	l, err := USBLinkFor(`C:\`)
+	t.Logf("C:\\ USB link: %+v, err %v", l, err)
+	if err == nil && l.Speed == SpeedUnknown {
+		t.Error("a link without an error should have a speed")
+	}
+	if _, err := USBLinkFor(`\\server\share`); err == nil {
+		t.Error("network paths have no USB link")
+	}
+}

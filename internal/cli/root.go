@@ -117,6 +117,7 @@ saved index instantly - even for drives that are not plugged in.`,
 	root.AddCommand(newIndexCmd())
 	root.AddCommand(newSearchCmd())
 	root.AddCommand(newDrivesCmd())
+	root.AddCommand(newPortsCmd())
 	root.AddCommand(newListCmd())
 	root.AddCommand(newForgetCmd())
 	root.AddCommand(newBenchScanCmd())
