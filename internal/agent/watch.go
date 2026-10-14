@@ -87,6 +87,8 @@ type Deps struct {
 	Header func(id string) (index.Header, bool)
 	// Notify shows a pop-up; nil disables notifications.
 	Notify func(title, body string) error
+	// USBLink says how fast a USB drive is linked ("E:\"); nil skips the check.
+	USBLink func(root string) (volume.USBLink, error)
 	// Sleep waits d, returning false if ctx ended first.
 	Sleep func(ctx context.Context, d time.Duration) bool
 	// Now is the clock.
@@ -462,6 +464,9 @@ func (a *Agent) Handle(ctx context.Context, t Target) {
 	if !a.d.Sleep(ctx, a.set.Settle) {
 		return
 	}
+	if t.Kind == index.KindVolume {
+		a.checkUSBSpeed(t)
+	}
 	if a.d.Locked != nil && a.d.Locked(t) {
 		a.log.Infof("skipped %s: it is already being indexed by another DriveDex process", t.Display)
 		return
@@ -491,6 +496,40 @@ func (a *Agent) Handle(ctx context.Context, t Target) {
 		if err := a.d.Notify(title, body); err != nil {
 			a.logOnce("notify", "couldn't show a notification: %v", err)
 		}
+	}
+}
+
+// checkUSBSpeed tells the user, the moment a drive is plugged in, when it is
+// running slower than it could - a USB 3 drive in a USB 2.0 port, behind a
+// USB 2.0 hub, or on a cable that fell back to USB 2.0. Explorer never says.
+func (a *Agent) checkUSBSpeed(t Target) {
+	if a.d.USBLink == nil {
+		return
+	}
+	l, err := a.d.USBLink(t.Arg + `\`)
+	if err != nil || l.Speed == volume.SpeedUnknown {
+		return // not USB, or Windows didn't say: nothing to report
+	}
+	v := l.Judge()
+	if !v.Slow() {
+		a.log.Infof("%s runs at %s", t.Display, l.Speed)
+		return
+	}
+	a.log.Infof("SLOW LINK: %s runs at %s but can do %s", t.Display, l.Speed, l.Capable)
+	if !a.set.Notifications || a.d.Notify == nil {
+		return
+	}
+	fix := "Try another port (a USB 3 one)."
+	switch v {
+	case volume.VerdictSlowHub:
+		fix = "Plug it straight into the PC, or use a USB 3 hub."
+	case volume.VerdictSlowCable:
+		fix = "Push it fully in; drop any extension or adapter that isn't USB 3."
+	}
+	title := t.Label + " is on a slow USB link"
+	body := fmt.Sprintf("Running at %s; it can do %s. %s", l.Speed, l.Capable, fix)
+	if err := a.d.Notify(title, body); err != nil {
+		a.logOnce("notify", "couldn't show a notification: %v", err)
 	}
 }
 

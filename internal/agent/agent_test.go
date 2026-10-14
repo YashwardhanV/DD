@@ -43,6 +43,7 @@ type world struct {
 	peak      atomic.Int64
 	indexWork time.Duration
 	now       time.Time
+	links     map[string]volume.USBLink // by drive root; missing = not USB
 
 	logPath string
 }
@@ -149,6 +150,14 @@ func (w *world) deps() Deps {
 			return ctx.Err() == nil
 		},
 		Now: func() time.Time { return w.now },
+		USBLink: func(root string) (volume.USBLink, error) {
+			w.mu.Lock()
+			defer w.mu.Unlock()
+			if l, ok := w.links[root]; ok {
+				return l, nil
+			}
+			return volume.USBLink{}, volume.ErrNotUSB
+		},
 	}
 }
 
@@ -810,5 +819,68 @@ func TestRunIndexesAPortableDeviceWhenItIsPluggedIn(t *testing.T) {
 	}
 	if len(w.notified) != 1 || w.notified[0][0] != "Galaxy S21 indexed" {
 		t.Errorf("notified = %v", w.notified)
+	}
+}
+
+func TestSlowUSBLinkIsReportedWhenTheDriveArrives(t *testing.T) {
+	w := newWorld(t)
+	w.links = map[string]volume.USBLink{`E:\`: {Speed: volume.SpeedHigh, Capable: volume.SpeedSuper, PortKnown: true}}
+	a, _ := w.agent(t)
+	a.Handle(context.Background(), target())
+
+	if len(w.notified) != 2 {
+		t.Fatalf("want a slow-link pop-up and an indexed pop-up, got %v", w.notified)
+	}
+	slow := w.notified[0]
+	if slow[0] != "SANDISK 32GB is on a slow USB link" || !strings.Contains(slow[1], "480 Mbps") ||
+		!strings.Contains(slow[1], "5 Gbps") || !strings.Contains(slow[1], "another port") {
+		t.Errorf("slow-link pop-up = %v", slow)
+	}
+	if !strings.Contains(w.logText(t), "SLOW LINK: SANDISK 32GB (E:) runs at USB 2.0") {
+		t.Errorf("log:\n%s", w.logText(t))
+	}
+	if len(w.indexed) != 1 {
+		t.Error("a slow drive must still be indexed")
+	}
+
+	// Through a USB 2.0 hub, and a cable that fell back: their own advice.
+	for _, c := range []struct {
+		l    volume.USBLink
+		want string
+	}{
+		{volume.USBLink{Speed: volume.SpeedHigh, Capable: volume.SpeedSuper, PortKnown: true, ViaHub: true}, "straight into the PC"},
+		{volume.USBLink{Speed: volume.SpeedHigh, Capable: volume.SpeedSuper, PortKnown: true, PortTwinUSB3: true}, "fully in"},
+	} {
+		w := newWorld(t)
+		w.links = map[string]volume.USBLink{`E:\`: c.l}
+		a, _ := w.agent(t)
+		a.Handle(context.Background(), target())
+		if len(w.notified) == 0 || !strings.Contains(w.notified[0][1], c.want) {
+			t.Errorf("%+v: pop-ups %v, want %q", c.l, w.notified, c.want)
+		}
+	}
+}
+
+func TestFastOrUnknownUSBLinkStaysQuiet(t *testing.T) {
+	for _, l := range []volume.USBLink{
+		{Speed: volume.SpeedSuper, Capable: volume.SpeedSuper, PortKnown: true, PortUSB3: true},
+		{Speed: volume.SpeedHigh, Capable: volume.SpeedHigh, PortKnown: true}, // a USB 2.0 drive
+		{Speed: volume.SpeedHigh}, // Windows can't tell
+	} {
+		w := newWorld(t)
+		w.links = map[string]volume.USBLink{`E:\`: l}
+		a, _ := w.agent(t)
+		a.Handle(context.Background(), target())
+		if len(w.notified) != 1 || !strings.HasSuffix(w.notified[0][0], "indexed") {
+			t.Errorf("%+v: pop-ups %v, want only the indexed one", l, w.notified)
+		}
+	}
+	// Notifications off: logged, no pop-up.
+	w := newWorld(t)
+	w.links = map[string]volume.USBLink{`E:\`: {Speed: volume.SpeedHigh, Capable: volume.SpeedSuper, PortKnown: true}}
+	a, _ := w.agent(t, func(s *Settings) { s.Notifications = false })
+	a.Handle(context.Background(), target())
+	if len(w.notified) != 0 || !strings.Contains(w.logText(t), "SLOW LINK") {
+		t.Errorf("notifications off: %v\n%s", w.notified, w.logText(t))
 	}
 }

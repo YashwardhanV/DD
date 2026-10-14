@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -23,6 +24,8 @@ func TestMain(m *testing.M) {
 	listDevices = func() ([]portable.Device, error) { return nil, nil }
 	busTypeFor = func(string) (volume.BusInfo, error) { return volume.BusInfo{}, nil }
 	systemDrive = func() string { return "C:" }
+	usbLinkFor = func(string) (volume.USBLink, error) { return volume.USBLink{}, errors.ErrUnsupported }
+	usbPortsFor = func() ([]volume.PortInfo, error) { return nil, nil }
 	code := m.Run()
 	os.RemoveAll(dir)
 	os.Exit(code)

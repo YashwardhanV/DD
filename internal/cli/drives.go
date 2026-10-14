@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -60,6 +61,11 @@ func runDrives(out io.Writer) error {
 
 	now := time.Now()
 	sys := systemDrive()
+	type slowDrive struct {
+		v    volume.Volume
+		link volume.USBLink
+	}
+	var slow []slowDrive
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "DRIVE\tLABEL\tFS\tTYPE\tCONNECTION\tSIZE\tFREE\tINDEXED?")
 	for _, v := range vols {
@@ -75,12 +81,27 @@ func runDrives(out io.Writer) error {
 		if v.DriveType != volume.DriveRemote {
 			bus, _ := busTypeFor(v.Root) // unknown bus: judged on the drive type alone
 			conn = volume.Connection(v, bus, sys)
+			if l, ok := usbLinkOf(v.Root); ok {
+				// "USB · external" -> "USB 2.0 · 480 Mbps · external"
+				conn = strings.Replace(conn, "USB", l.Speed.String(), 1)
+				if l.Judge().Slow() {
+					conn += " ⚠"
+					slow = append(slow, slowDrive{v, l})
+				}
+			}
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			v.Letter(), v.Label, v.FileSystem, v.TypeName(), conn, ui.HumanSizeU(v.TotalBytes), ui.HumanSizeU(v.FreeBytes), indexed)
 	}
 	if err := tw.Flush(); err != nil {
 		return err
+	}
+	if len(slow) > 0 {
+		sum := portSummary()
+		fmt.Fprintln(out)
+		for _, d := range slow {
+			printDriveLink(out, d.v, d.link, sum)
+		}
 	}
 
 	devs, err := listDevices()

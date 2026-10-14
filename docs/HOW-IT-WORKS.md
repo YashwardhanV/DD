@@ -2,7 +2,7 @@
 
 A beginner-friendly tour. You don't need to know any of this to *use* DriveDex — but if you read it once, you'll be able to explain the project (and the ideas behind it) to anyone, including in an interview. Each section ends with a one-sentence "in short".
 
-Contents: [1. Why Explorer is slow](#1-why-explorer-is-slow) · [2. What an index is](#2-what-an-index-is) · [3. File systems](#3-file-systems-ntfs-vs-fatexfat) · [4. The MFT and the USN journal](#4-the-mft-and-the-usn-journal-the-library-catalogue-and-the-diary) · [5. HDD vs flash](#5-hdd-vs-flash-and-why-the-number-of-workers-matters) · [6. MTP vs ADB](#6-phones-mtp-vs-adb) · [7. Paths from parent IDs](#7-how-the-index-stores-paths-parent-ids-and-why-renames-are-cheap) · [8. Search internals](#8-how-search-is-so-fast) · [9. Knowing a drive](#9-recognising-a-drive-serial-numbers-not-letters) · [10. Copy, agent, safety](#10-copying-the-agent-and-staying-safe) · [11. Interview cheat sheet](#11-interview-cheat-sheet)
+Contents: [1. Why Explorer is slow](#1-why-explorer-is-slow) · [2. What an index is](#2-what-an-index-is) · [3. File systems](#3-file-systems-ntfs-vs-fatexfat) · [4. The MFT and the USN journal](#4-the-mft-and-the-usn-journal-the-library-catalogue-and-the-diary) · [5. HDD vs flash](#5-hdd-vs-flash-and-why-the-number-of-workers-matters) · [6. MTP vs ADB](#6-phones-mtp-vs-adb) · [7. Paths from parent IDs](#7-how-the-index-stores-paths-parent-ids-and-why-renames-are-cheap) · [8. Search internals](#8-how-search-is-so-fast) · [9. Knowing a drive](#9-recognising-a-drive-serial-numbers-not-letters) · [10. Copy, agent, safety](#10-copying-the-agent-and-staying-safe) · [11. USB 2 vs USB 3](#11-usb-20-vs-usb-3-why-software-cant-speed-up-a-port) · [12. Interview cheat sheet](#12-interview-cheat-sheet)
 
 ---
 
@@ -136,7 +136,27 @@ Results from a drive that's plugged in show its real path (`G:\Photos\IMG_001.jp
 - **The agent** (`drivedex-agent.exe`) is a tiny program with no window. It checks for new USB drives and phones every few seconds and runs `drivedex index` for them, so your indexes stay fresh without you remembering. A lock file stops it and a hand-run `index` from rebuilding the same index at once.
 - **Safety rules.** DriveDex is **read-only** on the drives it indexes. The only commands that write to a drive are `copy` (what you asked for) and `doctor --bench` (one temporary file, always deleted). It never writes to a phone. `forget`/`uninstall` only ever delete DriveDex's own files, by exact name. Installing asks y/N before every change to your system, and nothing needs administrator rights unless you choose NTFS turbo mode.
 
-## 11. Interview cheat sheet
+## 11. USB 2.0 vs USB 3: why software can't speed up a port
+
+**The wires.** Look inside a USB-A port. A USB 2.0 port has **4 contacts** (power, ground, and one pair of data wires). A USB 3 port has those 4 *plus 5 more* set further back: two extra data pairs (one to send, one to receive) and a ground. USB 3's speed lives entirely on those extra wires. Put a USB 3 pen drive in a USB 2.0 port and the extra contacts on the plug touch nothing, so the drive and the PC agree to talk over the old pair at **480 Mbit/s — about 40 MB/s in practice**. No program can send data over wires that aren't there.
+
+**The names are a mess** (this trips everyone up): *USB 3.0*, *USB 3.1 Gen 1* and *USB 3.2 Gen 1* are the **same thing**, 5 Gbit/s — it was renamed twice. *USB 3.2 Gen 2* is 10 Gbit/s, *Gen 2x2* is 20. So a "USB 3.2" pen drive is usually a 5 Gbit/s one. And the port's colour (blue inside, or an "SS" logo) is a convention, not a rule.
+
+**The drive is often the real limit.** 5 Gbit/s allows ~450 MB/s, but many cheap "USB 3" sticks *write* at 20–40 MB/s — no faster than USB 2.0. `drivedex doctor --bench E:` measures the write speed so you know which one is holding you back.
+
+**What DriveDex does about it.** Windows' USB hub driver knows, for every port: which USB versions the port speaks, how fast the device in it is running, and whether that device *could* run faster (it's how Windows decides to show "This device can perform faster if connected to a USB 3.0 port"). DriveDex follows a drive letter down to its port — volume → physical disk → disk device → up the device tree to the USB hub, whose *address* for the device is the port number — and asks the hub (`IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX_V2`). Then it can say *which* thing is in the way:
+
+- **the port** is USB 2.0 only → move to another port (`drivedex ports` counts the PC's USB 3 ports, including USB-C ones, which work through a USB-C→A adapter *marked USB 3*);
+- **a hub, dock or adapter** in between is USB 2.0 → plug straight in;
+- **the port is USB 3 but the link fell back** → a USB 2.0 extension cable or adapter, or a plug not pushed all the way in. A USB 3 socket is really *two* ports to Windows (its USB 3 half and its USB 2.0 half, "companions"); a drive that lands on the USB 2.0 half of a USB 3 socket gives this away.
+
+Windows usually can't tell *where* a port is on the case, so `drivedex ports --watch` lets you find out: move the drive from port to port and it prints each port's speed as you plug in.
+
+**And within the limit, the copy wastes less.** On USB, at most two big files are copied at once (the link moves one stream as fast as eight; finished files are what survive an unplug); a file's space is reserved before writing it (so files written side by side don't interleave on the drive); and the file's date is set through the already-open file instead of opening it a second time (on a pen drive, every extra little write to a folder entry is slow).
+
+**In short:** speed lives in the wires; DriveDex can't add wires, but it tells you exactly which port, hub or cable is missing them.
+
+## 12. Interview cheat sheet
 
 **"What is it, in one sentence?"** A Windows tool that indexes external drives and Android phones once, then searches them instantly — even when unplugged — and copies files fast and resumably.
 
@@ -146,8 +166,10 @@ Results from a drive that's plugged in show its real path (`G:\Photos\IMG_001.jp
 
 **"How did you test things you can't run in CI?"** Interfaces + fakes for everything hardware-shaped (`ntfs.Device`, `phone.Runner`, the registry), and a checklist of hardware checks the owner runs on real drives and records in `PROGRESS.md` — with nothing marked "passed" without evidence.
 
+**"Anything you're proud of that isn't search?"** The USB link check: following a drive letter through the Windows device tree to its hub port and asking the hub driver whether the device could run faster — so a user learns *the port is USB 2.0 only* instead of blaming the drive.
+
 **"What would you do next?"** Duplicate finder (group by size, then hash), disk-usage view from the index, content search, iPhone support, a GUI on top of the same packages.
 
 **"What are the limits?"** Android only (no iPhone); turbo mode needs administrator rights; cloned drives share a serial number; the index is a snapshot until refreshed.
 
-**Words worth knowing:** index · file system · NTFS / exFAT · MFT · USN journal · `DeviceIoControl` · seek penalty · goroutine / worker pool · MTP · ADB · CRC-32 · atomic write (write a temp file, then rename) · struct-of-arrays · CGO (avoided: the program is one `.exe` with no extra DLLs).
+**Words worth knowing:** index · file system · NTFS / exFAT · MFT · USN journal · `DeviceIoControl` · seek penalty · goroutine / worker pool · MTP · ADB · CRC-32 · USB 2.0 (480 Mbit/s) vs USB 3 (5 Gbit/s+), companion ports · atomic write (write a temp file, then rename) · struct-of-arrays · CGO (avoided: the program is one `.exe` with no extra DLLs).

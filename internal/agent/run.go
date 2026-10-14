@@ -109,7 +109,8 @@ func RealDeps(log *Logger) (Deps, error) {
 			h, err := index.ReadHeaderFile(store.Path(id))
 			return h, err == nil
 		},
-		Notify: Notify,
+		Notify:  Notify,
+		USBLink: volume.USBLinkFor,
 	}, nil
 }
 

@@ -231,6 +231,7 @@ func collectFacts(ctx context.Context, version string) doctor.Facts {
 
 	f.ADB = collectADB(ctx)
 	f.Drives, f.DrivesErr = collectDrives(infos, f.Elevated)
+	f.Ports = portSummary()
 	return f
 }
 
@@ -293,6 +294,9 @@ func collectDrives(infos []index.Info, elevated bool) ([]doctor.DriveFacts, erro
 		d := doctor.DriveFacts{Letter: v.Letter(), Label: v.Label, FileSystem: v.FileSystem}
 		if bus, err := busTypeFor(v.Root); err == nil && bus.Bus != 0 {
 			d.Bus = volume.BusName(bus.Bus)
+		}
+		if l, ok := usbLinkOf(v.Root); ok {
+			d.USB = &l
 		}
 		if penalty, known := seekPenaltyFor(v.Root); known {
 			d.Media = doctor.MediaFlash
