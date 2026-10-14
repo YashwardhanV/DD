@@ -3,6 +3,7 @@ package copier
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,10 +34,10 @@ func TestBigLanesLimitBigFilesWithoutStarvingSmallOnes(t *testing.T) {
 		os.Chtimes(p, mtime, mtime)
 	}
 	for i := 0; i < 5; i++ {
-		write("big"+string(rune('a'+i))+".bin", 8<<10)
+		write(fmt.Sprintf("big%02d.bin", i), 8<<10)
 	}
 	for i := 0; i < 30; i++ {
-		write("small"+string(rune('a'+i))+".txt", 100)
+		write(fmt.Sprintf("small%02d.txt", i), 100) // (plain letters ran into '|', which Windows forbids)
 	}
 
 	var bigActive, maxBig, smallDuringBig atomic.Int32
