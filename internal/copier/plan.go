@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/yashwardhanv/dd/internal/copier/trace"
 	"github.com/yashwardhanv/dd/internal/index"
 	"github.com/yashwardhanv/dd/internal/scan"
 )
@@ -99,6 +100,10 @@ type Plan struct {
 	Phone   *PhoneSource
 
 	OnConflict string
+
+	// Source names where the file list came from ("walk", "index",
+	// "usn+index", "phone-find", "phone-index"), so the owner can see it.
+	Source string
 }
 
 // Counts summarises the plan.
@@ -178,9 +183,16 @@ func abs64(v int64) int64 {
 // finalize resolves conflicts for jobs (statting destinations in parallel),
 // sorts so big files go first, and assembles the Plan.
 func finalize(dstRoot string, dirs []string, jobs []Job, policy string, workers int) *Plan {
+	return finalizeTraced(nil, dstRoot, dirs, jobs, policy, workers)
+}
+
+// finalizeTraced is finalize, timing the destination check (trace phase PlanDst).
+func finalizeTraced(tr *trace.Recorder, dstRoot string, dirs []string, jobs []Job, policy string, workers int) *Plan {
 	if policy == "" {
 		policy = OnConflictNewer
 	}
+	m := tr.Start()
+	defer tr.End(trace.PlanDst, m)
 	items := make([]Item, len(jobs))
 	parallelFor(len(jobs), workers, func(i int) {
 		j := jobs[i]
@@ -259,9 +271,12 @@ func PlanLocal(ctx context.Context, src, dstRoot, policy string, workers int) (*
 		return nil, fmt.Errorf("opening %s: %w", src, err)
 	}
 
+	tr := trace.From(ctx)
 	if !st.IsDir() {
 		job := Job{Src: src, Rel: filepath.Base(src), Size: st.Size(), ModTime: st.ModTime().Unix()}
-		return finalize(dstRoot, nil, []Job{job}, policy, 1), nil
+		p := finalizeTraced(tr, dstRoot, nil, []Job{job}, policy, 1)
+		p.Source = "walk"
+		return p, nil
 	}
 
 	if inside(src, dstRoot) {
@@ -269,9 +284,12 @@ func PlanLocal(ctx context.Context, src, dstRoot, policy string, workers int) (*
 	}
 
 	name := srcName(src)
+	m := tr.Start()
 	sc := scan.NewParallel(src, workers)
 	b := index.NewBuilder(index.Header{})
-	if err := sc.Scan(ctx, b, nil); err != nil {
+	err = sc.Scan(ctx, b, nil)
+	tr.End(trace.PlanList, m)
+	if err != nil {
 		return nil, fmt.Errorf("listing %s: %w", src, err)
 	}
 	ix := b.Index()
@@ -292,7 +310,9 @@ func PlanLocal(ctx context.Context, src, dstRoot, policy string, workers int) (*
 			ModTime: ix.MTimes[slot],
 		})
 	}
-	return finalize(dstRoot, dirs, jobs, policy, workers), nil
+	p := finalizeTraced(tr, dstRoot, dirs, jobs, policy, workers)
+	p.Source = "walk"
+	return p, nil
 }
 
 // ErrDestinationInsideSource means a folder would be copied into itself (or
@@ -313,7 +333,9 @@ func inside(dir, path string) bool {
 // PlanJobs plans copying an explicit list of files (for example every match of
 // a search) into dstRoot.
 func PlanJobs(dstRoot string, jobs []Job, policy string, workers int) *Plan {
-	return finalize(dstRoot, nil, append([]Job(nil), jobs...), policy, workers)
+	p := finalize(dstRoot, nil, append([]Job(nil), jobs...), policy, workers)
+	p.Source = "index"
+	return p
 }
 
 // ---------------------------------------------------------------------------

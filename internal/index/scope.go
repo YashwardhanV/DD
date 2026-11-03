@@ -120,6 +120,10 @@ func LocateScope(indexes []*Index, env Env, abs string) (FolderScope, bool) {
 	return FolderScope{Index: indexes[best], FolderID: id, Rel: bestRel}, true
 }
 
+// RelativeTo returns abs relative to root with `\` separators, and whether
+// abs is root itself or inside it (compared case-insensitively, like Windows).
+func RelativeTo(root, abs string) (string, bool) { return relativeTo(root, abs) }
+
 // relativeTo returns abs relative to root with `\` separators, if abs is root
 // or inside it (case-insensitively, like Windows paths).
 func relativeTo(root, abs string) (string, bool) {

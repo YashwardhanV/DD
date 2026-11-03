@@ -17,8 +17,45 @@ Legend: `[x]` done and verified · `[~]` code complete and tested in the cloud c
 - [~] 11 Doctor, config, power search
 - [~] 12 Packaging & release
 
+## v2.0 (BUILD-V2.pdf)
+Legend: [x] done and verified - [~] code done, needs owner hardware - [ ] not started
+
+- [~] 13 Copy tracer + bench copy
+- [ ] 14 Phone USB link check
+- [ ] 15 Phone: plan from index + delta
+- [ ] 16 Phone: tar stream lane
+- [ ] 17 Local: plan from index + sweep
+- [ ] 18 Local fast paths (18a single-open, 18b unbuffered, 18c verify, 18d hints, 18e experiment)
+- [ ] 19 Autotuner
+- [ ] 20 Disk-order reads (HDD)
+- [ ] 21 Docs + v2.0.0
+
+### Defaults decided by benchmark
+| Setting | Default | Evidence (BENCHMARKS.md row) |
+|---|---|---|
+| phone_copy_mode | | |
+| phone_tar_streams | | |
+| phone_pull_compress | | |
+| copy_plan_from_index | | |
+| copy_unbuffered | | |
+| copy_autotune | | |
+| copy_order | | |
+
+### v2 stage notes
+- **Stage 13 (2026-11-03):** `internal/copier/trace` (Recorder, 13 phases, log2 per-file histogram, report, hints) and `internal/benchcopy` + `drivedex bench copy`. `drivedex copy` gained `--trace`, `--trace-file t.json` and `--v1`. Planning code finds the recorder through the `context.Context` (`trace.WithRecorder` / `trace.From`) so no planner signature changed; `copier.Run` takes it in `Options.Trace`. Every traced copy also saves `last-copy-trace.json` in the index folder (for `doctor`, stage 18d). **Overhead (container, 500 small files, 6 interleaved runs of 40 copies each):** a nil recorder costs ~2 ns per call (about 20 ns per file, about 0.01 % of a ~150 µs file); v1 build vs v2 build with the tracer off: medians 75.7 vs 77.6 ms/op with a ±10 % run-to-run spread - inside the noise; tracer ON: ~81 ns per phase call (about 0.5 %). Spec target "< 2 %": met by the per-call cost; end-to-end numbers on a container disk are too noisy to resolve 2 %.
+
+### v2 decisions & deviations
+- Work is on the session branch `ccr-6afc9af6-jrhf4s` (the cloud session's designated branch) rather than a branch named `v2`; one commit per stage as specified.
+- Stage 13: `writeAtomic` (spec 5.3; Appendix B lists it under stage 18) was extracted into `internal/copier/write.go` already in stage 13, because instrumenting the per-file phases (create, preallocate, data, set-time, close, rename) is the same refactor; behaviour is v1's (all v1 copier tests unchanged and green).
+- Stage 13: the **Explorer engine runs Shell.Application.CopyHere from PowerShell**, not through go-ole in-process: CopyHere is asynchronous, so the script itself polls the destination until it holds exactly the source's file count and bytes and stays unchanged for 2 s, and reports the time it first matched (the engine reports that time instead of the process's wall time). Its time limit is 2x the slowest other engine so far. Marked *experimental*; on a timeout the run is reported as failed with "time it by stopwatch instead".
+- Stage 13: hint "phone round trips" - "PhoneStream share low" is read as: a `pull`-mode phone copy of >= 100 files averaging < 1 MB that moves less than half its USB link's speed (or < 10 MB/s when the link is unknown). Hint "seek-bound" uses the drive's measured speed when known, else min(link, 100 MB/s) as a USB hard disk's typical sequential speed.
+- Stage 13: `bench copy` checks every run: the run's folder must hold exactly the source's file count and bytes, otherwise that run counts as failed (an engine that silently skips files can't "win"). It refuses to start if its `.drivedex-bench-<time>` folder already exists, so it never deletes a folder it didn't create; every delete goes through `benchcopy.SafeRemove`, which checks the path is inside that root (`TestSafeRemoveRefusesPathsOutsideTheRoot`). It needs free space for one copy of the source (each copy is deleted before the next).
+
+### Owner to verify (v2)
+- **Stage 13:** (a) `drivedex copy <your slow case> D:\x --trace` - paste the whole report; this is the first real diagnosis of "slow in real use". (b) On the pen drive: `drivedex bench copy E:\SomeFolder D:\BenchTmp --rounds 3 --cold --markdown` (answer y; replug when asked) - paste the table and the Markdown row. (c) `drivedex bench copy phone:/DCIM/Camera D:\BenchTmp --markdown` - paste the rows. (d) Check the Explorer engine gives a plausible time (compare once with a stopwatch); if it says "time it by stopwatch", tell me.
+
 ## Current status
-After stage 12: DriveDex now spots a USB 3 drive stuck at USB 2.0 speed and says what is in the way (`drivedex ports`, 2026-10-14, below), and the agent indexes **every external drive and portable device** by itself (2026-10-13). Stage 12 — `v1.0.0` tagged on `f8367fc` and released with both Windows zips (2026-10-10); `main` is the default branch and the repo is public. The hardware checks this PC could run were run on 2026-10-10 (below): two bugs found and fixed after the tag. Still open: the checks that need a pen drive, a phone or a person watching the screen.
+**v2.0 in progress (BUILD-V2.pdf, see the v2.0 section above).** Before v2 - after stage 12: DriveDex now spots a USB 3 drive stuck at USB 2.0 speed and says what is in the way (`drivedex ports`, 2026-10-14, below), and the agent indexes **every external drive and portable device** by itself (2026-10-13). Stage 12 — `v1.0.0` tagged on `f8367fc` and released with both Windows zips (2026-10-10); `main` is the default branch and the repo is public. The hardware checks this PC could run were run on 2026-10-10 (below): two bugs found and fixed after the tag. Still open: the checks that need a pen drive, a phone or a person watching the screen.
 
 ## Stress test (2026-10-06)
 A hardening pass after stage 12: fuzzing, adversarial unit tests, a randomized cancel/resume stress test and an end-to-end run on 200,000 files. **9 bugs found and fixed**, each with a test that fails on the old code and passes now:

@@ -121,6 +121,7 @@ saved index instantly - even for drives that are not plugged in.`,
 	root.AddCommand(newListCmd())
 	root.AddCommand(newForgetCmd())
 	root.AddCommand(newBenchScanCmd())
+	root.AddCommand(newBenchCmd())
 	root.AddCommand(newJournalCmd())
 	root.AddCommand(newCopyCmd())
 	root.AddCommand(newTUICmd())

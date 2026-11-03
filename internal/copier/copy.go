@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/yashwardhanv/dd/internal/copier/trace"
 	"github.com/yashwardhanv/dd/internal/ui"
 )
 
@@ -53,6 +54,9 @@ type Options struct {
 	// unplugged (resume restarts unfinished files) and more fragmentation on
 	// the destination. 0 = big files share all workers (the old behaviour).
 	BigLanes int
+	// Trace, if set, records where the time goes (drivedex copy --trace).
+	// nil costs nothing.
+	Trace *trace.Recorder
 }
 
 // BigFileSize is where BigLanes starts to apply.
@@ -137,6 +141,9 @@ var (
 // are reported in the Result and the copy carries on.
 func Run(ctx context.Context, p *Plan, opt Options) (Result, error) {
 	start := time.Now()
+	if opt.Trace == nil {
+		opt.Trace = trace.From(ctx)
+	}
 	counts := p.Counts()
 	st := &state{total: counts.Files, bytesTotal: counts.WriteBytes}
 
@@ -325,8 +332,10 @@ func copyWithRetries(ctx context.Context, dstRoot string, it *Item, buf []byte, 
 			}
 		}
 		var n int64
-		n, err = copyFile(ctx, it.Src, dst, it.ModTime, buf, opt.Verify, st)
+		began := time.Now()
+		n, err = copyFile(ctx, it.Src, dst, it.ModTime, buf, opt.Verify, st, opt.Trace)
 		if err == nil {
+			opt.Trace.FileDone(time.Since(began), n)
 			st.written.Add(1)
 			st.bytesDone.Add(n)
 			st.filesDone.Add(1)
@@ -350,78 +359,42 @@ func copyWithRetries(ctx context.Context, dstRoot string, it *Item, buf []byte, 
 // errVerify marks a checksum mismatch.
 var errVerify = errors.New("verification failed")
 
-// copyFile copies one file atomically: write "<dst>.ddxpart", set the modification
-// time, then rename it to the real name.
-//
-// There is deliberately no fsync here: forcing every small file to the platter
-// destroys USB throughput. (Use "Safely Remove" before unplugging a drive.)
-func copyFile(ctx context.Context, src, dst string, mtime int64, buf []byte, verify bool, st *state) (written int64, err error) {
+// copyFile copies one file atomically (see writeAtomic): write
+// "<dst>.ddxpart", set the modification time, then rename it to the real name.
+func copyFile(ctx context.Context, src, dst string, mtime int64, buf []byte, verify bool, st *state, tr *trace.Recorder) (written int64, err error) {
+	m := tr.Start()
 	info, err := os.Lstat(src)
 	if err != nil {
+		tr.End(trace.SrcOpen, m)
 		return 0, fmt.Errorf("reading %s: %w", src, err)
 	}
 	if !info.Mode().IsRegular() {
+		tr.End(trace.SrcOpen, m)
 		return 0, errNotRegular // never follow links: that could copy files from elsewhere
 	}
 	in, err := openSource(src)
+	tr.End(trace.SrcOpen, m)
 	if err != nil {
 		return 0, fmt.Errorf("opening %s: %w", src, err)
 	}
 	defer in.Close()
 
-	part := dst + PartSuffix
-	out, err := os.OpenFile(part, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	n, err := writeAtomic(ctx, dst, in, info.Size(), mtime, buf, buffered, tr)
 	if err != nil {
-		return 0, fmt.Errorf("creating %s: %w", part, err)
-	}
-	cleanup := func() { out.Close(); os.Remove(part) }
-
-	// Reserve the whole file's space up front: one allocation instead of
-	// growing the file a megabyte at a time. With several files written at
-	// once this keeps each file in one piece on the destination instead of
-	// interleaving them. Best effort: if it can't, the writes still work.
-	if info.Size() >= preallocMin {
-		preallocate(out, info.Size())
-	}
-
-	// struct{ io.Writer } hides *os.File's ReadFrom method; otherwise
-	// io.CopyBuffer would ignore our big buffer and use a small default one.
-	n, err := io.CopyBuffer(struct{ io.Writer }{out}, &ctxReader{ctx: ctx, r: in}, buf)
-	if err != nil {
-		cleanup()
-		return 0, fmt.Errorf("copying %s: %w", src, err)
-	}
-	// Set the time through the handle we already have, before closing. Doing
-	// it by name afterwards (os.Chtimes) opens the file a second time and
-	// rewrites its folder entry a second time - on a pen drive each of those
-	// is a slow little write, paid once per file.
-	t := time.Unix(mtime, 0)
-	timeSet, err := setModTime(out, t)
-	if err != nil {
-		cleanup()
-		return 0, fmt.Errorf("setting the time of %s: %w", part, err)
-	}
-	if err := out.Close(); err != nil {
-		os.Remove(part)
-		return 0, fmt.Errorf("writing %s: %w", part, err)
-	}
-	if !timeSet {
-		if err := os.Chtimes(part, t, t); err != nil {
-			os.Remove(part)
-			return 0, fmt.Errorf("setting the time of %s: %w", part, err)
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
 		}
-	}
-	if err := os.Rename(part, dst); err != nil {
-		os.Remove(part)
-		return 0, fmt.Errorf("moving %s into place: %w", part, err)
+		return 0, fmt.Errorf("copying %s: %w", src, err)
 	}
 	if afterCopy != nil {
 		afterCopy(dst)
 	}
 
 	if verify {
+		m := tr.Start()
 		a, errA := checksum(ctx, src, buf)
 		b, errB := checksum(ctx, dst, buf)
+		tr.End(trace.Verify, m)
 		switch {
 		case ctx.Err() != nil:
 			return n, ctx.Err()

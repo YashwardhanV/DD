@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yashwardhanv/dd/internal/copier/trace"
 	"github.com/yashwardhanv/dd/internal/index"
 	"github.com/yashwardhanv/dd/internal/phone"
 	"github.com/yashwardhanv/dd/internal/scan"
@@ -47,7 +48,10 @@ func PhonePath(p string) string { return PhonePathRoot(p, "/sdcard") }
 // PlanPhone plans copying a file or folder from the phone into dstRoot.
 // remote must be an absolute path on the phone (see PhonePath).
 func PlanPhone(ctx context.Context, adb *phone.ADB, serial, remote, dstRoot, policy string, workers int) (*Plan, error) {
+	tr := trace.From(ctx)
+	m := tr.Start()
 	info, err := adb.StatPath(ctx, serial, remote)
+	tr.End(trace.PhoneList, m)
 	if err != nil {
 		return nil, fmt.Errorf("asking the phone about %s: %w", remote, err)
 	}
@@ -63,15 +67,19 @@ func PlanPhone(ctx context.Context, adb *phone.ADB, serial, remote, dstRoot, pol
 
 	if !info.IsDir {
 		job := Job{Src: remote, Rel: SafeName(path.Base(remote)), Size: info.Size, ModTime: info.ModTime}
-		plan := finalize(dstRoot, nil, []Job{job}, policy, 1)
+		plan := finalizeTraced(tr, dstRoot, nil, []Job{job}, policy, 1)
 		plan.Phone = src
+		plan.Source = "phone-find"
 		return plan, nil
 	}
 
 	// One remote command lists every file with its size and time (stage 5).
+	m = tr.Start()
 	b := index.NewBuilder(index.Header{})
 	sc := phone.NewScanner(adb, serial, remote)
-	if err := sc.Scan(ctx, b, func(scan.Progress) {}); err != nil {
+	err = sc.Scan(ctx, b, func(scan.Progress) {})
+	tr.End(trace.PhoneList, m)
+	if err != nil {
 		return nil, fmt.Errorf("listing %s on the phone: %w", remote, err)
 	}
 	ix := b.Index()
@@ -94,8 +102,9 @@ func PlanPhone(ctx context.Context, adb *phone.ADB, serial, remote, dstRoot, pol
 			ModTime: ix.MTimes[slot],
 		})
 	}
-	plan := finalize(dstRoot, dirs, jobs, policy, workers)
+	plan := finalizeTraced(tr, dstRoot, dirs, jobs, policy, workers)
 	plan.Phone = src
+	plan.Source = "phone-find"
 	return plan, nil
 }
 
@@ -222,7 +231,7 @@ func pullBatchInto(ctx context.Context, p *Plan, b pullBatch, opt Options, st *s
 		}
 		var stillPending []*Item
 		for _, files := range group {
-			failed, err := pullAndPlace(ctx, p, files, st)
+			failed, err := pullAndPlace(ctx, p, files, st, opt.Trace)
 			if err != nil {
 				lastErr = err
 			}
@@ -244,7 +253,7 @@ func pullBatchInto(ctx context.Context, p *Plan, b pullBatch, opt Options, st *s
 
 // pullAndPlace pulls files into a fresh staging folder and moves each
 // delivered file to its final place. It returns the files that did not arrive.
-func pullAndPlace(ctx context.Context, p *Plan, files []*Item, st *state) (failed []*Item, err error) {
+func pullAndPlace(ctx context.Context, p *Plan, files []*Item, st *state, tr *trace.Recorder) (failed []*Item, err error) {
 	staging, mkErr := os.MkdirTemp(p.DstRoot, stagingPrefix)
 	if mkErr != nil {
 		return files, fmt.Errorf("creating a staging folder in %s: %w", p.DstRoot, mkErr)
@@ -258,11 +267,15 @@ func pullAndPlace(ctx context.Context, p *Plan, files []*Item, st *state) (faile
 	// A name Windows can't store (such as "a:b.jpg") is pulled on its own, to
 	// an explicit safe local name; makeBatches gives such files a batch each.
 	unsafe := len(files) == 1 && SafeName(path.Base(files[0].Src)) != path.Base(files[0].Src)
+	m := tr.Start()
+	began := time.Now()
 	if unsafe {
 		err = p.Phone.ADB.PullFile(ctx, p.Phone.Serial, files[0].Src, filepath.Join(staging, SafeName(path.Base(files[0].Src))))
 	} else {
 		err = p.Phone.ADB.Pull(ctx, p.Phone.Serial, srcs, staging)
 	}
+	tr.End(trace.PhoneStream, m)
+	perFile := time.Since(began) / time.Duration(len(files))
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
@@ -277,15 +290,19 @@ func pullAndPlace(ctx context.Context, p *Plan, files []*Item, st *state) (faile
 			failed = append(failed, it)
 			continue
 		}
+		pm := tr.Start()
 		t := time.Unix(it.ModTime, 0)
 		os.Chtimes(staged, t, t) // keep the phone's modification time (so a re-run sees "same")
 		final := filepath.Join(p.DstRoot, it.Rel)
 		os.MkdirAll(filepath.Dir(final), 0o755)
-		if rerr := os.Rename(staged, final); rerr != nil {
+		rerr := os.Rename(staged, final)
+		tr.End(trace.Place, pm)
+		if rerr != nil {
 			failed = append(failed, it)
 			err = fmt.Errorf("moving %s into place: %w", it.Rel, rerr)
 			continue
 		}
+		tr.FileDone(perFile, info.Size())
 		st.written.Add(1)
 		st.bytesDone.Add(info.Size())
 		st.filesDone.Add(1)
@@ -306,6 +323,7 @@ func PlanPhoneJobs(adb *phone.ADB, serial string, jobs []Job, dstRoot, policy st
 	}
 	plan := finalize(dstRoot, nil, jobs, policy, workers)
 	plan.Phone = &PhoneSource{ADB: adb, Serial: serial}
+	plan.Source = "index"
 	return plan
 }
 
