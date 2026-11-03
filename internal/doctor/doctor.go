@@ -183,6 +183,18 @@ type Facts struct {
 
 	// Ports counts the PC's USB 3 sockets (Known is false off Windows).
 	Ports volume.PortSummary
+
+	// LastCopy is the most recent traced copy (drivedex copy --trace), nil if none.
+	LastCopy *CopyFacts
+}
+
+// CopyFacts summarises the last traced copy for the "Copy speed" section.
+type CopyFacts struct {
+	When        time.Time
+	Destination string
+	Files       int64
+	MBps        float64
+	Hints       []string
 }
 
 // ---- building the report ----------------------------------------------------------------
@@ -195,7 +207,61 @@ func Build(f Facts) Report {
 		r.Sections = append(r.Sections, usbSection(f.Ports))
 	}
 	r.Sections = append(r.Sections, drivesSections(f)...)
+	if s, ok := copySection(f); ok {
+		r.Sections = append(r.Sections, s)
+	}
 	return r
+}
+
+// antivirusSteps is how to add a Windows Security exclusion BY HAND.
+// DriveDex never changes security settings itself (BUILD.md safety rules).
+const antivirusSteps = `you can add the destination folder to Windows Security's exclusions yourself, if you trust what you copy there:
+Start -> Windows Security -> Virus & threat protection -> "Manage settings" (under Virus & threat protection settings)
+-> scroll to Exclusions -> "Add or remove exclusions" -> "Add an exclusion" -> Folder -> choose %s.
+Remove it again the same way when the big copy is done. DriveDex never changes security settings for you.`
+
+// copySection explains the hints of the last traced copy (BUILD-V2 18d).
+func copySection(f Facts) (Section, bool) {
+	c := f.LastCopy
+	if c == nil || len(c.Hints) == 0 {
+		return Section{}, false
+	}
+	s := Section{Title: "Copy speed (last traced copy)"}
+	add := func(l Level, text, tip string) { s.Lines = append(s.Lines, Line{l, text, tip}) }
+	add(Info, fmt.Sprintf("%s files at %.1f MB/s, %s", fmtCount(c.Files), c.MBps, agoText(c.When, f.Now)), "")
+	for _, h := range c.Hints {
+		if strings.HasPrefix(h, "Creating files is the slow part") {
+			dst := c.Destination
+			if strings.TrimSpace(dst) == "" {
+				dst = "the destination folder"
+			}
+			add(Warn, "creating files was the slow part: antivirus scanning each new file is a common cause", fmt.Sprintf(antivirusSteps, dst))
+			continue
+		}
+		add(Info, h, "")
+	}
+	return s, true
+}
+
+func fmtCount(n int64) string {
+	s := fmt.Sprint(n)
+	for i := len(s) - 3; i > 0; i -= 3 {
+		s = s[:i] + "," + s[i:]
+	}
+	return s
+}
+
+func agoText(t, now time.Time) string {
+	d := now.Sub(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%d min ago", int(d.Minutes()))
+	case d < 48*time.Hour:
+		return fmt.Sprintf("%d h ago", int(d.Hours()))
+	}
+	return fmt.Sprintf("%d days ago", int(d.Hours()/24))
 }
 
 func driveDexSection(f Facts) Section {

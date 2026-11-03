@@ -15,6 +15,7 @@ import (
 	"github.com/yashwardhanv/dd/internal/agent"
 	"github.com/yashwardhanv/dd/internal/config"
 	"github.com/yashwardhanv/dd/internal/copier"
+	"github.com/yashwardhanv/dd/internal/copier/trace"
 	"github.com/yashwardhanv/dd/internal/doctor"
 	"github.com/yashwardhanv/dd/internal/index"
 	"github.com/yashwardhanv/dd/internal/install"
@@ -192,6 +193,13 @@ func collectFacts(ctx context.Context, version string) doctor.Facts {
 	infos := []index.Info(nil)
 	if store != nil {
 		infos, _ = store.List()
+		if rep, err := trace.ReadJSONFile(trace.LastReportPath(store.Dir)); err == nil {
+			when := time.Time{}
+			if st, err := os.Stat(trace.LastReportPath(store.Dir)); err == nil {
+				when = st.ModTime()
+			}
+			f.LastCopy = &doctor.CopyFacts{When: when, Destination: rep.Context.Destination, Files: rep.Files, MBps: rep.MBps, Hints: rep.Hints}
+		}
 	}
 	f.IndexCount = len(infos)
 

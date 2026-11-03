@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash"
 	"hash/crc32"
 	"io"
 	"io/fs"
@@ -74,6 +75,12 @@ type Options struct {
 	// reconciling sweep adds during the copy (the plan's own files were
 	// checked by Plan.Check before the copy started).
 	LateChecks Checks
+
+	// Fast turns on the local fast paths of BUILD-V2 stage 18 (zero = v1).
+	Fast FastPaths
+
+	journal *resumeJournal // set by Run (18e)
+	direct  bool           // small files go straight to their real names
 }
 
 // BigFileSize is where BigLanes starts to apply.
@@ -194,6 +201,11 @@ func Run(ctx context.Context, p *Plan, opt Options) (Result, error) {
 	if opt.Trace == nil {
 		opt.Trace = trace.From(ctx)
 	}
+	journal, direct, err := setupJournal(p, opt) // 18e; must come before the counts
+	if err != nil {
+		return Result{}, err
+	}
+	opt.journal, opt.direct = journal, direct
 	counts := p.Counts()
 	st := &state{}
 	st.total.Store(counts.Files)
@@ -241,11 +253,13 @@ func Run(ctx context.Context, p *Plan, opt Options) (Result, error) {
 		}()
 	}
 
-	var err error
 	if p.Phone != nil {
 		err = runPhone(ctx, p, opt, st)
 	} else {
 		runLocal(ctx, p, opt, st)
+	}
+	if journal != nil {
+		journal.finish(ctx.Err() == nil && st.failed.Load() == 0)
 	}
 
 	close(stopReport)
@@ -535,8 +549,11 @@ func copyWithRetries(ctx context.Context, p *Plan, it *Item, buf []byte, opt Opt
 		}
 		var n int64
 		began := time.Now()
-		n, err = copyFile(ctx, it.Src, dst, it.ModTime, buf, opt.Verify, st, opt.Trace)
+		n, err = copyFile(ctx, it.Src, dst, it.ModTime, buf, opt.Verify, st, opt.Trace, opt.Fast, opt.direct)
 		if err == nil {
+			if opt.journal != nil {
+				opt.journal.add(it.Rel)
+			}
 			opt.Trace.FileDone(time.Since(began), n)
 			st.written.Add(1)
 			st.bytesDone.Add(n)
@@ -570,28 +587,75 @@ var errVerify = errors.New("verification failed")
 
 // copyFile copies one file atomically (see writeAtomic): write
 // "<dst>.ddxpart", set the modification time, then rename it to the real name.
-func copyFile(ctx context.Context, src, dst string, mtime int64, buf []byte, verify bool, st *state, tr *trace.Recorder) (written int64, err error) {
+// fp turns on the stage 18 fast paths (the zero value is v1).
+func copyFile(ctx context.Context, src, dst string, mtime int64, buf []byte, verify bool, st *state, tr *trace.Recorder, fp FastPaths, direct bool) (written int64, err error) {
 	m := tr.Start()
-	info, err := os.Lstat(src)
-	if err != nil {
+	var in *os.File
+	var size int64
+	if fp.SingleOpen {
+		// 18a: one open; size and time come from the handle.
+		var realMtime int64
+		in, size, realMtime, err = openSourceSingle(src)
 		tr.End(trace.SrcOpen, m)
-		if errors.Is(err, fs.ErrNotExist) {
+		switch {
+		case errors.Is(err, errSourceGone):
 			return 0, fmt.Errorf("%w: %s", errSourceGone, src)
+		case errors.Is(err, errNotRegular):
+			return 0, errNotRegular
+		case err != nil:
+			return 0, fmt.Errorf("opening %s: %w", src, err)
 		}
-		return 0, fmt.Errorf("reading %s: %w", src, err)
-	}
-	if !info.Mode().IsRegular() {
+		mtime = realMtime
+	} else {
+		info, err := os.Lstat(src)
+		if err != nil {
+			tr.End(trace.SrcOpen, m)
+			if errors.Is(err, fs.ErrNotExist) {
+				return 0, fmt.Errorf("%w: %s", errSourceGone, src)
+			}
+			return 0, fmt.Errorf("reading %s: %w", src, err)
+		}
+		if !info.Mode().IsRegular() {
+			tr.End(trace.SrcOpen, m)
+			return 0, errNotRegular // never follow links: that could copy files from elsewhere
+		}
+		in, err = openSource(src)
 		tr.End(trace.SrcOpen, m)
-		return 0, errNotRegular // never follow links: that could copy files from elsewhere
-	}
-	in, err := openSource(src)
-	tr.End(trace.SrcOpen, m)
-	if err != nil {
-		return 0, fmt.Errorf("opening %s: %w", src, err)
+		if err != nil {
+			return 0, fmt.Errorf("opening %s: %w", src, err)
+		}
+		size = info.Size()
 	}
 	defer in.Close()
 
-	n, err := writeAtomic(ctx, dst, in, info.Size(), mtime, buf, buffered, tr)
+	// 18b: big files straight to and from the disk.
+	mode := buffered
+	var reader io.Reader = in
+	if fp.Unbuffered && size >= unbufferedMin {
+		mode = unbuffered
+		if u, err := openUnbuffered(src); err == nil {
+			defer u.Close()
+			reader = &unbufferedSource{f: u}
+		}
+	}
+	// 18c: the source's checksum is computed while it is copied.
+	var srcSum hash.Hash32
+	mediaVerify := verify && fp.MediaVerify
+	if mediaVerify {
+		srcSum = crc32.New(castagnoli)
+		if u, ok := reader.(*unbufferedSource); ok {
+			u.h = srcSum
+		} else {
+			reader = io.TeeReader(reader, srcSum)
+		}
+	}
+
+	var n int64
+	if direct && size < directMax && mode == buffered {
+		n, err = writeDirect(ctx, dst, reader, mtime, buf, tr) // 18e: no .ddxpart, no rename
+	} else {
+		n, err = writeAtomic(ctx, dst, reader, size, mtime, buf, mode, tr)
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return 0, ctx.Err()
@@ -604,8 +668,15 @@ func copyFile(ctx context.Context, src, dst string, mtime int64, buf []byte, ver
 
 	if verify {
 		m := tr.Start()
-		a, errA := checksum(ctx, src, buf)
-		b, errB := checksum(ctx, dst, buf)
+		var a, b uint32
+		var errA, errB error
+		if mediaVerify {
+			a = srcSum.Sum32()
+			b, errB = checksumMedia(ctx, dst)
+		} else {
+			a, errA = checksum(ctx, src, buf)
+			b, errB = checksum(ctx, dst, buf)
+		}
 		tr.End(trace.Verify, m)
 		switch {
 		case ctx.Err() != nil:
@@ -621,6 +692,40 @@ func copyFile(ctx context.Context, src, dst string, mtime int64, buf []byte, ver
 		}
 	}
 	return n, nil
+}
+
+// checksumMedia computes the CRC-32C of a file read with
+// FILE_FLAG_NO_BUFFERING, so the bytes come from the disk itself and not
+// from Windows' RAM cache (which still holds what was just written).
+// Elsewhere it is a normal read.
+func checksumMedia(ctx context.Context, path string) (uint32, error) {
+	h := crc32.New(castagnoli)
+	if f, err := openUnbuffered(path); err == nil {
+		defer f.Close()
+		buf := alignedBuffer(1 << 20)
+		for {
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+			n, err := f.Read(buf) // whole aligned requests; a short read is the end
+			h.Write(buf[:n])
+			if err == io.EOF || (err == nil && n < len(buf)) {
+				return h.Sum32(), nil
+			}
+			if err != nil {
+				return 0, err
+			}
+		}
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	if _, err := io.CopyBuffer(h, &ctxReader{ctx: ctx, r: f}, make([]byte, 1<<20)); err != nil {
+		return 0, err
+	}
+	return h.Sum32(), nil
 }
 
 // checksum computes the CRC-32C of a file.

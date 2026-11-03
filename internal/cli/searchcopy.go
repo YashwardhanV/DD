@@ -201,8 +201,9 @@ func copyMatches(ctx context.Context, in io.Reader, out *bufio.Writer, indexes [
 		fmt.Fprintf(out, "\n%s\n", ui.Bold(g.label))
 		// The same writer and lanes as 'drivedex copy' (tar stream for phones, per phone_copy_mode).
 		pm, streams, compress, _ := copyFlags{}.phoneOptions()
+		fast, _ := copyFlags{}.fastPaths()
 		if err := finishPlan(ctx, out, status, plan, planRun{workers: workers, why: why, dstArg: f.copyTo,
-			phoneMode: pm, tarStreams: streams, pullCompress: compress}); err != nil {
+			phoneMode: pm, tarStreams: streams, pullCompress: compress, fast: fast}); err != nil {
 			failed++
 			fmt.Fprintln(out, ui.Red("  "+err.Error()))
 		}

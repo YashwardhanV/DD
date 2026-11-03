@@ -3,6 +3,7 @@ package copier
 import (
 	"context"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"time"
@@ -34,7 +35,7 @@ func writeAtomic(ctx context.Context, dst string, r io.Reader, size, mtime int64
 	part := dst + PartSuffix
 
 	m := tr.Start()
-	out, err := createPart(part, mode)
+	out, unbufOut, err := createPart(part, mode)
 	tr.End(trace.DstCreate, m)
 	if err != nil {
 		return 0, fmt.Errorf("creating %s: %w", part, err)
@@ -52,7 +53,7 @@ func writeAtomic(ctx context.Context, dst string, r io.Reader, size, mtime int64
 	}
 
 	m = tr.Start()
-	n, err := copyData(ctx, out, r, buf, mode)
+	n, err := copyData(ctx, out, r, buf, unbufOut)
 	tr.End(trace.Data, m)
 	if err != nil {
 		cleanup()
@@ -97,13 +98,26 @@ func writeAtomic(ctx context.Context, dst string, r io.Reader, size, mtime int64
 	return n, nil
 }
 
-// createPart creates (or truncates) the .ddxpart file.
-func createPart(part string, mode ioMode) (*os.File, error) {
-	return os.OpenFile(part, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+// createPart creates (or truncates) the .ddxpart file. In unbuffered mode
+// it tries FILE_FLAG_NO_BUFFERING and reports whether it got it.
+func createPart(part string, mode ioMode) (*os.File, bool, error) {
+	if mode == unbuffered {
+		if f, err := createUnbuffered(part); err == nil {
+			return f, true, nil
+		}
+		// Not possible here (not Windows, or refused): the normal way.
+	}
+	f, err := os.OpenFile(part, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	return f, false, err
 }
 
-// copyData moves the bytes from r to out with buf.
-func copyData(ctx context.Context, out *os.File, r io.Reader, buf []byte, mode ioMode) (int64, error) {
+// copyData moves the bytes from r to out with buf. When either side is
+// unbuffered, the bytes move in sector-aligned blocks from an aligned buffer.
+func copyData(ctx context.Context, out *os.File, r io.Reader, buf []byte, unbufOut bool) (int64, error) {
+	// An unbuffered handle on EITHER side needs whole, aligned blocks.
+	if _, srcUnbuf := r.(*unbufferedSource); unbufOut || srcUnbuf {
+		return copyAligned(ctx, out, &ctxReader{ctx: ctx, r: r}, alignedBuffer(unbufferedBufSize), srcUnbuf)
+	}
 	// struct{ io.Writer } hides *os.File's ReadFrom method; otherwise
 	// io.CopyBuffer would ignore our big buffer and use a small default one.
 	n, err := io.CopyBuffer(struct{ io.Writer }{out}, &ctxReader{ctx: ctx, r: r}, buf)
@@ -111,4 +125,20 @@ func copyData(ctx context.Context, out *os.File, r io.Reader, buf []byte, mode i
 		return 0, fmt.Errorf("copying: %w", err)
 	}
 	return n, nil
+}
+
+// unbufferedSource marks a source opened with FILE_FLAG_NO_BUFFERING, so
+// copyData reads it in whole aligned blocks. h, if set, sees every byte read
+// (the --verify checksum, 18c).
+type unbufferedSource struct {
+	f *os.File
+	h hash.Hash32
+}
+
+func (u *unbufferedSource) Read(p []byte) (int, error) {
+	n, err := u.f.Read(p)
+	if u.h != nil && n > 0 {
+		u.h.Write(p[:n])
+	}
+	return n, err
 }

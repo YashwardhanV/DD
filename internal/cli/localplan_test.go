@@ -58,3 +58,26 @@ func TestCopyPlansFromAFreshFolderIndex(t *testing.T) {
 		t.Errorf("--plan index without an index: %v", err)
 	}
 }
+
+func TestCopyFastPathFlags(t *testing.T) {
+	tree, res := withFixture(t)
+	for _, args := range [][]string{
+		{"--verify"}, {"--unbuffered", "on", "--verify"}, {"--v1", "--verify"},
+	} {
+		out, err := run(t, append([]string{"copy", tree, filepath.Join(t.TempDir(), "o")}, args...)...)
+		if err != nil || !strings.Contains(out, "Verified:") {
+			t.Errorf("%v: %v\n%s", args, err, out)
+		}
+	}
+	dst := filepath.Join(t.TempDir(), "brand-new")
+	out, err := run(t, "copy", tree, dst, "--experimental-direct")
+	if err != nil || countFilesUnder(t, filepath.Join(dst, "tree")) != res.Files {
+		t.Errorf("direct: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(dst, ".drivedex-resume")); !os.IsNotExist(err) {
+		t.Error("the resume journal must be gone after a complete copy")
+	}
+	if _, err := run(t, "copy", tree, t.TempDir(), "--unbuffered", "sometimes"); err == nil {
+		t.Error("--unbuffered sometimes must be refused")
+	}
+}

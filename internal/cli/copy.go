@@ -57,13 +57,15 @@ for speed, DriveDex does not force every file to be flushed to the disk.`,
 	}
 	cmd.Flags().StringVar(&workers, "workers", "auto", "files copied at once: auto (picked from the drive types) or a number")
 	cmd.Flags().StringVar(&onConflict, "on-conflict", copier.OnConflictNewer, "when a file already exists: newer (replace only if the source is newer), skip, or overwrite")
-	cmd.Flags().BoolVar(&verify, "verify", false, "afterwards compare CRC-32 checksums of every copied file (note: the copy may be read back from RAM cache, so this checks the copy logic, not the physical media)")
+	cmd.Flags().BoolVar(&verify, "verify", false, "check every copied file with a CRC-32C checksum: the original's is computed while copying, and the copy is re-read straight from the disk (bypassing the RAM cache), so the media itself is checked; with --v1 both files are re-read and the copy may come from RAM")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "show what would be copied, skipped or overwritten, without writing anything")
 	cmd.Flags().BoolVar(&f.trace, "trace", false, "measure where the time goes and print a report with hints at the end")
 	cmd.Flags().StringVar(&f.traceFile, "trace-file", "", "also save the trace report as JSON to this file (for benchmarks and bug reports)")
 	cmd.Flags().BoolVar(&f.v1, "v1", false, "turn every DriveDex 2.0 copy feature off and copy exactly like version 1 (for comparisons)")
 	cmd.Flags().StringVar(&f.plan, "plan", "auto", "where the file list comes from: auto (the saved index when it can be trusted), index, or walk (list the source again, like v1)")
 	cmd.Flags().BoolVar(&f.fresh, "fresh", false, "list the source again instead of using the saved index (same as --plan walk)")
+	cmd.Flags().StringVar(&f.unbuffered, "unbuffered", "", "files of 256 MB and more: on (straight to the disk, skipping the RAM cache, like robocopy /J), off, or auto; default from copy_unbuffered")
+	cmd.Flags().BoolVar(&f.direct, "experimental-direct", false, "EXPERIMENTAL: into a brand-new folder, write small files straight to their names and keep a resume journal (.drivedex-resume) instead of renaming each file")
 	cmd.Flags().StringVar(&f.phoneMode, "phone-mode", "", "phone copies: auto (tar stream when the phone supports it), tar, or pull (one adb pull per batch, like v1); default from phone_copy_mode")
 	return cmd
 }
@@ -73,12 +75,32 @@ type copyFlags struct {
 	verify, dryRun      bool
 
 	// v2.0
-	trace     bool   // print the trace report
-	traceFile string // also write it as JSON
-	v1        bool   // every v2 feature off
-	plan      string // auto | index | walk
-	fresh     bool   // = --plan walk
-	phoneMode string // auto | tar | pull ("" = the phone_copy_mode setting)
+	trace      bool   // print the trace report
+	traceFile  string // also write it as JSON
+	v1         bool   // every v2 feature off
+	plan       string // auto | index | walk
+	fresh      bool   // = --plan walk
+	phoneMode  string // auto | tar | pull ("" = the phone_copy_mode setting)
+	unbuffered string // auto | on | off ("" = the copy_unbuffered setting)
+	direct     bool   // 18e experiment
+}
+
+// fastPaths returns the stage 18 switches. "auto" for unbuffered I/O means
+// OFF until the owner's benchmark shows it helps (BUILD-V2 18b).
+func (f copyFlags) fastPaths() (copier.FastPaths, error) {
+	if f.v1 {
+		return copier.FastPaths{}, nil
+	}
+	u := strings.ToLower(strings.TrimSpace(f.unbuffered))
+	if u == "" {
+		u = activeConfig.CopyUnbuffered
+	}
+	switch u {
+	case "", "auto", "on", "off":
+	default:
+		return copier.FastPaths{}, userErr(fmt.Sprintf("--unbuffered %q isn't valid", f.unbuffered), "use auto, on or off", nil)
+	}
+	return copier.FastPaths{SingleOpen: true, MediaVerify: true, Unbuffered: u == "on", Direct: f.direct}, nil
 }
 
 // phoneOptions returns the copier's phone settings from the flags and config.
@@ -172,6 +194,10 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 		return err
 	}
 	phoneMode, tarStreams, pullCompress, err := f.phoneOptions()
+	if err != nil {
+		return err
+	}
+	fast, err := f.fastPaths()
 	if err != nil {
 		return err
 	}
@@ -282,7 +308,7 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 	return finishPlan(ctx, out, status, plan, planRun{
 		workers: workers, why: why, verify: f.verify, dryRun: f.dryRun, dstArg: dstArg, srcRoot: srcRoot,
 		trace: rec, showTrace: f.trace, traceFile: f.traceFile, began: began, phoneLinkMBps: phoneLink,
-		afterRun: afterRun, phoneMode: phoneMode, tarStreams: tarStreams, pullCompress: pullCompress,
+		afterRun: afterRun, phoneMode: phoneMode, tarStreams: tarStreams, pullCompress: pullCompress, fast: fast,
 	})
 }
 
@@ -307,6 +333,7 @@ type planRun struct {
 	phoneMode    string // auto | tar | pull
 	tarStreams   int
 	pullCompress string
+	fast         copier.FastPaths
 }
 
 // finishPlan checks, announces, (dry-)runs and reports one copy plan. Both
@@ -364,6 +391,7 @@ func finishPlan(ctx context.Context, out *bufio.Writer, status *ui.StatusLine, p
 		TarStreams:   o.tarStreams,
 		PullCompress: o.pullCompress,
 		LateChecks:   copyChecks(),
+		Fast:         o.fast,
 		Progress: func(p ui.CopyProgress) {
 			status.Update(ui.FormatCopyProgress(p))
 		},

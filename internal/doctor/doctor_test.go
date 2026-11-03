@@ -278,3 +278,21 @@ func TestPhoneUSBSpeed(t *testing.T) {
 		t.Errorf("unknown: %+v", l)
 	}
 }
+
+func TestCopySpeedSectionExplainsTheAntivirusExclusion(t *testing.T) {
+	f := healthy()
+	if _, ok := copySection(f); ok {
+		t.Error("no traced copy: no section")
+	}
+	f.LastCopy = &CopyFacts{When: now.Add(-5 * time.Minute), Destination: `D:\Backup`, Files: 18412, MBps: 21.4,
+		Hints: []string{"Creating files is the slow part (avg file 340 KB). Antivirus ...", "Listing took 41.0 s; ..."}}
+	r := Build(f)
+	l := find(t, r, "creating files was the slow part")
+	if l.Level != Warn || !strings.Contains(l.Tip, "Add an exclusion") || !strings.Contains(l.Tip, `D:\Backup`) || !strings.Contains(l.Tip, "never changes security settings") {
+		t.Errorf("%+v", l)
+	}
+	if l := find(t, r, "18,412 files at 21.4 MB/s, 5 min ago"); l.Level != Info {
+		t.Errorf("%+v", l)
+	}
+	find(t, r, "Listing took 41.0 s")
+}

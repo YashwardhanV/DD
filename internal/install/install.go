@@ -265,7 +265,8 @@ func OwnedData(indexDir, dataDir, configPath string) []DataFile {
 	if entries, err := os.ReadDir(indexDir); err == nil {
 		for _, e := range entries {
 			n := strings.ToLower(e.Name())
-			if strings.HasSuffix(n, ".ddx") || strings.HasSuffix(n, ".ddx.tmp") || strings.HasSuffix(n, ".lock") {
+			if strings.HasSuffix(n, ".ddx") || strings.HasSuffix(n, ".ddx.tmp") || strings.HasSuffix(n, ".lock") ||
+				n == "last-copy-trace.json" || n == "last-copy-trace.json.tmp" { // v2: the last 'copy --trace' report
 				add(filepath.Join(indexDir, e.Name()))
 			}
 		}
