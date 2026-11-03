@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -99,5 +101,40 @@ func TestCopyAutotuneOnlyForAutomaticWorkerCounts(t *testing.T) {
 	out, _ = run(t, "copy", tree, filepath.Join(t.TempDir(), "c"))
 	if !strings.Contains(out, "adjusts itself between 1 and 4") {
 		t.Errorf("hard disk bounds:\n%s", out)
+	}
+}
+
+func TestCopyDiskOrderOnAnNTFSHardDisk(t *testing.T) {
+	tree, res := withFixture(t)
+	fakeDriveType(t, true, true) // a spinning disk
+	fakeChecks(t, 1<<40, "NTFS")
+	old := firstLCN
+	var asked atomic.Int64
+	firstLCN = func(p string) (int64, error) { asked.Add(1); return int64(len(p)), nil }
+	t.Cleanup(func() { firstLCN = old })
+
+	out, err := run(t, "copy", tree, filepath.Join(t.TempDir(), "a"))
+	if err != nil || !strings.Contains(out, "in the order they sit on the disk") || !strings.Contains(out, "between 1 and 2") {
+		t.Errorf("auto on an NTFS hard disk: %v\n%s", err, out)
+	}
+	if asked.Load() != int64(res.Files) {
+		t.Errorf("asked for %d files' clusters, want %d", asked.Load(), res.Files)
+	}
+	out, _ = run(t, "copy", tree, filepath.Join(t.TempDir(), "b"), "--order", "size")
+	if strings.Contains(out, "order they sit") {
+		t.Errorf("--order size:\n%s", out)
+	}
+	fakeChecks(t, 1<<40, "exFAT")
+	out, _ = run(t, "copy", tree, filepath.Join(t.TempDir(), "c"))
+	if strings.Contains(out, "order they sit") {
+		t.Errorf("auto on exFAT must keep size order:\n%s", out)
+	}
+	firstLCN = func(string) (int64, error) { return 0, errors.New("nope") }
+	out, _ = run(t, "copy", tree, filepath.Join(t.TempDir(), "d"), "--order", "disk")
+	if !strings.Contains(out, "Disk order not used") || !strings.Contains(out, "Copied 400 files") {
+		t.Errorf("--order disk where it can't work:\n%s", out)
+	}
+	if _, err := run(t, "copy", tree, t.TempDir(), "--order", "random"); err == nil {
+		t.Error("--order random must be refused")
 	}
 }

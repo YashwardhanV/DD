@@ -64,6 +64,7 @@ for speed, DriveDex does not force every file to be flushed to the disk.`,
 	cmd.Flags().BoolVar(&f.v1, "v1", false, "turn every DriveDex 2.0 copy feature off and copy exactly like version 1 (for comparisons)")
 	cmd.Flags().StringVar(&f.plan, "plan", "auto", "where the file list comes from: auto (the saved index when it can be trusted), index, or walk (list the source again, like v1)")
 	cmd.Flags().BoolVar(&f.fresh, "fresh", false, "list the source again instead of using the saved index (same as --plan walk)")
+	cmd.Flags().StringVar(&f.order, "order", "", "order small files are read in: auto (disk order for an NTFS hard disk, else largest first), size, name, or disk; default from copy_order")
 	cmd.Flags().StringVar(&f.unbuffered, "unbuffered", "", "files of 256 MB and more: on (straight to the disk, skipping the RAM cache, like robocopy /J), off, or auto; default from copy_unbuffered")
 	cmd.Flags().BoolVar(&f.direct, "experimental-direct", false, "EXPERIMENTAL: into a brand-new folder, write small files straight to their names and keep a resume journal (.drivedex-resume) instead of renaming each file")
 	cmd.Flags().StringVar(&f.phoneMode, "phone-mode", "", "phone copies: auto (tar stream when the phone supports it), tar, or pull (one adb pull per batch, like v1); default from phone_copy_mode")
@@ -83,6 +84,25 @@ type copyFlags struct {
 	phoneMode  string // auto | tar | pull ("" = the phone_copy_mode setting)
 	unbuffered string // auto | on | off ("" = the copy_unbuffered setting)
 	direct     bool   // 18e experiment
+	order      string // auto | size | name | disk ("" = the copy_order setting)
+}
+
+// copyOrder resolves --order / copy_order ("auto" stays "auto": it depends on the source).
+func (f copyFlags) copyOrder() (string, error) {
+	if f.v1 {
+		return copier.OrderSize, nil
+	}
+	o := strings.ToLower(strings.TrimSpace(f.order))
+	if o == "" {
+		o = activeConfig.CopyOrder
+	}
+	switch o {
+	case "", "auto":
+		return "auto", nil
+	case copier.OrderSize, copier.OrderName, copier.OrderDisk:
+		return o, nil
+	}
+	return "", userErr(fmt.Sprintf("--order %q isn't valid", f.order), "use auto, size, name or disk", nil)
 }
 
 // fastPaths returns the stage 18 switches. "auto" for unbuffered I/O means
@@ -201,6 +221,10 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 	if err != nil {
 		return err
 	}
+	order, err := f.copyOrder()
+	if err != nil {
+		return err
+	}
 	n, autoWorkers, err := parseWorkers(f.workers)
 	if err != nil {
 		return err
@@ -304,6 +328,13 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 		plan = res.Plan
 		if res.Plan.Source != copier.PlanWalk || f.trace {
 			fmt.Fprintln(out, ui.Dim(res.Why))
+		}
+		if orderSmallFiles(ctx, out, plan, src, order) == copier.OrderDisk {
+			// Stage 20: disk order with at most 2 workers, so the head moves forward.
+			workers = min(workers, 2)
+			if tune != nil {
+				tune.Max = min(tune.Max, 2)
+			}
 		}
 		if res.Sweeper != nil {
 			sweepStart := time.Now()

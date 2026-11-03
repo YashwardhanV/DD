@@ -61,3 +61,21 @@ func TestUnbufferedCopyOnWindows(t *testing.T) {
 	}
 	sameTree(t, src, filepath.Join(dst, filepath.Base(src)))
 }
+
+func TestFirstLCNOnWindows(t *testing.T) {
+	dir := t.TempDir()
+	big := filepath.Join(dir, "big.bin")
+	os.WriteFile(big, make([]byte, 1<<20), 0o644)
+	lcn, err := FirstLCN(big)
+	if err != nil {
+		t.Skipf("FSCTL_GET_RETRIEVAL_POINTERS not available here (%v) - the temp folder may not be NTFS", err)
+	}
+	if lcn <= 0 {
+		t.Errorf("a 1 MB file starts at cluster %d", lcn)
+	}
+	tiny := filepath.Join(dir, "tiny.txt")
+	os.WriteFile(tiny, []byte("x"), 0o644)
+	if _, err := FirstLCN(tiny); err != nil && err != ErrResident {
+		t.Errorf("tiny file: %v", err)
+	}
+}
