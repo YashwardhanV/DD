@@ -62,6 +62,8 @@ for speed, DriveDex does not force every file to be flushed to the disk.`,
 	cmd.Flags().BoolVar(&f.trace, "trace", false, "measure where the time goes and print a report with hints at the end")
 	cmd.Flags().StringVar(&f.traceFile, "trace-file", "", "also save the trace report as JSON to this file (for benchmarks and bug reports)")
 	cmd.Flags().BoolVar(&f.v1, "v1", false, "turn every DriveDex 2.0 copy feature off and copy exactly like version 1 (for comparisons)")
+	cmd.Flags().StringVar(&f.plan, "plan", "auto", "where the file list comes from: auto (the saved index when it can be trusted), index, or walk (list the source again, like v1)")
+	cmd.Flags().BoolVar(&f.fresh, "fresh", false, "list the source again instead of using the saved index (same as --plan walk)")
 	return cmd
 }
 
@@ -73,6 +75,33 @@ type copyFlags struct {
 	trace     bool   // print the trace report
 	traceFile string // also write it as JSON
 	v1        bool   // every v2 feature off
+	plan      string // auto | index | walk
+	fresh     bool   // = --plan walk
+}
+
+// planMode turns --plan / --fresh / --v1 / copy_plan_from_index into "auto",
+// "index" or "find" (list the source like v1), and the oldest index to trust
+// (-1 = any age, 0 = the default).
+func (f copyFlags) planMode() (mode string, anyAge bool, err error) {
+	p := strings.ToLower(strings.TrimSpace(f.plan))
+	switch p {
+	case "", "auto", "index", "walk":
+	default:
+		return "", false, userErr(fmt.Sprintf("--plan %q isn't valid", f.plan), "use auto, index or walk", nil)
+	}
+	switch {
+	case f.v1 || f.fresh || p == "walk":
+		return "find", false, nil
+	case p == "index":
+		return "index", activeConfig.CopyPlanFromIndex == "always", nil
+	}
+	switch activeConfig.CopyPlanFromIndex {
+	case "never":
+		return "find", false, nil
+	case "always":
+		return "auto", true, nil
+	}
+	return "auto", false, nil
 }
 
 // traced reports whether the copy is measured at all.
@@ -119,6 +148,10 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 	if !copier.ValidPolicy(f.onConflict) {
 		return userErr(fmt.Sprintf("--on-conflict %q isn't valid", f.onConflict), "use newer, skip or overwrite", nil)
 	}
+	planMode, anyAge, err := f.planMode()
+	if err != nil {
+		return err
+	}
 	n, autoWorkers, err := parseWorkers(f.workers)
 	if err != nil {
 		return err
@@ -133,8 +166,9 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 
 	// --- plan -----------------------------------------------------------------
 	var plan *copier.Plan
-	srcRoot := ""    // the local source, for the USB speed check ("" for a phone)
-	phoneLink := 0.0 // the phone's USB link in MB/s (0 = unknown)
+	srcRoot := ""                    // the local source, for the USB speed check ("" for a phone)
+	phoneLink := 0.0                 // the phone's USB link in MB/s (0 = unknown)
+	var afterRun func(copier.Result) // e.g. refresh the phone index from what the plan learned
 	spec, isPhone, err := parsePhoneSource(srcArg)
 	if err != nil {
 		return err
@@ -161,11 +195,24 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 		remote := copier.PhonePathRoot(spec.path, activePhoneRoot())
 		phoneLink = printPhoneLink(out, dev.Name(), dev.Serial)
 		status.Update("Reading the file list from " + dev.Name() + " …")
-		plan, err = copier.PlanPhone(ctx, adb, dev.Serial, remote, dst, f.onConflict, max(workers, 4))
+		req := copier.PhonePlanRequest{
+			ADB: adb, Serial: dev.Serial, Remote: remote, DstRoot: dst, Policy: f.onConflict, Workers: max(workers, 4),
+			Index: loadPhoneIndex(dev.Serial), Mode: planMode,
+		}
+		if anyAge {
+			req.MaxAge = -1
+		}
+		res, err := copier.PlanPhoneSmart(ctx, req)
 		status.Clear()
 		if err != nil {
+			if errors.Is(err, copier.ErrIndexNotUsable) {
+				return userErr(err.Error(), "drop --plan index to let DriveDex list the phone, or run: drivedex index phone", nil)
+			}
 			return planError(srcArg, err)
 		}
+		plan = res.Plan
+		fmt.Fprintln(out, ui.Dim(res.Why))
+		afterRun = func(r copier.Result) { refreshPhoneIndex(out, dev.Serial, res, r) }
 		if f.verify {
 			fmt.Fprintln(out, ui.Dim("note: --verify isn't available for phone copies (there is nothing on the PC to compare with); files are still copied atomically."))
 			f.verify = false
@@ -197,6 +244,7 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 	return finishPlan(ctx, out, status, plan, planRun{
 		workers: workers, why: why, verify: f.verify, dryRun: f.dryRun, dstArg: dstArg, srcRoot: srcRoot,
 		trace: rec, showTrace: f.trace, traceFile: f.traceFile, began: began, phoneLinkMBps: phoneLink,
+		afterRun: afterRun,
 	})
 }
 
@@ -215,6 +263,8 @@ type planRun struct {
 	began     time.Time       // when the command started (planning is part of the copy's time)
 
 	phoneLinkMBps float64 // a phone source's USB link speed (0 = unknown)
+
+	afterRun func(copier.Result) // runs after the copy (nil = nothing)
 }
 
 // finishPlan checks, announces, (dry-)runs and reports one copy plan. Both
@@ -276,12 +326,19 @@ func finishPlan(ctx context.Context, out *bufio.Writer, status *ui.StatusLine, p
 		return userErr("the copy couldn't start", "check the destination can be written to: "+dst, err)
 	}
 	defer reportTrace(out, plan, o, workers)
+	if o.afterRun != nil {
+		o.afterRun(res)
+	}
 
 	// --- report ---------------------------------------------------------------
 	rate := ui.PerSecond(res.BytesWritten, res.Elapsed)
 	fmt.Fprintf(out, "Copied %s files (%s) in %s · %s/s · %d skipped · %d failed\n",
 		ui.Thousands(res.Written), ui.HumanSize(res.BytesWritten), ui.FormatDuration(res.Elapsed),
 		ui.HumanSize(rate), res.Skipped, res.Failed)
+	if res.Vanished > 0 {
+		fmt.Fprintln(out, ui.Dim(fmt.Sprintf("%d %s had been deleted since the index was made (vanished) - nothing to copy, not an error.",
+			res.Vanished, plural(int(res.Vanished), "file", "files"))))
+	}
 	if res.NotRegular > 0 {
 		fmt.Fprintln(out, ui.Dim(fmt.Sprintf("%d links/special files were skipped (DriveDex never follows links).", res.NotRegular)))
 	}

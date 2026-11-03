@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yashwardhanv/dd/internal/phone"
 	"github.com/yashwardhanv/dd/internal/phone/phonetest"
@@ -67,5 +68,51 @@ func TestDrivesListsPhonesWithTheirUSBSpeed(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q:\n%s", want, out)
 		}
+	}
+}
+
+func TestCopyFromPhonePlansFromTheIndex(t *testing.T) {
+	t.Setenv("DRIVEDEX_INDEX_DIR", t.TempDir())
+	fs := phonetest.NewFS()
+	old := time.Now().Add(-48 * time.Hour).Unix()
+	for _, n := range []string{"a", "b", "c"} {
+		fs.Add("/sdcard/DCIM/Camera/"+n+".jpg", "photo "+n, old)
+	}
+	useFS(t, fs)
+	fakeDriveType(t, false, true)
+	if out, err := run(t, "index", "phone"); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	fs.Add("/sdcard/DCIM/Camera/new.jpg", "taken after indexing", time.Now().Unix())
+	fs.Remove("/sdcard/DCIM/Camera/c.jpg")
+
+	dst := filepath.Join(t.TempDir(), "d")
+	out, err := run(t, "copy", "phone:/DCIM/Camera", dst)
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	for _, want := range []string{"Planned from the phone index (made just now) + 1 changed file.", "Copied 3 files", "1 file had been deleted since the index was made (vanished)", "Phone index updated with 1 changed file."} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q:\n%s", want, out)
+		}
+	}
+	for _, c := range fs.ShellCommands() {
+		if strings.HasPrefix(c, "find /sdcard/DCIM/Camera") && !strings.Contains(c, "-cmin") {
+			t.Errorf("a full listing ran: %s", c)
+		}
+	}
+	// The refreshed index now finds the new photo.
+	out, _ = run(t, "search", "new.jpg")
+	if !strings.Contains(out, "new.jpg") {
+		t.Errorf("search after the refresh:\n%s", out)
+	}
+
+	// --fresh lists the phone like v1.
+	out, err = run(t, "copy", "phone:/DCIM/Camera", filepath.Join(t.TempDir(), "e"), "--fresh")
+	if err != nil || !strings.Contains(out, "Listed the phone folder (a fresh listing was asked for).") {
+		t.Errorf("--fresh: %v\n%s", err, out)
+	}
+	if _, err := run(t, "copy", "phone:/DCIM/Camera", t.TempDir(), "--plan", "sideways"); err == nil {
+		t.Error("--plan sideways must be refused")
 	}
 }

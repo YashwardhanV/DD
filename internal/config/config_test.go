@@ -28,6 +28,9 @@ func TestDefaultsMatchTheSpec(t *testing.T) {
 		DefaultLimit: 50, ShowHidden: true, Workers: "auto",
 		SkipDirs: []string{"System Volume Information", "$RECYCLE.BIN", "$Recycle.Bin"}, SkipDirsExtra: []string{},
 		StaleAfter: "24h", Notifications: true, AutoIndex: []string{}, AdbPath: "", PhoneRoot: "/sdcard/", Color: "auto",
+		// v2.0 (BUILD-V2 section 5.6)
+		CopyPlanFromIndex: "auto", IndexPlanMaxAge: "15m", CopyAutotune: true, CopyOrder: "auto",
+		CopyUnbuffered: "auto", PhoneCopyMode: "auto", PhoneTarStreams: 1, PhonePullCompress: "auto",
 	}
 	if !reflect.DeepEqual(d, want) {
 		t.Errorf("defaults = %+v", d)
@@ -214,5 +217,37 @@ func TestHugeStaleAfterMeansNeverStale(t *testing.T) {
 		if err != nil || d < 100*365*24*time.Hour {
 			t.Errorf("stale_after %q = %v, %v; want a huge positive duration", s, d, err)
 		}
+	}
+}
+
+func TestV2CopySettings(t *testing.T) {
+	d := Defaults()
+	if d.CopyPlanFromIndex != "auto" || d.IndexPlanMaxAge != "15m" || !d.CopyAutotune || d.CopyOrder != "auto" ||
+		d.CopyUnbuffered != "auto" || d.PhoneCopyMode != "auto" || d.PhoneTarStreams != 1 || d.PhonePullCompress != "auto" {
+		t.Errorf("v2 defaults: %+v", d)
+	}
+	// The generated file parses to exactly the defaults.
+	p := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(p, []byte(Template), 0o644)
+	got, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PhoneCopyMode != "auto" || got.PhoneTarStreams != 1 || !got.CopyAutotune || got.IndexPlanMaxAge != "15m" {
+		t.Errorf("template: %+v", got)
+	}
+	for _, bad := range []string{
+		`copy_plan_from_index = "sometimes"`, `copy_order = "random"`, `copy_unbuffered = "maybe"`,
+		`phone_copy_mode = "mtp"`, `phone_pull_compress = "gzip"`, `phone_tar_streams = 9`, `index_plan_max_age = "soon"`,
+	} {
+		os.WriteFile(p, []byte(bad+"\n"), 0o644)
+		if _, err := Load(p); err == nil || !strings.Contains(err.Error(), strings.Fields(bad)[0]) {
+			t.Errorf("%s: %v", bad, err)
+		}
+	}
+	os.WriteFile(p, []byte("phone_copy_mode = \"PULL\"\ncopy_autotune = false\n"), 0o644)
+	got, err = Load(p)
+	if err != nil || got.PhoneCopyMode != "pull" || got.CopyAutotune || got.CopyOrder != "auto" {
+		t.Errorf("partial file: %+v %v", got, err)
 	}
 }

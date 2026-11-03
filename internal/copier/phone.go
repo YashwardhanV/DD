@@ -48,22 +48,41 @@ func PhonePath(p string) string { return PhonePathRoot(p, "/sdcard") }
 // PlanPhone plans copying a file or folder from the phone into dstRoot.
 // remote must be an absolute path on the phone (see PhonePath).
 func PlanPhone(ctx context.Context, adb *phone.ADB, serial, remote, dstRoot, policy string, workers int) (*Plan, error) {
+	info, err := statRemote(ctx, adb, serial, remote)
+	if err != nil {
+		return nil, err
+	}
+	return planPhoneFind(ctx, adb, serial, remote, info, dstRoot, policy, workers)
+}
+
+// statRemote asks the phone whether remote exists and is a folder.
+func statRemote(ctx context.Context, adb *phone.ADB, serial, remote string) (phone.PathInfo, error) {
 	tr := trace.From(ctx)
 	m := tr.Start()
 	info, err := adb.StatPath(ctx, serial, remote)
 	tr.End(trace.PhoneList, m)
 	if err != nil {
-		return nil, fmt.Errorf("asking the phone about %s: %w", remote, err)
+		return info, fmt.Errorf("asking the phone about %s: %w", remote, err)
 	}
 	if !info.Exists {
-		return nil, fmt.Errorf("%w: %s", ErrRemoteNotFound, remote)
+		return info, fmt.Errorf("%w: %s", ErrRemoteNotFound, remote)
 	}
-	src := &PhoneSource{ADB: adb, Serial: serial, Remote: remote}
+	return info, nil
+}
 
+// phoneFolderName is the name a phone folder gets inside the destination.
+func phoneFolderName(remote string) string {
 	name := path.Base(strings.TrimRight(remote, "/"))
-	if name == "." || name == "/" || name == "sdcard" {
+	if name == "." || name == "/" || name == "sdcard" || name == "" {
 		name = "Phone"
 	}
+	return SafeName(name)
+}
+
+// planPhoneFind is the v1 plan: one 'find' on the phone lists the folder.
+func planPhoneFind(ctx context.Context, adb *phone.ADB, serial, remote string, info phone.PathInfo, dstRoot, policy string, workers int) (*Plan, error) {
+	tr := trace.From(ctx)
+	src := &PhoneSource{ADB: adb, Serial: serial, Remote: remote}
 
 	if !info.IsDir {
 		job := Job{Src: remote, Rel: SafeName(path.Base(remote)), Size: info.Size, ModTime: info.ModTime}
@@ -74,17 +93,17 @@ func PlanPhone(ctx context.Context, adb *phone.ADB, serial, remote, dstRoot, pol
 	}
 
 	// One remote command lists every file with its size and time (stage 5).
-	m = tr.Start()
+	m := tr.Start()
 	b := index.NewBuilder(index.Header{})
 	sc := phone.NewScanner(adb, serial, remote)
-	err = sc.Scan(ctx, b, func(scan.Progress) {})
+	err := sc.Scan(ctx, b, func(scan.Progress) {})
 	tr.End(trace.PhoneList, m)
 	if err != nil {
 		return nil, fmt.Errorf("listing %s on the phone: %w", remote, err)
 	}
 	ix := b.Index()
 
-	name = SafeName(name)
+	name := phoneFolderName(remote)
 	dirs := []string{name}
 	var jobs []Job
 	cache := map[uint64]string{}
@@ -243,12 +262,22 @@ func pullBatchInto(ctx context.Context, p *Plan, b pullBatch, opt Options, st *s
 		return
 	}
 	for _, it := range pending {
+		if p.MayBeStale && goneFromPhone(ctx, p, it) {
+			st.vanish()
+			continue
+		}
 		err := lastErr
 		if err == nil {
 			err = errors.New("the phone didn't deliver the file")
 		}
 		st.fail(it.Rel, err)
 	}
+}
+
+// goneFromPhone reports whether a planned file no longer exists on the phone.
+func goneFromPhone(ctx context.Context, p *Plan, it *Item) bool {
+	info, err := p.Phone.ADB.StatPath(ctx, p.Phone.Serial, it.Src)
+	return err == nil && !info.Exists
 }
 
 // pullAndPlace pulls files into a fresh staging folder and moves each

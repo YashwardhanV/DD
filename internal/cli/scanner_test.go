@@ -107,8 +107,15 @@ func TestBenchScan(t *testing.T) {
 			t.Errorf("bench-scan output missing %q:\n%s", want, out)
 		}
 	}
-	// One row per setting.
-	if rows := strings.Count(out, fmtCount(res.Files+res.Dirs)); rows != 2 {
+	// One row per setting. (Compare the ENTRIES column itself: the count can
+	// also appear inside the ENTRIES/S column, e.g. 417 in "417,016".)
+	rows := 0
+	for _, line := range strings.Split(out, "\n") {
+		if f := strings.Fields(line); len(f) == 4 && f[2] == fmtCount(res.Files+res.Dirs) {
+			rows++
+		}
+	}
+	if rows != 2 {
 		t.Errorf("want 2 result rows, got %d:\n%s", rows, out)
 	}
 	for _, bad := range []string{"", "0", "a,b", "1,,x"} {

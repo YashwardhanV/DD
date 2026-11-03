@@ -96,6 +96,10 @@ type Result struct {
 	Elapsed          time.Duration
 	Cancelled        bool
 	NotRegular       int64 // links and other special files that were skipped
+	// Vanished counts planned files that no longer existed when their turn
+	// came (deleted since the index the plan came from was made). They are
+	// not failures.
+	Vanished int64
 }
 
 // state is the live, shared counters of a running copy.
@@ -106,9 +110,17 @@ type state struct {
 	skipped, failed      atomic.Int64
 	written, notRegular  atomic.Int64
 	mismatches           atomic.Int64
+	vanished             atomic.Int64
 
 	mu       sync.Mutex
 	failures []Failure
+}
+
+// vanish records a planned file that no longer exists at the source.
+func (s *state) vanish() {
+	s.vanished.Add(1)
+	s.skipped.Add(1)
+	s.filesDone.Add(1)
 }
 
 func (s *state) fail(rel string, err error) {
@@ -213,6 +225,7 @@ func Run(ctx context.Context, p *Plan, opt Options) (Result, error) {
 		BytesWritten: st.bytesDone.Load(), VerifyMismatches: st.mismatches.Load(),
 		Failures: append([]Failure(nil), st.failures...), Elapsed: elapsed,
 		Cancelled: ctx.Err() != nil, NotRegular: st.notRegular.Load(),
+		Vanished: st.vanished.Load(),
 	}
 	st.mu.Unlock()
 	return res, err

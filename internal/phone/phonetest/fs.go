@@ -34,9 +34,15 @@ type FS struct {
 	FailTimes map[string]int
 	// OnPull, if set, runs at the start of every pull (to slow it down or cancel).
 	OnPull func(ctx context.Context)
+	// NoCmin makes the phone's find reject -cmin (like an old busybox).
+	NoCmin bool
+	// Now is the phone's clock in unix seconds (default: the real clock).
+	Now func() int64
 
 	mu      sync.Mutex
 	files   map[string]File
+	ctimes  map[string]int64 // status-change time; default = MTime
+	shells  []string         // every shell command run
 	pulls   [][]string
 	running atomic.Int64
 	peak    atomic.Int64
@@ -52,6 +58,38 @@ func (f *FS) Add(p, content string, mtime int64) {
 	f.mu.Lock()
 	f.files[p] = File{content, mtime}
 	f.mu.Unlock()
+}
+
+// SetCTime sets a file's status-change time (what find -cmin looks at). A
+// file added with Add has ctime = mtime until this is called.
+func (f *FS) SetCTime(p string, ctime int64) {
+	f.mu.Lock()
+	if f.ctimes == nil {
+		f.ctimes = map[string]int64{}
+	}
+	f.ctimes[p] = ctime
+	f.mu.Unlock()
+}
+
+// Remove deletes a file from the phone.
+func (f *FS) Remove(p string) {
+	f.mu.Lock()
+	delete(f.files, p)
+	f.mu.Unlock()
+}
+
+// ShellCommands returns every 'adb shell' command run so far.
+func (f *FS) ShellCommands() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.shells...)
+}
+
+func (f *FS) now() int64 {
+	if f.Now != nil {
+		return f.Now()
+	}
+	return time.Now().Unix()
 }
 
 // ADB returns an *phone.ADB backed by this fake phone.
@@ -92,9 +130,22 @@ func (f *FS) handle(ctx context.Context, args []string) (string, error) {
 		return f.pull(ctx, args[3:]) // -a remote... local
 	case "shell":
 		cmd := args[3]
+		f.mu.Lock()
+		f.shells = append(f.shells, cmd)
+		f.mu.Unlock()
 		switch {
 		case strings.HasPrefix(cmd, "stat -c"):
 			return f.stat(cmd), nil
+		case strings.HasPrefix(cmd, "find / -maxdepth 0 -cmin"):
+			if f.NoCmin {
+				return "find: Unknown option '-cmin'\nDDX_RC=1\n", nil
+			}
+			return "DDX_RC=0\n", nil
+		case strings.HasPrefix(cmd, "find ") && strings.Contains(cmd, " -cmin -"):
+			if f.NoCmin {
+				return "", &phone.ExitError{Code: 1}
+			}
+			return f.findChanged(cmd), nil
 		case strings.HasPrefix(cmd, "find "):
 			return f.find(cmd), nil
 		}
@@ -134,6 +185,34 @@ func (f *FS) find(cmd string) string {
 	var paths []string
 	for p := range f.files {
 		if strings.HasPrefix(p, root) {
+			paths = append(paths, p)
+		}
+	}
+	sort.Strings(paths)
+	var sb strings.Builder
+	for _, p := range paths {
+		fmt.Fprintf(&sb, "%d|%d|%s\n", len(f.files[p].Content), f.files[p].MTime, p)
+	}
+	return sb.String()
+}
+
+// findChanged answers DeltaCommand: files under the root whose ctime is
+// within the last N minutes.
+func (f *FS) findChanged(cmd string) string {
+	root := strings.TrimRight(unquote(strings.TrimPrefix(cmd, "find ")), "/") + "/"
+	i := strings.Index(cmd, " -cmin -")
+	var minutes int64
+	fmt.Sscanf(cmd[i+len(" -cmin -"):], "%d", &minutes)
+	since := f.now() - minutes*60
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var paths []string
+	for p, file := range f.files {
+		ct, ok := f.ctimes[p]
+		if !ok {
+			ct = file.MTime
+		}
+		if strings.HasPrefix(p, root) && ct > since {
 			paths = append(paths, p)
 		}
 	}

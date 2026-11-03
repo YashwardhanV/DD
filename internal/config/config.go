@@ -53,6 +53,16 @@ type Config struct {
 	AdbPath       string   `toml:"adb_path"`
 	PhoneRoot     string   `toml:"phone_root"`
 	Color         string   `toml:"color"`
+
+	// v2.0 copy settings (BUILD-V2 section 5.6).
+	CopyPlanFromIndex string `toml:"copy_plan_from_index"` // auto | always | never
+	IndexPlanMaxAge   string `toml:"index_plan_max_age"`   // an older index is not trusted on its own
+	CopyAutotune      bool   `toml:"copy_autotune"`        // worker count adjusts itself during a copy
+	CopyOrder         string `toml:"copy_order"`           // auto | size | name | disk
+	CopyUnbuffered    string `toml:"copy_unbuffered"`      // auto | on | off (files >= 256 MB)
+	PhoneCopyMode     string `toml:"phone_copy_mode"`      // auto | tar | pull
+	PhoneTarStreams   int    `toml:"phone_tar_streams"`    // tar streams at once
+	PhonePullCompress string `toml:"phone_pull_compress"`  // auto | off | lz4 | zstd | brotli
 }
 
 // Defaults returns the built-in settings (BUILD.md stage 11).
@@ -69,6 +79,15 @@ func Defaults() Config {
 		AdbPath:       "",
 		PhoneRoot:     "/sdcard/",
 		Color:         "auto",
+
+		CopyPlanFromIndex: "auto",
+		IndexPlanMaxAge:   "15m",
+		CopyAutotune:      true,
+		CopyOrder:         "auto",
+		CopyUnbuffered:    "auto",
+		PhoneCopyMode:     "auto",
+		PhoneTarStreams:   1,
+		PhonePullCompress: "auto",
 	}
 }
 
@@ -113,6 +132,27 @@ phone_root      = "/sdcard/"
 
 # Colored output: "auto", "always" or "never". (The NO_COLOR environment variable is also respected.)
 color           = "auto"
+
+# --- v2.0 copy settings ---
+# Plan a copy from the saved index instead of listing the source again:
+# "auto" (when the index is fresh enough to trust), "always" or "never".
+copy_plan_from_index = "auto"
+# An index older than this is not trusted on its own for planning a drive copy.
+index_plan_max_age   = "15m"
+# Let the number of parallel workers adjust itself during a copy (off when --workers N is given).
+copy_autotune        = true
+# Order small files are copied in: "auto", "size" (largest first), "name", or "disk"
+# (the order they sit on a hard disk; NTFS hard-disk sources only).
+copy_order           = "auto"
+# Copy files of 256 MB and more straight to the disk, skipping Windows' RAM cache: "auto", "on" or "off".
+copy_unbuffered      = "auto"
+# How phone files are copied: "auto" (tar stream when the phone supports it), "tar" or "pull".
+phone_copy_mode      = "auto"
+# Tar streams from the phone at once (1 or 2; the benchmark decides if 2 is better).
+phone_tar_streams    = 1
+# Compress big compressible phone files on the way (.txt .log .json .db .csv .xml .html):
+# "auto", "off", "lz4", "zstd" or "brotli". Needs a recent adb and phone.
+phone_pull_compress  = "auto"
 `
 
 // Path returns where the config file lives.
@@ -196,7 +236,66 @@ func (c Config) Validate() error {
 	if pr := strings.TrimSpace(c.PhoneRoot); pr != "" && !strings.HasPrefix(pr, "/") {
 		return fmt.Errorf("phone_root must start with / (for example \"/sdcard/\"), not %q", c.PhoneRoot)
 	}
+	return c.validateV2()
+}
+
+// validateV2 checks the v2.0 copy settings.
+func (c Config) validateV2() error {
+	oneOf := func(key, v string, allowed ...string) error {
+		v = strings.ToLower(strings.TrimSpace(v))
+		if v == "" {
+			return nil // missing = default
+		}
+		for _, a := range allowed {
+			if v == a {
+				return nil
+			}
+		}
+		return fmt.Errorf("%s must be %s, not %q", key, quoteList(allowed), v)
+	}
+	for _, err := range []error{
+		oneOf("copy_plan_from_index", c.CopyPlanFromIndex, "auto", "always", "never"),
+		oneOf("copy_order", c.CopyOrder, "auto", "size", "name", "disk"),
+		oneOf("copy_unbuffered", c.CopyUnbuffered, "auto", "on", "off"),
+		oneOf("phone_copy_mode", c.PhoneCopyMode, "auto", "tar", "pull"),
+		oneOf("phone_pull_compress", c.PhonePullCompress, "auto", "off", "lz4", "zstd", "brotli"),
+	} {
+		if err != nil {
+			return err
+		}
+	}
+	if _, err := c.IndexPlanMaxAgeDuration(); err != nil {
+		return err
+	}
+	if c.PhoneTarStreams < 0 || c.PhoneTarStreams > 4 {
+		return fmt.Errorf("phone_tar_streams must be 1, 2, 3 or 4, not %d", c.PhoneTarStreams)
+	}
 	return nil
+}
+
+// quoteList renders ["a","b","c"] as `"a", "b" or "c"`.
+func quoteList(v []string) string {
+	q := make([]string, len(v))
+	for i, s := range v {
+		q[i] = `"` + s + `"`
+	}
+	if len(q) == 1 {
+		return q[0]
+	}
+	return strings.Join(q[:len(q)-1], ", ") + " or " + q[len(q)-1]
+}
+
+// IndexPlanMaxAgeDuration parses index_plan_max_age ("15m", "1h"; "" = 15m).
+func (c Config) IndexPlanMaxAgeDuration() (time.Duration, error) {
+	s := strings.TrimSpace(c.IndexPlanMaxAge)
+	if s == "" {
+		return 15 * time.Minute, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d < 0 {
+		return 0, fmt.Errorf("index_plan_max_age must be a time like \"15m\" or \"1h\", not %q", c.IndexPlanMaxAge)
+	}
+	return d, nil
 }
 
 func validLetter(s string) bool {
@@ -211,6 +310,23 @@ func validLetter(s string) bool {
 // normalize tidies values after validation.
 func (c *Config) normalize() {
 	c.Color = strings.ToLower(strings.TrimSpace(c.Color))
+	d := Defaults()
+	for _, f := range []struct {
+		v   *string
+		def string
+	}{
+		{&c.CopyPlanFromIndex, d.CopyPlanFromIndex}, {&c.CopyOrder, d.CopyOrder},
+		{&c.CopyUnbuffered, d.CopyUnbuffered}, {&c.PhoneCopyMode, d.PhoneCopyMode},
+		{&c.PhonePullCompress, d.PhonePullCompress},
+	} {
+		*f.v = strings.ToLower(strings.TrimSpace(*f.v))
+		if *f.v == "" {
+			*f.v = f.def
+		}
+	}
+	if c.PhoneTarStreams == 0 {
+		c.PhoneTarStreams = d.PhoneTarStreams
+	}
 	if strings.TrimSpace(c.PhoneRoot) == "" {
 		c.PhoneRoot = Defaults().PhoneRoot
 	}

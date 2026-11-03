@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // SetupSteps tells the owner how to get a phone ready. Shown whenever adb
@@ -70,6 +71,9 @@ type Runner interface {
 type ADB struct {
 	Path string // for display and diagnostics
 	run  Runner
+
+	capsMu sync.Mutex
+	caps   map[string]Caps // Probe results, by serial
 }
 
 // NewADB returns an ADB that runs the adb executable at path.

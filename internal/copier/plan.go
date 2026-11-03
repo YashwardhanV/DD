@@ -104,6 +104,10 @@ type Plan struct {
 	// Source names where the file list came from ("walk", "index",
 	// "usn+index", "phone-find", "phone-index"), so the owner can see it.
 	Source string
+	// MayBeStale is set when the plan came from a saved index: a planned
+	// file that no longer exists is then reported as "vanished" (deleted
+	// since the index was made), not as a failure.
+	MayBeStale bool
 }
 
 // Counts summarises the plan.
