@@ -21,7 +21,7 @@ Legend: `[x]` done and verified · `[~]` code complete and tested in the cloud c
 Legend: [x] done and verified - [~] code done, needs owner hardware - [ ] not started
 
 - [~] 13 Copy tracer + bench copy
-- [ ] 14 Phone USB link check
+- [~] 14 Phone USB link check
 - [ ] 15 Phone: plan from index + delta
 - [ ] 16 Phone: tar stream lane
 - [ ] 17 Local: plan from index + sweep
@@ -44,6 +44,8 @@ Legend: [x] done and verified - [~] code done, needs owner hardware - [ ] not st
 ### v2 stage notes
 - **Stage 13 (2026-11-03):** `internal/copier/trace` (Recorder, 13 phases, log2 per-file histogram, report, hints) and `internal/benchcopy` + `drivedex bench copy`. `drivedex copy` gained `--trace`, `--trace-file t.json` and `--v1`. Planning code finds the recorder through the `context.Context` (`trace.WithRecorder` / `trace.From`) so no planner signature changed; `copier.Run` takes it in `Options.Trace`. Every traced copy also saves `last-copy-trace.json` in the index folder (for `doctor`, stage 18d). **Overhead (container, 500 small files, 6 interleaved runs of 40 copies each):** a nil recorder costs ~2 ns per call (about 20 ns per file, about 0.01 % of a ~150 µs file); v1 build vs v2 build with the tracer off: medians 75.7 vs 77.6 ms/op with a ±10 % run-to-run spread - inside the noise; tracer ON: ~81 ns per phase call (about 0.5 %). Spec target "< 2 %": met by the per-call cost; end-to-end numbers on a container disk are too noisy to resolve 2 %.
 
+- **Stage 14 (2026-11-03):** `volume.USBLinkFor(root)` now finds the disk's device and calls the new `volume.USBLinkForDevice(instanceID)` (the hub-query part); `volume.USBLinkForPhone(serial)` lists the present USB devices (`CM_Get_Device_ID_List`, enumerator `USB`, present only), picks the one named `USB\VID_xxxx&PID_yyyy\<serial>` (`MatchPhoneInstance`: case-insensitive; interfaces `&MI_nn` never match; two devices with the same serial = no answer) and asks its hub. `volume.PhoneAdvice` = v1 `Advice` worded for phones, plus the phone-only line "this phone's port is USB 2.0: about 40 MB/s is the most any software can get". Shown in `drivedex drives` (new PHONE table with a CONNECTION column; a USB 2.0-only phone or a slow port gets ⚠ and an explanation), in `doctor` (Phone section), on the line printed before every phone copy, and as the tracer's `LinkMBps`. Unmatched serial or wireless adb: "USB speed: can't tell" (tested). `_other.go` stubs return `ErrUnsupported`.
+
 ### v2 decisions & deviations
 - Work is on the session branch `ccr-6afc9af6-jrhf4s` (the cloud session's designated branch) rather than a branch named `v2`; one commit per stage as specified.
 - Stage 13: `writeAtomic` (spec 5.3; Appendix B lists it under stage 18) was extracted into `internal/copier/write.go` already in stage 13, because instrumenting the per-file phases (create, preallocate, data, set-time, close, rename) is the same refactor; behaviour is v1's (all v1 copier tests unchanged and green).
@@ -52,6 +54,7 @@ Legend: [x] done and verified - [~] code done, needs owner hardware - [ ] not st
 - Stage 13: `bench copy` checks every run: the run's folder must hold exactly the source's file count and bytes, otherwise that run counts as failed (an engine that silently skips files can't "win"). It refuses to start if its `.drivedex-bench-<time>` folder already exists, so it never deletes a folder it didn't create; every delete goes through `benchcopy.SafeRemove`, which checks the path is inside that root (`TestSafeRemoveRefusesPathsOutsideTheRoot`). It needs free space for one copy of the source (each copy is deleted before the next).
 
 ### Owner to verify (v2)
+- **Stage 14:** `drivedex drives` with the phone (USB debugging on) in a USB 3 port, then in a USB 2 port - paste both. Also `drivedex doctor` (Phone section) once. If it says "USB speed: can't tell" for a phone plugged in by cable, tell me the phone model and paste `adb devices -l` and the phone's line from Device Manager → Properties → Details → "Device instance path".
 - **Stage 13:** (a) `drivedex copy <your slow case> D:\x --trace` - paste the whole report; this is the first real diagnosis of "slow in real use". (b) On the pen drive: `drivedex bench copy E:\SomeFolder D:\BenchTmp --rounds 3 --cold --markdown` (answer y; replug when asked) - paste the table and the Markdown row. (c) `drivedex bench copy phone:/DCIM/Camera D:\BenchTmp --markdown` - paste the rows. (d) Check the Explorer engine gives a plausible time (compare once with a stopwatch); if it says "time it by stopwatch", tell me.
 
 ## Current status

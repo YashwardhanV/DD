@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/yashwardhanv/dd/internal/volume"
 )
 
 var now = time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
@@ -253,5 +255,26 @@ func TestTipsAreInformationOnly(t *testing.T) {
 		if !strings.Contains(out, s) {
 			t.Errorf("tips missing %q:\n%s", s, out)
 		}
+	}
+}
+
+func TestPhoneUSBSpeed(t *testing.T) {
+	f := healthy()
+	usb2 := volume.USBLink{Speed: volume.SpeedHigh, Capable: volume.SpeedHigh}
+	slow := volume.USBLink{Speed: volume.SpeedHigh, Capable: volume.SpeedSuper, PortKnown: true}
+	f.ADB.Phones = []PhoneFacts{
+		{Serial: "A", Name: "Pixel 7", State: "device", USB: &usb2},
+		{Serial: "B", Name: "Galaxy S23", State: "device", USB: &slow},
+		{Serial: "C", Name: "Redmi", State: "device"},
+	}
+	r := Build(f)
+	if l := find(t, r, "Pixel 7 running at"); l.Level != Info || !strings.Contains(l.Text, "this phone's port is USB 2.0") {
+		t.Errorf("USB 2.0 phone: %+v", l)
+	}
+	if l := find(t, r, "Galaxy S23 can run at"); l.Level != Warn || !strings.Contains(l.Text, "USB 2.0 only") {
+		t.Errorf("slow port: %+v", l)
+	}
+	if l := find(t, r, "Redmi: USB speed: can't tell"); l.Level != Info {
+		t.Errorf("unknown: %+v", l)
 	}
 }

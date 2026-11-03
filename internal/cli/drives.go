@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/yashwardhanv/dd/internal/index"
+	"github.com/yashwardhanv/dd/internal/phone"
 	"github.com/yashwardhanv/dd/internal/ui"
 	"github.com/yashwardhanv/dd/internal/volume"
 )
@@ -104,6 +106,8 @@ func runDrives(out io.Writer) error {
 		}
 	}
 
+	printPhonesTable(out, byID, now)
+
 	devs, err := listDevices()
 	if err != nil || len(devs) == 0 {
 		return nil // nothing connected (or not Windows): say nothing
@@ -119,4 +123,59 @@ func runDrives(out io.Writer) error {
 		fmt.Fprintf(tw, "%s\t%s\t%s\n", d.Arg(), d.Label(), indexed)
 	}
 	return tw.Flush()
+}
+
+// connectedPhones lists the phones adb sees (within phoneCheckTimeout), or
+// nothing when adb isn't installed. A variable so tests never start a real adb.
+var connectedPhones = func() []phone.Device {
+	adb, err := openADB()
+	if err != nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), phoneCheckTimeout)
+	defer cancel()
+	devs, err := adb.Devices(ctx)
+	if err != nil {
+		return nil
+	}
+	return devs
+}
+
+// printPhonesTable lists phones connected over USB debugging with their USB
+// speed (stage 14: a phone with a USB 2.0 port can't go faster than ~40 MB/s).
+func printPhonesTable(out io.Writer, byID map[string]index.Info, now time.Time) {
+	phones := connectedPhones()
+	if len(phones) == 0 {
+		return
+	}
+	fmt.Fprintln(out)
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "PHONE\tNAME\tCONNECTION\tINDEXED?")
+	type note struct{ name, text, tip string }
+	var notes []note
+	for _, d := range phones {
+		conn := "USB speed: can't tell"
+		if !d.Usable() {
+			conn = d.State
+		} else if l, ok := phoneLinkOf(d.Serial); ok {
+			conn = l.Speed.String()
+			if l.Judge().Slow() || l.Capable == volume.SpeedHigh {
+				conn += " ⚠"
+				text, tip := volume.PhoneAdvice(l, portSummary())
+				notes = append(notes, note{d.Name(), text, tip})
+			}
+		}
+		indexed := "no"
+		if in, ok := byID[phone.SourceID(d.Serial)]; ok {
+			indexed = indexedSummary(in.Header, now)
+		}
+		fmt.Fprintf(tw, "phone:%s\t%s\t%s\t%s\n", d.Serial, d.Name(), conn, indexed)
+	}
+	tw.Flush()
+	for _, n := range notes {
+		fmt.Fprintln(out, ui.Yellow("⚠ "+n.name+": "+n.text))
+		if n.tip != "" {
+			fmt.Fprintln(out, ui.Dim("    → "+n.tip))
+		}
+	}
 }

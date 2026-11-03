@@ -12,3 +12,9 @@ func USBLinkFor(root string) (USBLink, error) { return USBLink{}, errors.ErrUnsu
 
 // USBPorts is only implemented on Windows.
 func USBPorts() ([]PortInfo, error) { return nil, errors.ErrUnsupported }
+
+// USBLinkForDevice is only available on Windows.
+func USBLinkForDevice(instanceID string) (USBLink, error) { return USBLink{}, errors.ErrUnsupported }
+
+// USBLinkForPhone is only available on Windows.
+func USBLinkForPhone(serial string) (USBLink, error) { return USBLink{}, errors.ErrUnsupported }

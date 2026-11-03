@@ -141,6 +141,9 @@ type PhoneFacts struct {
 	Serial string
 	Name   string
 	State  string // "device", "unauthorized", "offline", ...
+	// USB is the phone's USB link; nil when Windows can't tell (wireless
+	// adb, a serial that matches no USB device, not Windows).
+	USB *volume.USBLink
 }
 
 // ADBFacts is what is known about adb.
@@ -285,6 +288,7 @@ func phoneSection(f Facts) Section {
 		switch p.State {
 		case "device":
 			add(OK, fmt.Sprintf("%s is connected and authorized", name), "")
+			phoneLinkLine(add, name, p.USB, f.Ports)
 		case "unauthorized":
 			add(Fail, fmt.Sprintf("%s is waiting for permission", name), "unlock the phone and tap \"Allow\" on the \"Allow USB debugging?\" prompt (tick \"Always allow\")")
 		case "offline":
@@ -294,6 +298,23 @@ func phoneSection(f Facts) Section {
 		}
 	}
 	return s
+}
+
+// phoneLinkLine reports a phone's USB speed (BUILD-V2 stage 14).
+func phoneLinkLine(add func(Level, string, string), name string, l *volume.USBLink, ports volume.PortSummary) {
+	if l == nil || l.Speed == volume.SpeedUnknown {
+		add(Info, name+": USB speed: can't tell", "")
+		return
+	}
+	text, tip := volume.PhoneAdvice(*l, ports)
+	switch {
+	case l.Judge().Slow():
+		add(Warn, name+" "+text, tip)
+	case l.Capable == volume.SpeedHigh:
+		add(Info, name+" "+text, tip)
+	default:
+		add(OK, name+" "+text, tip)
+	}
 }
 
 func drivesSections(f Facts) []Section {

@@ -133,7 +133,8 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 
 	// --- plan -----------------------------------------------------------------
 	var plan *copier.Plan
-	srcRoot := "" // the local source, for the USB speed check ("" for a phone)
+	srcRoot := ""    // the local source, for the USB speed check ("" for a phone)
+	phoneLink := 0.0 // the phone's USB link in MB/s (0 = unknown)
 	spec, isPhone, err := parsePhoneSource(srcArg)
 	if err != nil {
 		return err
@@ -158,6 +159,7 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 			why = autoWhy(workers)
 		}
 		remote := copier.PhonePathRoot(spec.path, activePhoneRoot())
+		phoneLink = printPhoneLink(out, dev.Name(), dev.Serial)
 		status.Update("Reading the file list from " + dev.Name() + " …")
 		plan, err = copier.PlanPhone(ctx, adb, dev.Serial, remote, dst, f.onConflict, max(workers, 4))
 		status.Clear()
@@ -194,7 +196,7 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 
 	return finishPlan(ctx, out, status, plan, planRun{
 		workers: workers, why: why, verify: f.verify, dryRun: f.dryRun, dstArg: dstArg, srcRoot: srcRoot,
-		trace: rec, showTrace: f.trace, traceFile: f.traceFile, began: began,
+		trace: rec, showTrace: f.trace, traceFile: f.traceFile, began: began, phoneLinkMBps: phoneLink,
 	})
 }
 
@@ -211,6 +213,8 @@ type planRun struct {
 	showTrace bool            // print the report
 	traceFile string          // write the report as JSON here
 	began     time.Time       // when the command started (planning is part of the copy's time)
+
+	phoneLinkMBps float64 // a phone source's USB link speed (0 = unknown)
 }
 
 // finishPlan checks, announces, (dry-)runs and reports one copy plan. Both

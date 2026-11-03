@@ -16,11 +16,49 @@ import (
 	"github.com/yashwardhanv/dd/internal/volume"
 )
 
-// Variables so tests can plug in a pretend USB drive.
+// Variables so tests can plug in a pretend USB drive or phone.
 var (
-	usbLinkFor  = volume.USBLinkFor
-	usbPortsFor = volume.USBPorts
+	usbLinkFor   = volume.USBLinkFor
+	usbPortsFor  = volume.USBPorts
+	phoneUSBLink = volume.USBLinkForPhone
 )
+
+// phoneLinkOf returns how the phone with the given adb serial is connected.
+// ok is false when Windows can't tell (wireless adb, unmatched serial, not
+// Windows) - then the speed is shown as "can't tell", never guessed.
+func phoneLinkOf(serial string) (volume.USBLink, bool) {
+	l, err := phoneUSBLink(serial)
+	if err != nil || l.Speed == volume.SpeedUnknown {
+		return volume.USBLink{}, false
+	}
+	return l, true
+}
+
+// printPhoneLink prints the one line shown before a phone copy:
+// "Phone connected at USB 2.0 · 480 Mbps - max ≈ 40 MB/s", plus advice when
+// the phone runs slower than it could or is USB 2.0 itself.
+func printPhoneLink(out io.Writer, name, serial string) (mbps float64) {
+	l, ok := phoneLinkOf(serial)
+	if !ok {
+		fmt.Fprintln(out, ui.Dim(name+": USB speed: can't tell"))
+		return 0
+	}
+	line := name + " connected at " + volume.LinkSummary(l)
+	text, tip := volume.PhoneAdvice(l, volume.PortSummary{})
+	switch {
+	case l.Judge().Slow():
+		text, tip = volume.PhoneAdvice(l, portSummary())
+		fmt.Fprintln(out, ui.Yellow("⚠ "+line+": "+text))
+	case l.Capable == volume.SpeedHigh:
+		fmt.Fprintln(out, ui.Dim(line+" ("+text+")"))
+	default:
+		fmt.Fprintln(out, ui.Dim(line))
+	}
+	if tip != "" {
+		fmt.Fprintln(out, ui.Dim("  → "+tip))
+	}
+	return l.Speed.MaxMBps()
+}
 
 // portSummary asks Windows about the PC's USB sockets.
 func portSummary() volume.PortSummary {

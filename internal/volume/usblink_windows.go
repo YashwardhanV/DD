@@ -31,6 +31,8 @@ var (
 	procCMGetDeviceIDW            = cfgmgr32.NewProc("CM_Get_Device_IDW")
 	procCMGetDevNodeRegPropertyW  = cfgmgr32.NewProc("CM_Get_DevNode_Registry_PropertyW")
 	procCMGetDeviceInterfacePropW = cfgmgr32.NewProc("CM_Get_Device_Interface_PropertyW")
+	procCMGetDeviceIDListSizeW    = cfgmgr32.NewProc("CM_Get_Device_ID_List_SizeW")
+	procCMGetDeviceIDListW        = cfgmgr32.NewProc("CM_Get_Device_ID_ListW")
 )
 
 const (
@@ -43,11 +45,15 @@ const (
 
 	ioctlStorageGetDeviceNumber = 0x002D1080
 
-	cmCrSuccess    = 0
-	cmLocateNormal = 0
-	cmDrpAddress   = 0x1D // CM_DRP_ADDRESS: for a USB device, its port number on the parent hub
-	maxInstanceID  = 200
-	maxHubLevels   = 12 // a USB tree is at most 7 tiers deep; disk/adapter nodes add a few
+	cmCrSuccess     = 0
+	cmCrBufferSmall = 0x1A // CR_BUFFER_SMALL
+	cmLocateNormal  = 0
+
+	cmGetIDListFilterEnumerator = 0x00000001
+	cmGetIDListFilterPresent    = 0x00000100
+	cmDrpAddress                = 0x1D // CM_DRP_ADDRESS: for a USB device, its port number on the parent hub
+	maxInstanceID               = 200
+	maxHubLevels                = 12 // a USB tree is at most 7 tiers deep; disk/adapter nodes add a few
 )
 
 var (
@@ -78,9 +84,17 @@ func USBLinkFor(root string) (USBLink, error) {
 	if err != nil {
 		return USBLink{}, err
 	}
-	node, ok := cmLocate(inst)
+	return USBLinkForDevice(inst)
+}
+
+// USBLinkForDevice reports the USB link of the device with the given
+// instance ID (a disk, or a phone found by USBLinkForPhone): it walks up the
+// device tree to the first USB hub and asks that hub about the port the
+// device (or its USB parent) is plugged into.
+func USBLinkForDevice(instanceID string) (USBLink, error) {
+	node, ok := cmLocate(instanceID)
 	if !ok {
-		return USBLink{}, fmt.Errorf("Windows has no device %s", inst)
+		return USBLink{}, fmt.Errorf("Windows has no device %s", instanceID)
 	}
 	for level := 0; level < maxHubLevels; level++ {
 		parent, ok := cmParent(node)
@@ -94,7 +108,7 @@ func USBLinkFor(root string) (USBLink, error) {
 		if hub := hubInterface(parentID); hub != "" {
 			port, ok := cmDWORD(node, cmDrpAddress)
 			if !ok || port == 0 {
-				return USBLink{}, fmt.Errorf("couldn't find which port of %s the drive is in", parentID)
+				return USBLink{}, fmt.Errorf("couldn't find which port of %s the device is in", parentID)
 			}
 			link, err := linkOnPort(hub, int(port))
 			link.ViaHub = !IsRootHub(parentID)
@@ -103,6 +117,56 @@ func USBLinkFor(root string) (USBLink, error) {
 		node = parent
 	}
 	return USBLink{}, ErrNotUSB
+}
+
+// USBLinkForPhone finds the phone with the given adb serial among the
+// present USB devices (see MatchPhoneInstance) and reports its USB link.
+func USBLinkForPhone(serial string) (USBLink, error) {
+	ids, err := presentUSBDevices()
+	if err != nil {
+		return USBLink{}, err
+	}
+	inst, ok := MatchPhoneInstance(ids, serial)
+	if !ok {
+		return USBLink{}, ErrPhoneNotMatched
+	}
+	return USBLinkForDevice(inst)
+}
+
+// presentUSBDevices lists the instance IDs of every USB device that is
+// plugged in now (CM_Get_Device_ID_List with the "USB" enumerator).
+func presentUSBDevices() ([]string, error) {
+	filter, _ := windows.UTF16PtrFromString("USB")
+	const flags = cmGetIDListFilterEnumerator | cmGetIDListFilterPresent
+	for attempt := 0; attempt < 3; attempt++ { // the list can grow between the two calls
+		var n uint32
+		r, _, _ := procCMGetDeviceIDListSizeW.Call(uintptr(unsafe.Pointer(&n)), uintptr(unsafe.Pointer(filter)), flags)
+		if r != cmCrSuccess {
+			return nil, fmt.Errorf("listing USB devices: CONFIGRET %d", r)
+		}
+		buf := make([]uint16, n+1)
+		r, _, _ = procCMGetDeviceIDListW.Call(uintptr(unsafe.Pointer(filter)), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), flags)
+		if r == cmCrBufferSmall {
+			continue
+		}
+		if r != cmCrSuccess {
+			return nil, fmt.Errorf("listing USB devices: CONFIGRET %d", r)
+		}
+		var ids []string
+		for start := 0; start < len(buf); {
+			end := start
+			for end < len(buf) && buf[end] != 0 {
+				end++
+			}
+			if end == start {
+				break
+			}
+			ids = append(ids, windows.UTF16ToString(buf[start:end]))
+			start = end + 1
+		}
+		return ids, nil
+	}
+	return nil, errors.New("listing USB devices: the list kept changing")
 }
 
 // linkOnPort asks a hub about the device on one of its ports.

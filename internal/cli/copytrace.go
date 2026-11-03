@@ -49,6 +49,9 @@ func traceContext(plan *copier.Plan, o planRun, workers int) trace.Context {
 		c.SrcKind = driveKind(o.srcRoot)
 	}
 	c.LinkMBps = linkMBps(o.srcRoot, plan.DstRoot)
+	if plan.Phone != nil && o.phoneLinkMBps > 0 && (c.LinkMBps == 0 || o.phoneLinkMBps < c.LinkMBps) {
+		c.LinkMBps = o.phoneLinkMBps
+	}
 	return c
 }
 

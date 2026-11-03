@@ -270,7 +270,13 @@ func collectADB(ctx context.Context) doctor.ADBFacts {
 		return a
 	}
 	for _, d := range devs {
-		a.Phones = append(a.Phones, doctor.PhoneFacts{Serial: d.Serial, Name: d.Name(), State: d.State})
+		pf := doctor.PhoneFacts{Serial: d.Serial, Name: d.Name(), State: d.State}
+		if d.Usable() {
+			if l, ok := phoneLinkOf(d.Serial); ok {
+				pf.USB = &l
+			}
+		}
+		a.Phones = append(a.Phones, pf)
 	}
 	return a
 }
