@@ -79,6 +79,10 @@ type Options struct {
 	// Fast turns on the local fast paths of BUILD-V2 stage 18 (zero = v1).
 	Fast FastPaths
 
+	// Tune, when set, lets the number of workers adjust itself during a
+	// local copy (stage 19), between Min and Max, starting at Workers.
+	Tune *TuneOptions
+
 	journal *resumeJournal // set by Run (18e)
 	direct  bool           // small files go straight to their real names
 }
@@ -347,21 +351,52 @@ func runLocal(ctx context.Context, p *Plan, opt Options, st *state) {
 	}
 	inflight := newInflight()
 
+	// The autotuner (stage 19): small-file workers take a slot from a
+	// resizable limit before each file; the tuner moves the limit. The big
+	// lanes are not tuned. Without it every worker always runs (v1).
+	smallWorkers := workers - bigLanes
+	var limit *Limit
+	if t := opt.Tune; t != nil {
+		smallWorkers = max(t.Max-bigLanes, 1)
+		limit = NewLimit(workers - bigLanes)
+		tctx, stopTuner := context.WithCancel(ctx)
+		defer stopTuner()
+		tuner := &Tuner{Min: max(t.Min, 1), Max: max(t.Max-bigLanes, 1), Start: workers - bigLanes, Window: t.Window}
+		go tuner.Run(tctx, limit, func() (int64, int64) { return st.written.Load(), st.bytesDone.Load() }, opt.Trace.Note)
+	}
+
 	smallQ := make(chan *Item)
 	bigQ := make(chan *Item)
 	var wg sync.WaitGroup
+	process := func(it *Item, buf []byte) {
+		if it.late {
+			copyLate(ctx, p, it, buf, opt, st)
+		} else {
+			copyWithRetries(ctx, p, it, buf, opt, st)
+		}
+		inflight.finish(it)
+	}
 	work := func(queues ...chan *Item) {
 		defer wg.Done()
 		bufp := bufPool.Get().(*[]byte)
 		defer bufPool.Put(bufp)
 		for _, q := range queues {
-			for it := range q {
-				if it.late {
-					copyLate(ctx, p, it, *bufp, opt, st)
-				} else {
-					copyWithRetries(ctx, p, it, *bufp, opt, st)
+			tuned := limit != nil && q == smallQ
+			for {
+				if tuned && limit.Acquire(ctx) != nil {
+					return // cancelled
 				}
-				inflight.finish(it)
+				it, ok := <-q
+				if !ok {
+					if tuned {
+						limit.Release()
+					}
+					break
+				}
+				process(it, *bufp)
+				if tuned {
+					limit.Release()
+				}
 			}
 		}
 	}
@@ -370,7 +405,7 @@ func runLocal(ctx context.Context, p *Plan, opt Options, st *state) {
 		wg.Add(1)
 		go work(bigQ, smallQ)
 	}
-	for w := 0; w < workers-bigLanes; w++ {
+	for w := 0; w < smallWorkers; w++ {
 		wg.Add(1)
 		go work(smallQ)
 	}

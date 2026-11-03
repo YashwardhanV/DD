@@ -81,3 +81,23 @@ func TestCopyFastPathFlags(t *testing.T) {
 		t.Error("--unbuffered sometimes must be refused")
 	}
 }
+
+func TestCopyAutotuneOnlyForAutomaticWorkerCounts(t *testing.T) {
+	tree, _ := withFixture(t)
+	fakeDriveType(t, false, true)
+	out, err := run(t, "copy", tree, filepath.Join(t.TempDir(), "a"))
+	if err != nil || !strings.Contains(out, "(8 workers: both ends are flash/SSD) - adjusts itself between 1 and 16 while copying") {
+		t.Errorf("auto: %v\n%s", err, out)
+	}
+	for _, args := range [][]string{{"--workers", "8"}, {"--v1"}} {
+		out, _ := run(t, append([]string{"copy", tree, filepath.Join(t.TempDir(), "b")}, args...)...)
+		if strings.Contains(out, "adjusts itself") {
+			t.Errorf("%v must not autotune:\n%s", args, out)
+		}
+	}
+	fakeDriveType(t, true, true) // a hard disk: at most 4
+	out, _ = run(t, "copy", tree, filepath.Join(t.TempDir(), "c"))
+	if !strings.Contains(out, "adjusts itself between 1 and 4") {
+		t.Errorf("hard disk bounds:\n%s", out)
+	}
+}

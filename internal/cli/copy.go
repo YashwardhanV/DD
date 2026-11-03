@@ -218,6 +218,7 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 	srcRoot := ""                    // the local source, for the USB speed check ("" for a phone)
 	phoneLink := 0.0                 // the phone's USB link in MB/s (0 = unknown)
 	var afterRun func(copier.Result) // e.g. refresh the phone index from what the plan learned
+	var tune *copier.TuneOptions     // stage 19 autotuner (nil = fixed worker count)
 	spec, isPhone, err := parsePhoneSource(srcArg)
 	if err != nil {
 		return err
@@ -277,6 +278,11 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 			dstPenalty, dstKnown := seekPenaltyFor(dst)
 			workers = copier.AutoWorkers(srcPenalty, srcKnown, dstPenalty, dstKnown)
 			why = autoWhy(workers)
+			// Stage 19: the count then adjusts itself while copying.
+			if activeConfig.CopyAutotune && !f.v1 {
+				minW, maxW := copier.TuneBounds((srcKnown && srcPenalty) || (dstKnown && dstPenalty))
+				tune = &copier.TuneOptions{Min: minW, Max: maxW}
+			}
 		}
 		status.Update("Reading the file list from " + src + " …")
 		localMode := planMode
@@ -309,6 +315,7 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 		workers: workers, why: why, verify: f.verify, dryRun: f.dryRun, dstArg: dstArg, srcRoot: srcRoot,
 		trace: rec, showTrace: f.trace, traceFile: f.traceFile, began: began, phoneLinkMBps: phoneLink,
 		afterRun: afterRun, phoneMode: phoneMode, tarStreams: tarStreams, pullCompress: pullCompress, fast: fast,
+		tune: tune,
 	})
 }
 
@@ -334,6 +341,7 @@ type planRun struct {
 	tarStreams   int
 	pullCompress string
 	fast         copier.FastPaths
+	tune         *copier.TuneOptions
 }
 
 // finishPlan checks, announces, (dry-)runs and reports one copy plan. Both
@@ -362,7 +370,11 @@ func finishPlan(ctx context.Context, out *bufio.Writer, status *ui.StatusLine, p
 			ui.Thousands(counts.Copy+counts.Overwrite), ui.HumanSize(counts.WriteBytes), workers)
 	}
 	if !f.dryRun {
-		fmt.Fprintln(out, ui.Dim(fmt.Sprintf("(%d workers: %s)", workers, why)))
+		line := fmt.Sprintf("(%d workers: %s)", workers, why)
+		if o.tune != nil {
+			line += fmt.Sprintf(" - adjusts itself between %d and %d while copying", o.tune.Min, o.tune.Max)
+		}
+		fmt.Fprintln(out, ui.Dim(line))
 	}
 	// A USB 3 drive stuck at USB 2.0 speed is worth knowing BEFORE a long copy.
 	anyUSB := warnSlowUSB(out, []string{o.srcRoot, dst}, counts.WriteBytes)
@@ -392,6 +404,7 @@ func finishPlan(ctx context.Context, out *bufio.Writer, status *ui.StatusLine, p
 		PullCompress: o.pullCompress,
 		LateChecks:   copyChecks(),
 		Fast:         o.fast,
+		Tune:         o.tune,
 		Progress: func(p ui.CopyProgress) {
 			status.Update(ui.FormatCopyProgress(p))
 		},

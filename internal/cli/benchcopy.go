@@ -54,6 +54,7 @@ type benchFlags struct {
 	markdown bool
 	yes      bool
 	set      string
+	v2Flags  string
 }
 
 func newBenchCopyCmd() *cobra.Command {
@@ -92,6 +93,7 @@ rights. Without it the results are labelled "warm cache".`,
 	cmd.Flags().BoolVar(&f.markdown, "markdown", false, "also print a row ready to paste into docs/BENCHMARKS.md")
 	cmd.Flags().BoolVar(&f.yes, "yes", false, "don't ask before writing to the destination")
 	cmd.Flags().StringVar(&f.set, "set", "", `test set name for the Markdown row, e.g. "A" (5,000+ files under 1 MB)`)
+	cmd.Flags().StringVar(&f.v2Flags, "v2-flags", "", `extra 'drivedex copy' flags for the drivedex engine only, to measure one switch, e.g. "--experimental-direct" or "--unbuffered on"`)
 	return cmd
 }
 
@@ -128,7 +130,7 @@ func runBenchCopy(ctx context.Context, in io.Reader, stdout io.Writer, srcArg, d
 	}
 
 	exe, _ := benchExe()
-	engines, err := benchEngines(src, exe, f.engines)
+	engines, err := benchEngines(src, exe, f.engines, strings.Fields(f.v2Flags))
 	if err != nil {
 		return err
 	}
@@ -275,7 +277,7 @@ func benchSrcArg(s benchSource) string {
 }
 
 // benchEngines builds the engine list (all that apply, or the --engines list).
-func benchEngines(src benchSource, exe, list string) ([]benchcopy.Engine, error) {
+func benchEngines(src benchSource, exe, list string, v2Flags []string) ([]benchcopy.Engine, error) {
 	var all []benchcopy.Engine
 	if src.local != "" {
 		all = []benchcopy.Engine{
@@ -283,14 +285,14 @@ func benchEngines(src benchSource, exe, list string) ([]benchcopy.Engine, error)
 			benchcopy.Robocopy{Run: benchRunner},
 			benchcopy.Robocopy{Run: benchRunner, Threads: 16},
 			benchcopy.DriveDex{Run: benchRunner, Exe: exe, V1: true},
-			benchcopy.DriveDex{Run: benchRunner, Exe: exe},
+			benchcopy.DriveDex{Run: benchRunner, Exe: exe, Extra: v2Flags},
 		}
 	} else {
 		// The drivedex engines get the phone path in phone:<serial>:<path> form.
 		all = []benchcopy.Engine{
 			benchcopy.ADBPull{Run: benchRunner, ADB: src.adbPath, Serial: src.serial},
 			phoneEngine{benchcopy.DriveDex{Run: benchRunner, Exe: exe, V1: true}, src.serial},
-			phoneEngine{benchcopy.DriveDex{Run: benchRunner, Exe: exe}, src.serial},
+			phoneEngine{benchcopy.DriveDex{Run: benchRunner, Exe: exe, Extra: v2Flags}, src.serial},
 		}
 	}
 	if strings.TrimSpace(list) == "" {
