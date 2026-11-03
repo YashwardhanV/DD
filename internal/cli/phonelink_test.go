@@ -116,3 +116,27 @@ func TestCopyFromPhonePlansFromTheIndex(t *testing.T) {
 		t.Error("--plan sideways must be refused")
 	}
 }
+
+func TestCopyFromPhoneUsesTheTarStream(t *testing.T) {
+	t.Setenv("DRIVEDEX_INDEX_DIR", t.TempDir())
+	fs := phonetest.NewFS()
+	for i := 0; i < 150; i++ {
+		fs.Add("/sdcard/WhatsApp/Media/IMG-"+strings.Repeat("0", 3)+string(rune('A'+i%26))+string(rune('a'+i/26))+".jpg", "media", 1_700_000_000)
+	}
+	useFS(t, fs)
+	fakeDriveType(t, false, true)
+	out, err := run(t, "copy", "phone:/WhatsApp/Media", filepath.Join(t.TempDir(), "d"), "--trace")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if !strings.Contains(out, "Copied 150 files") || !strings.Contains(out, "Phone files came by tar stream") || len(fs.TarCalls()) != 1 || fs.PullCount() != 0 {
+		t.Errorf("tar streams %d, pulls %d:\n%s", len(fs.TarCalls()), fs.PullCount(), out)
+	}
+	if _, err := run(t, "copy", "phone:/WhatsApp/Media", t.TempDir(), "--phone-mode", "fax"); err == nil {
+		t.Error("--phone-mode fax must be refused")
+	}
+	out, _ = run(t, "copy", "phone:/WhatsApp/Media", filepath.Join(t.TempDir(), "e"), "--v1")
+	if !strings.Contains(out, "Phone files came by adb pull.") {
+		t.Errorf("--v1 must use adb pull:\n%s", out)
+	}
+}

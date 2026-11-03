@@ -18,6 +18,8 @@ type Fake struct {
 	// It returns what adb would print on stdout and, optionally, an error
 	// such as &phone.ExitError{Code: 1}.
 	Handler func(ctx context.Context, args []string) (stdout string, err error)
+	// Wrap, if set, wraps the stdout of every Stream (to watch or cut it).
+	Wrap func(args []string, r io.Reader) io.Reader
 
 	mu    sync.Mutex
 	calls [][]string
@@ -51,7 +53,11 @@ func (f *Fake) Output(ctx context.Context, args ...string) ([]byte, error) {
 func (f *Fake) Stream(ctx context.Context, args ...string) (io.ReadCloser, func() error, error) {
 	f.record(args)
 	out, err := f.Handler(ctx, args)
-	return io.NopCloser(strings.NewReader(out)), func() error { return err }, nil
+	var r io.Reader = strings.NewReader(out)
+	if f.Wrap != nil {
+		r = f.Wrap(args, r)
+	}
+	return io.NopCloser(r), func() error { return err }, nil
 }
 
 // New returns an *phone.ADB backed by the handler.

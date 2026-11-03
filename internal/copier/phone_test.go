@@ -90,7 +90,7 @@ func TestPhoneCopyEndToEnd(t *testing.T) {
 	fp.Add("/sdcard/DCIM/Camera/Sub Folder/clip.mp4", "VIDEO", 1_700_000_500)
 	dst := t.TempDir()
 
-	r := mustRun(t, phonePlan(t, fp, "/sdcard/DCIM/Camera", dst, ""), fastOpts(1))
+	r := mustRun(t, phonePlan(t, fp, "/sdcard/DCIM/Camera", dst, ""), pullOpts(1))
 	if r.Written != 31 || r.Failed != 0 || r.Cancelled {
 		t.Fatalf("result = %+v", r)
 	}
@@ -122,7 +122,7 @@ func TestPhoneCopyEndToEnd(t *testing.T) {
 func TestPhonePullsAreBatchedAtMost100Files(t *testing.T) {
 	fp := phonetest.NewFS()
 	sampleCamera(fp, 250)
-	mustRun(t, phonePlan(t, fp, "/sdcard/DCIM/Camera", t.TempDir(), ""), fastOpts(1))
+	mustRun(t, phonePlan(t, fp, "/sdcard/DCIM/Camera", t.TempDir(), ""), pullOpts(1))
 	if fp.PullCount() != 3 {
 		t.Errorf("250 files should need 3 pulls (100+100+50), got %d", fp.PullCount())
 	}
@@ -139,7 +139,7 @@ func TestPhonePullsRespectTheCommandLineLength(t *testing.T) {
 	for i := 0; i < 120; i++ {
 		fp.Add(fmt.Sprintf("/sdcard/Long/%s%03d.bin", long, i), "d", 1)
 	}
-	mustRun(t, phonePlan(t, fp, "/sdcard/Long", t.TempDir(), ""), fastOpts(1))
+	mustRun(t, phonePlan(t, fp, "/sdcard/Long", t.TempDir(), ""), pullOpts(1))
 	if fp.PullCount() < 2 {
 		t.Errorf("120 files with 260-char paths must be split by length, got %d pull(s)", fp.PullCount())
 	}
@@ -158,7 +158,7 @@ func TestPhoneCopyResumes(t *testing.T) {
 	fp := phonetest.NewFS()
 	sampleCamera(fp, 40)
 	dst := t.TempDir()
-	mustRun(t, phonePlan(t, fp, "/sdcard/DCIM/Camera", dst, ""), fastOpts(1))
+	mustRun(t, phonePlan(t, fp, "/sdcard/DCIM/Camera", dst, ""), pullOpts(1))
 	pulls := fp.PullCount()
 
 	// Nothing changed: the plan skips everything and nothing is pulled.
@@ -166,14 +166,14 @@ func TestPhoneCopyResumes(t *testing.T) {
 	if c := p.Counts(); c.Skipped != 40 || c.Copy != 0 {
 		t.Fatalf("counts = %+v", c)
 	}
-	r := mustRun(t, p, fastOpts(1))
+	r := mustRun(t, p, pullOpts(1))
 	if r.Written != 0 || r.Skipped != 40 || fp.PullCount() != pulls {
 		t.Errorf("result = %+v, pulls %d -> %d", r, pulls, fp.PullCount())
 	}
 
 	// A file vanished locally (e.g. an interrupted earlier run): only it is pulled.
 	os.Remove(filepath.Join(dst, "Camera", "IMG_0013.jpg"))
-	r = mustRun(t, phonePlan(t, fp, "/sdcard/DCIM/Camera", dst, ""), fastOpts(1))
+	r = mustRun(t, phonePlan(t, fp, "/sdcard/DCIM/Camera", dst, ""), pullOpts(1))
 	if r.Written != 1 || fp.PullCount() != pulls+1 || len(fp.PullCalls()[fp.PullCount()-1]) != 1 {
 		t.Errorf("result = %+v, last pull = %q", r, fp.PullCalls()[fp.PullCount()-1])
 	}
@@ -186,7 +186,7 @@ func TestPhoneBatchWithOneBadFileRetriesThatFileAlone(t *testing.T) {
 	fp.Unreadable[bad] = true
 	dst := t.TempDir()
 
-	r := mustRun(t, phonePlan(t, fp, "/sdcard/DCIM/Camera", dst, ""), fastOpts(1))
+	r := mustRun(t, phonePlan(t, fp, "/sdcard/DCIM/Camera", dst, ""), pullOpts(1))
 	if r.Written != 9 || r.Failed != 1 || len(r.Failures) != 1 {
 		t.Fatalf("result = %+v", r)
 	}
@@ -208,7 +208,7 @@ func TestPhoneFileThatWorksOnRetry(t *testing.T) {
 	sampleCamera(fp, 5)
 	fp.FailTimes["/sdcard/DCIM/Camera/IMG_0002.jpg"] = 1 // fails inside the batch, fine on retry
 	dst := t.TempDir()
-	r := mustRun(t, phonePlan(t, fp, "/sdcard/DCIM/Camera", dst, ""), fastOpts(1))
+	r := mustRun(t, phonePlan(t, fp, "/sdcard/DCIM/Camera", dst, ""), pullOpts(1))
 	if r.Written != 5 || r.Failed != 0 {
 		t.Errorf("result = %+v", r)
 	}
@@ -224,7 +224,7 @@ func TestPhoneInterruptedPullLeavesNothingUnderRealNames(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	fp.OnPull = func(context.Context) { cancel() } // the user presses Ctrl+C mid-pull
-	r, err := Run(ctx, phonePlan(t, fp, "/sdcard/DCIM/Camera", dst, ""), fastOpts(1))
+	r, err := Run(ctx, phonePlan(t, fp, "/sdcard/DCIM/Camera", dst, ""), pullOpts(1))
 	if err != nil || !r.Cancelled || r.Failed != 0 {
 		t.Fatalf("result = %+v err = %v", r, err)
 	}
@@ -239,7 +239,7 @@ func TestPhoneInterruptedPullLeavesNothingUnderRealNames(t *testing.T) {
 	os.MkdirAll(stale, 0o755)
 	os.WriteFile(filepath.Join(stale, "half.jpg"), []byte("partial"), 0o644)
 	fp.OnPull = nil
-	r = mustRun(t, phonePlan(t, fp, "/sdcard/DCIM/Camera", dst, ""), fastOpts(1))
+	r = mustRun(t, phonePlan(t, fp, "/sdcard/DCIM/Camera", dst, ""), pullOpts(1))
 	if r.Written != 20 {
 		t.Errorf("rerun result = %+v", r)
 	}
@@ -257,7 +257,7 @@ func TestPhoneUsesAtMostTwoParallelPulls(t *testing.T) {
 		}
 	}
 	fp.OnPull = func(context.Context) { time.Sleep(20 * time.Millisecond) }
-	opt := fastOpts(16) // asking for 16 workers changes nothing for phones
+	opt := pullOpts(16) // asking for 16 workers changes nothing for phones
 	mustRun(t, phonePlan(t, fp, "/sdcard/Many", t.TempDir(), ""), opt)
 	if peak := fp.PeakPulls(); peak != 2 {
 		t.Errorf("peak parallel pulls = %d, want exactly 2", peak)
@@ -280,7 +280,7 @@ func TestPhoneConflictPolicyAppliesToLocalFiles(t *testing.T) {
 		t.Errorf("decision = %v: a newer local file must be kept", p.Items[0].Decision)
 	}
 	p = phonePlan(t, fp, "/sdcard/Docs", dst, "overwrite")
-	mustRun(t, p, fastOpts(1))
+	mustRun(t, p, pullOpts(1))
 	if got, _ := os.ReadFile(local); string(got) != "PHONE VERSION" {
 		t.Errorf("overwrite policy: %q", got)
 	}
@@ -292,8 +292,16 @@ func TestPhoneDestinationFolderBlockingAFileIsAFailure(t *testing.T) {
 	fp.Add("/sdcard/D/y.txt", "2", 1)
 	dst := t.TempDir()
 	os.MkdirAll(filepath.Join(dst, "D", "x.txt"), 0o755)
-	r := mustRun(t, phonePlan(t, fp, "/sdcard/D", dst, ""), fastOpts(1))
+	r := mustRun(t, phonePlan(t, fp, "/sdcard/D", dst, ""), pullOpts(1))
 	if r.Written != 1 || r.Failed != 1 || !strings.Contains(r.Failures[0].Err, "folder") {
 		t.Errorf("result = %+v", r)
 	}
+}
+
+// pullOpts pins a phone copy to the v1 pull lane: the tests above check v1's
+// behaviour, which --phone-mode pull (and --v1) must keep exactly.
+func pullOpts(workers int) Options {
+	o := fastOpts(workers)
+	o.PhoneMode = "pull"
+	return o
 }

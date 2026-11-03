@@ -66,6 +66,11 @@ func (a *ADB) Probe(ctx context.Context, serial string) (Caps, error) {
 		return Caps{}, fmt.Errorf("asking the phone what it supports: %w", err)
 	}
 	c.FindCmin = ParseCminProbe(string(out))
+	c.Tar = a.probeTar(ctx, serial)
+	c.PullCompress = a.probeCompress(ctx, serial)
+	if ctx.Err() != nil {
+		return Caps{}, ctx.Err()
+	}
 
 	a.capsMu.Lock()
 	if a.caps == nil {

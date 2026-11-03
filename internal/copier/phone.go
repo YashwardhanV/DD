@@ -128,18 +128,32 @@ func planPhoneFind(ctx context.Context, adb *phone.ADB, serial, remote string, i
 }
 
 // pullBatch is up to 100 files from ONE phone folder, pulled with one adb call.
-type pullBatch struct{ items []*Item }
+type pullBatch struct {
+	items []*Item
+	// compress is the 'adb pull -z' algorithm ("" = none).
+	compress string
+	// checkVanish: a file that doesn't arrive is looked up on the phone, and
+	// reported as vanished (not failed) if it no longer exists.
+	checkVanish bool
+}
 
 // makeBatches groups the files to write by their folder on the phone and cuts
 // each group into batches that respect the command-line limits.
 func makeBatches(p *Plan) []pullBatch {
+	var items []*Item
+	for i := range p.Items {
+		if it := &p.Items[i]; !it.Decision.Skipped() && it.Blocked == "" {
+			items = append(items, it)
+		}
+	}
+	return makeBatchesFor(items)
+}
+
+// makeBatchesFor is makeBatches for a given list of files.
+func makeBatchesFor(items []*Item) []pullBatch {
 	groups := map[string][]*Item{}
 	var batches []pullBatch
-	for i := range p.Items {
-		it := &p.Items[i]
-		if it.Decision.Skipped() || it.Blocked != "" {
-			continue
-		}
+	for _, it := range items {
 		if base := path.Base(it.Src); SafeName(base) != base {
 			batches = append(batches, pullBatch{items: []*Item{it}}) // pulled alone, to a safe name
 			continue
@@ -185,7 +199,17 @@ func runPhone(ctx context.Context, p *Plan, opt Options, st *state) error {
 			st.fail(it.Rel, errors.New(it.Blocked))
 		}
 	}
+	lane := choosePhoneLane(ctx, p, opt)
+	st.setPhoneLane(lane.describe())
+	if lane.tar {
+		return runPhoneTar(ctx, p, opt, st, lane)
+	}
+	return runPhonePull(ctx, p, opt, st)
+}
 
+// runPhonePull is the v1 phone copy: every file through 'adb pull' batches,
+// two batches at a time.
+func runPhonePull(ctx context.Context, p *Plan, opt Options, st *state) error {
 	queue := make(chan pullBatch)
 	var wg sync.WaitGroup
 	for w := 0; w < pullWorkers; w++ {
@@ -250,7 +274,7 @@ func pullBatchInto(ctx context.Context, p *Plan, b pullBatch, opt Options, st *s
 		}
 		var stillPending []*Item
 		for _, files := range group {
-			failed, err := pullAndPlace(ctx, p, files, st, opt.Trace)
+			failed, err := pullAndPlace(ctx, p, files, b.compress, st, opt.Trace)
 			if err != nil {
 				lastErr = err
 			}
@@ -262,7 +286,7 @@ func pullBatchInto(ctx context.Context, p *Plan, b pullBatch, opt Options, st *s
 		return
 	}
 	for _, it := range pending {
-		if p.MayBeStale && goneFromPhone(ctx, p, it) {
+		if (p.MayBeStale || b.checkVanish) && goneFromPhone(ctx, p, it) {
 			st.vanish()
 			continue
 		}
@@ -282,7 +306,7 @@ func goneFromPhone(ctx context.Context, p *Plan, it *Item) bool {
 
 // pullAndPlace pulls files into a fresh staging folder and moves each
 // delivered file to its final place. It returns the files that did not arrive.
-func pullAndPlace(ctx context.Context, p *Plan, files []*Item, st *state, tr *trace.Recorder) (failed []*Item, err error) {
+func pullAndPlace(ctx context.Context, p *Plan, files []*Item, compress string, st *state, tr *trace.Recorder) (failed []*Item, err error) {
 	staging, mkErr := os.MkdirTemp(p.DstRoot, stagingPrefix)
 	if mkErr != nil {
 		return files, fmt.Errorf("creating a staging folder in %s: %w", p.DstRoot, mkErr)
@@ -301,7 +325,7 @@ func pullAndPlace(ctx context.Context, p *Plan, files []*Item, st *state, tr *tr
 	if unsafe {
 		err = p.Phone.ADB.PullFile(ctx, p.Phone.Serial, files[0].Src, filepath.Join(staging, SafeName(path.Base(files[0].Src))))
 	} else {
-		err = p.Phone.ADB.Pull(ctx, p.Phone.Serial, srcs, staging)
+		err = p.Phone.ADB.PullCompressed(ctx, p.Phone.Serial, srcs, staging, compress)
 	}
 	tr.End(trace.PhoneStream, m)
 	perFile := time.Since(began) / time.Duration(len(files))

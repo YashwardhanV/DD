@@ -1,8 +1,11 @@
 package phonetest
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -36,6 +39,18 @@ type FS struct {
 	OnPull func(ctx context.Context)
 	// NoCmin makes the phone's find reject -cmin (like an old busybox).
 	NoCmin bool
+	// NoTar makes the phone have no working tar (the probe fails).
+	NoTar bool
+	// Features is what 'adb features' prints (e.g. "sendrecv_v2,sendrecv_v2_lz4").
+	Features string
+	// TarExtra, if set, can add entries to every tar stream after the
+	// requested files (malicious or buggy phone tests).
+	TarExtra func(tw *tar.Writer)
+	// TarCut cuts the first TarCutTimes tar streams after TarCut bytes, like
+	// an unplugged cable.
+	TarCut, TarCutTimes int
+	// OnStreamRead is called while a tar stream is read, with the bytes read so far.
+	OnStreamRead func(ctx context.Context, n int64)
 	// Now is the phone's clock in unix seconds (default: the real clock).
 	Now func() int64
 
@@ -43,6 +58,8 @@ type FS struct {
 	files   map[string]File
 	ctimes  map[string]int64 // status-change time; default = MTime
 	shells  []string         // every shell command run
+	tars    [][]string       // the files requested by every tar stream
+	algos   []string         // the -z algorithm of every pull ("" = none)
 	pulls   [][]string
 	running atomic.Int64
 	peak    atomic.Int64
@@ -94,8 +111,49 @@ func (f *FS) now() int64 {
 
 // ADB returns an *phone.ADB backed by this fake phone.
 func (f *FS) ADB() *phone.ADB {
-	adb, _ := New(f.handle)
-	return adb
+	fake := &Fake{Handler: f.handle}
+	fake.Wrap = func(args []string, r io.Reader) io.Reader {
+		if f.OnStreamRead == nil || len(args) < 3 || args[2] != "exec-out" {
+			return r
+		}
+		return &watchReader{r: r, fn: f.OnStreamRead}
+	}
+	return phone.NewADBWithRunner(fake)
+}
+
+// watchReader reports progress while a stream is read.
+type watchReader struct {
+	r  io.Reader
+	n  int64
+	fn func(ctx context.Context, n int64)
+}
+
+func (w *watchReader) Read(p []byte) (int, error) {
+	if len(p) > 4096 {
+		p = p[:4096] // small reads, so a test can stop a stream mid-file
+	}
+	n, err := w.r.Read(p)
+	w.n += int64(n)
+	w.fn(context.Background(), w.n)
+	return n, err
+}
+
+// TarCalls returns the requested files of every tar stream so far.
+func (f *FS) TarCalls() [][]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([][]string, len(f.tars))
+	for i, c := range f.tars {
+		out[i] = append([]string(nil), c...)
+	}
+	return out
+}
+
+// PullAlgos returns the -z algorithm of every pull ("" = plain pull).
+func (f *FS) PullAlgos() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.algos...)
 }
 
 // PullCalls returns the remote paths of every `adb pull` so far.
@@ -119,6 +177,9 @@ func (f *FS) handle(ctx context.Context, args []string) (string, error) {
 	if len(args) > 0 && args[0] == "devices" {
 		return DevicesOutput(f.Devices...), nil
 	}
+	if len(args) == 1 && args[0] == "help" {
+		return "global options:\n ...\nfile transfer:\n pull [-a] [-z ALGORITHM] [-Z] REMOTE... LOCAL\n", nil
+	}
 	if len(args) == 1 && args[0] == "version" {
 		return "Android Debug Bridge version 1.0.41\nVersion 35.0.2-12147458\nInstalled as C:\\platform-tools\\adb.exe\n", nil
 	}
@@ -127,7 +188,11 @@ func (f *FS) handle(ctx context.Context, args []string) (string, error) {
 	}
 	switch args[2] {
 	case "pull":
-		return f.pull(ctx, args[3:]) // -a remote... local
+		return f.pull(ctx, args[3:]) // -a [-z algo] remote... local
+	case "features":
+		return f.Features + "\n", nil
+	case "exec-out":
+		return f.execOut(args[3])
 	case "shell":
 		cmd := args[3]
 		f.mu.Lock()
@@ -228,7 +293,15 @@ func (f *FS) pull(ctx context.Context, args []string) (string, error) {
 	if len(args) < 3 || args[0] != "-a" {
 		return "", fmt.Errorf("phonetest: unexpected pull args %q", args)
 	}
-	remotes, local := args[1:len(args)-1], args[len(args)-1]
+	args = args[1:]
+	algo := ""
+	if len(args) > 2 && args[0] == "-z" {
+		algo, args = args[1], args[2:]
+	}
+	f.mu.Lock()
+	f.algos = append(f.algos, algo)
+	f.mu.Unlock()
+	remotes, local := args[:len(args)-1], args[len(args)-1]
 
 	n := f.running.Add(1)
 	defer f.running.Add(-1)
@@ -277,4 +350,111 @@ func (f *FS) pull(ctx context.Context, args []string) (string, error) {
 		return "", &phone.ExitError{Code: 1, Stderr: "adb: error: failed to copy some files"}
 	}
 	return "", nil
+}
+
+// execOut answers 'adb exec-out': the tar probe and tar streams.
+func (f *FS) execOut(cmd string) (string, error) {
+	if cmd == phone.TarProbeCommand {
+		if f.NoTar {
+			return "tar: unknown option -C\n", nil
+		}
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		tw.WriteHeader(&tar.Header{Name: "hosts", Mode: 0o644, Size: 9, Typeflag: tar.TypeReg})
+		tw.Write([]byte("127.0.0.1"))
+		tw.Close()
+		return buf.String(), nil
+	}
+	root, rels, ok := parseTarCommand(cmd)
+	if !ok || f.NoTar {
+		return "", &phone.ExitError{Code: 127, Stderr: "tar: not found"}
+	}
+	f.mu.Lock()
+	f.tars = append(f.tars, append([]string(nil), rels...))
+	cut := 0
+	if f.TarCutTimes > 0 {
+		f.TarCutTimes--
+		cut = f.TarCut
+	}
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	missing := false
+	for _, rel := range rels {
+		full := path.Join(root, rel)
+		file, ok := f.files[full]
+		if !ok || f.Unreadable[full] {
+			missing = true // real tar: "No such file", carries on, exits 1
+			continue
+		}
+		tw.WriteHeader(&tar.Header{Name: rel, Mode: 0o644, Size: int64(len(file.Content)), ModTime: time.Unix(file.MTime, 0), Typeflag: tar.TypeReg, Format: tar.FormatGNU})
+		tw.Write([]byte(file.Content))
+	}
+	extra := f.TarExtra
+	f.mu.Unlock()
+	if extra != nil {
+		extra(tw)
+	}
+	tw.Close()
+	out := buf.String()
+	if cut > 0 && cut < len(out) {
+		return out[:cut], &phone.ExitError{Code: 1, Stderr: "error: device offline"}
+	}
+	if missing {
+		return out, &phone.ExitError{Code: 1}
+	}
+	return out, nil
+}
+
+// parseTarCommand reads "cd <root> && tar -cf - -- <rels...> 2>/dev/null".
+func parseTarCommand(cmd string) (root string, rels []string, ok bool) {
+	words := shellWords(cmd)
+	if len(words) < 7 || words[0] != "cd" || words[2] != "&&" || words[3] != "tar" || words[4] != "-cf" || words[5] != "-" || words[6] != "--" {
+		return "", nil, false
+	}
+	root = words[1]
+	for _, w := range words[7:] {
+		if w == "2>/dev/null" {
+			break
+		}
+		rels = append(rels, w)
+	}
+	return root, rels, true
+}
+
+// shellWords splits a command line the way the phone's shell would, for
+// the quoting DriveDex produces: bare words and '...' with '\” inside.
+func shellWords(s string) []string {
+	var out []string
+	var cur strings.Builder
+	inWord, quoted := false, false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case quoted:
+			if c == '\'' {
+				quoted = false
+			} else {
+				cur.WriteByte(c)
+			}
+		case c == '\'':
+			quoted, inWord = true, true
+		case c == '\\' && i+1 < len(s):
+			i++
+			cur.WriteByte(s[i])
+			inWord = true
+		case c == ' ':
+			if inWord {
+				out = append(out, cur.String())
+				cur.Reset()
+				inWord = false
+			}
+		default:
+			cur.WriteByte(c)
+			inWord = true
+		}
+	}
+	if inWord {
+		out = append(out, cur.String())
+	}
+	return out
 }

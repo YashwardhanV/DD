@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/yashwardhanv/dd/internal/copier"
@@ -13,12 +14,16 @@ import (
 // reportTrace prints (--trace) and saves (--trace-file) the trace report of a
 // finished copy. The latest report is also kept in DriveDex's own folder, so
 // 'drivedex doctor' can explain its hints later.
-func reportTrace(out *bufio.Writer, plan *copier.Plan, o planRun, workers int) {
+func reportTrace(out *bufio.Writer, plan *copier.Plan, o planRun, workers int, res copier.Result) {
 	if o.trace == nil {
 		return
 	}
 	elapsed := time.Since(o.began)
-	rep := o.trace.Report(elapsed, traceContext(plan, o, workers))
+	ctx := traceContext(plan, o, workers)
+	if res.PhoneLane != "" {
+		ctx.PhoneMode = strings.Fields(res.PhoneLane)[0]
+	}
+	rep := o.trace.Report(elapsed, ctx)
 	if o.showTrace {
 		fmt.Fprintln(out)
 		rep.WriteText(out)

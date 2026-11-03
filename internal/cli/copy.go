@@ -64,6 +64,7 @@ for speed, DriveDex does not force every file to be flushed to the disk.`,
 	cmd.Flags().BoolVar(&f.v1, "v1", false, "turn every DriveDex 2.0 copy feature off and copy exactly like version 1 (for comparisons)")
 	cmd.Flags().StringVar(&f.plan, "plan", "auto", "where the file list comes from: auto (the saved index when it can be trusted), index, or walk (list the source again, like v1)")
 	cmd.Flags().BoolVar(&f.fresh, "fresh", false, "list the source again instead of using the saved index (same as --plan walk)")
+	cmd.Flags().StringVar(&f.phoneMode, "phone-mode", "", "phone copies: auto (tar stream when the phone supports it), tar, or pull (one adb pull per batch, like v1); default from phone_copy_mode")
 	return cmd
 }
 
@@ -77,6 +78,24 @@ type copyFlags struct {
 	v1        bool   // every v2 feature off
 	plan      string // auto | index | walk
 	fresh     bool   // = --plan walk
+	phoneMode string // auto | tar | pull ("" = the phone_copy_mode setting)
+}
+
+// phoneOptions returns the copier's phone settings from the flags and config.
+func (f copyFlags) phoneOptions() (mode string, streams int, compress string, err error) {
+	if f.v1 {
+		return "pull", 1, "off", nil
+	}
+	mode = strings.ToLower(strings.TrimSpace(f.phoneMode))
+	if mode == "" {
+		mode = activeConfig.PhoneCopyMode
+	}
+	switch mode {
+	case "", "auto", "tar", "pull":
+	default:
+		return "", 0, "", userErr(fmt.Sprintf("--phone-mode %q isn't valid", f.phoneMode), "use auto, tar or pull", nil)
+	}
+	return mode, activeConfig.PhoneTarStreams, activeConfig.PhonePullCompress, nil
 }
 
 // planMode turns --plan / --fresh / --v1 / copy_plan_from_index into "auto",
@@ -149,6 +168,10 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 		return userErr(fmt.Sprintf("--on-conflict %q isn't valid", f.onConflict), "use newer, skip or overwrite", nil)
 	}
 	planMode, anyAge, err := f.planMode()
+	if err != nil {
+		return err
+	}
+	phoneMode, tarStreams, pullCompress, err := f.phoneOptions()
 	if err != nil {
 		return err
 	}
@@ -244,7 +267,7 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 	return finishPlan(ctx, out, status, plan, planRun{
 		workers: workers, why: why, verify: f.verify, dryRun: f.dryRun, dstArg: dstArg, srcRoot: srcRoot,
 		trace: rec, showTrace: f.trace, traceFile: f.traceFile, began: began, phoneLinkMBps: phoneLink,
-		afterRun: afterRun,
+		afterRun: afterRun, phoneMode: phoneMode, tarStreams: tarStreams, pullCompress: pullCompress,
 	})
 }
 
@@ -265,6 +288,10 @@ type planRun struct {
 	phoneLinkMBps float64 // a phone source's USB link speed (0 = unknown)
 
 	afterRun func(copier.Result) // runs after the copy (nil = nothing)
+
+	phoneMode    string // auto | tar | pull
+	tarStreams   int
+	pullCompress string
 }
 
 // finishPlan checks, announces, (dry-)runs and reports one copy plan. Both
@@ -317,6 +344,10 @@ func finishPlan(ctx context.Context, out *bufio.Writer, status *ui.StatusLine, p
 		BigLanes: bigLanes,
 		Verify:   f.verify,
 		Trace:    o.trace,
+
+		PhoneMode:    o.phoneMode,
+		TarStreams:   o.tarStreams,
+		PullCompress: o.pullCompress,
 		Progress: func(p ui.CopyProgress) {
 			status.Update(ui.FormatCopyProgress(p))
 		},
@@ -325,7 +356,7 @@ func finishPlan(ctx context.Context, out *bufio.Writer, status *ui.StatusLine, p
 	if err != nil {
 		return userErr("the copy couldn't start", "check the destination can be written to: "+dst, err)
 	}
-	defer reportTrace(out, plan, o, workers)
+	defer func() { reportTrace(out, plan, o, workers, res) }()
 	if o.afterRun != nil {
 		o.afterRun(res)
 	}
@@ -335,6 +366,13 @@ func finishPlan(ctx context.Context, out *bufio.Writer, status *ui.StatusLine, p
 	fmt.Fprintf(out, "Copied %s files (%s) in %s · %s/s · %d skipped · %d failed\n",
 		ui.Thousands(res.Written), ui.HumanSize(res.BytesWritten), ui.FormatDuration(res.Elapsed),
 		ui.HumanSize(rate), res.Skipped, res.Failed)
+	if res.PhoneLane != "" {
+		fmt.Fprintln(out, ui.Dim("Phone files came by "+laneWords(res.PhoneLane)+"."))
+	}
+	if res.StreamRejected > 0 {
+		fmt.Fprintln(out, ui.Yellow("note:")+fmt.Sprintf(" the phone's tar stream held %d unexpected %s (not asked for, a link, or a name outside the folder); %s ignored.",
+			res.StreamRejected, plural(int(res.StreamRejected), "entry", "entries"), plural(int(res.StreamRejected), "it was", "they were")))
+	}
 	if res.Vanished > 0 {
 		fmt.Fprintln(out, ui.Dim(fmt.Sprintf("%d %s had been deleted since the index was made (vanished) - nothing to copy, not an error.",
 			res.Vanished, plural(int(res.Vanished), "file", "files"))))
@@ -452,4 +490,15 @@ func printDryRun(out io.Writer, plan *copier.Plan, c copier.Counts) error {
 	fmt.Fprintf(out, "\nWould copy %s files (%s), overwrite %s, skip %s. Nothing was written (dry run).\n",
 		ui.Thousands(c.Copy), ui.HumanSize(c.WriteBytes), ui.Thousands(c.Overwrite), ui.Thousands(c.Skipped))
 	return nil
+}
+
+// laneWords describes a phone lane: "tar" -> "one continuous tar stream".
+func laneWords(lane string) string {
+	switch {
+	case lane == "tar":
+		return "tar stream (many files per request; big files by adb pull)"
+	case strings.HasPrefix(lane, "pull ("):
+		return "adb pull " + strings.TrimPrefix(lane, "pull ")
+	}
+	return "adb pull"
 }

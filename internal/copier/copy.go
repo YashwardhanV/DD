@@ -57,6 +57,17 @@ type Options struct {
 	// Trace, if set, records where the time goes (drivedex copy --trace).
 	// nil costs nothing.
 	Trace *trace.Recorder
+
+	// Phone copies (BUILD-V2 stage 16).
+	// PhoneMode: "auto" or "" (tar stream when the phone supports it), "tar",
+	// or "pull" (exactly v1).
+	PhoneMode string
+	// TarStreams is how many tar streams run at once (<= 0 means 1).
+	TarStreams int
+	// PullCompress: "auto"/"" or "off" (no compression), or "lz4", "zstd",
+	// "brotli" to use that 'adb pull -z' algorithm for big compressible
+	// files when the phone supports it.
+	PullCompress string
 }
 
 // BigFileSize is where BigLanes starts to apply.
@@ -100,6 +111,13 @@ type Result struct {
 	// came (deleted since the index the plan came from was made). They are
 	// not failures.
 	Vanished int64
+	// PhoneLane says how phone files were moved: "tar", "pull", or "pull
+	// (...)" with the reason tar wasn't used. "" for local copies.
+	PhoneLane string
+	// StreamRejected counts entries in a phone's tar stream that were
+	// refused (not requested, not a regular file, or a name that would
+	// escape the destination). They are drained and ignored.
+	StreamRejected int64
 }
 
 // state is the live, shared counters of a running copy.
@@ -111,9 +129,19 @@ type state struct {
 	written, notRegular  atomic.Int64
 	mismatches           atomic.Int64
 	vanished             atomic.Int64
+	rejected             atomic.Int64
+
+	laneMu    sync.Mutex
+	phoneLane string
 
 	mu       sync.Mutex
 	failures []Failure
+}
+
+func (s *state) setPhoneLane(l string) {
+	s.laneMu.Lock()
+	s.phoneLane = l
+	s.laneMu.Unlock()
 }
 
 // vanish records a planned file that no longer exists at the source.
@@ -225,8 +253,11 @@ func Run(ctx context.Context, p *Plan, opt Options) (Result, error) {
 		BytesWritten: st.bytesDone.Load(), VerifyMismatches: st.mismatches.Load(),
 		Failures: append([]Failure(nil), st.failures...), Elapsed: elapsed,
 		Cancelled: ctx.Err() != nil, NotRegular: st.notRegular.Load(),
-		Vanished: st.vanished.Load(),
+		Vanished: st.vanished.Load(), StreamRejected: st.rejected.Load(),
 	}
+	st.laneMu.Lock()
+	res.PhoneLane = st.phoneLane
+	st.laneMu.Unlock()
 	st.mu.Unlock()
 	return res, err
 }

@@ -338,7 +338,7 @@ func TestCopyFromPhone(t *testing.T) {
 	fakeDriveType(t, false, true)
 	dst := filepath.Join(t.TempDir(), "PhoneBackup")
 
-	out, err := run(t, "copy", "phone:/DCIM/Camera", dst)
+	out, err := run(t, "copy", "phone:/DCIM/Camera", dst, "--phone-mode", "pull")
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
