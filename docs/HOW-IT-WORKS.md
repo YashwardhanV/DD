@@ -2,7 +2,7 @@
 
 A beginner-friendly tour. You don't need to know any of this to *use* DriveDex — but if you read it once, you'll be able to explain the project (and the ideas behind it) to anyone, including in an interview. Each section ends with a one-sentence "in short".
 
-Contents: [1. Why Explorer is slow](#1-why-explorer-is-slow) · [2. What an index is](#2-what-an-index-is) · [3. File systems](#3-file-systems-ntfs-vs-fatexfat) · [4. The MFT and the USN journal](#4-the-mft-and-the-usn-journal-the-library-catalogue-and-the-diary) · [5. HDD vs flash](#5-hdd-vs-flash-and-why-the-number-of-workers-matters) · [6. MTP vs ADB](#6-phones-mtp-vs-adb) · [7. Paths from parent IDs](#7-how-the-index-stores-paths-parent-ids-and-why-renames-are-cheap) · [8. Search internals](#8-how-search-is-so-fast) · [9. Knowing a drive](#9-recognising-a-drive-serial-numbers-not-letters) · [10. Copy, agent, safety](#10-copying-the-agent-and-staying-safe) · [11. USB 2 vs USB 3](#11-usb-20-vs-usb-3-why-software-cant-speed-up-a-port) · [12. Interview cheat sheet](#12-interview-cheat-sheet)
+Contents: [1. Why Explorer is slow](#1-why-explorer-is-slow) · [2. What an index is](#2-what-an-index-is) · [3. File systems](#3-file-systems-ntfs-vs-fatexfat) · [4. The MFT and the USN journal](#4-the-mft-and-the-usn-journal-the-library-catalogue-and-the-diary) · [5. HDD vs flash](#5-hdd-vs-flash-and-why-the-number-of-workers-matters) · [6. MTP vs ADB](#6-phones-mtp-vs-adb) · [7. Paths from parent IDs](#7-how-the-index-stores-paths-parent-ids-and-why-renames-are-cheap) · [8. Search internals](#8-how-search-is-so-fast) · [9. Knowing a drive](#9-recognising-a-drive-serial-numbers-not-letters) · [10. Copy, agent, safety](#10-copying-the-agent-and-staying-safe) · [11. USB 2 vs USB 3](#11-usb-20-vs-usb-3-why-software-cant-speed-up-a-port) · [12. DriveDex 2.0: where copy time goes](#12-drivedex-20-where-copy-time-goes-and-how-20-saves-it) · [13. Interview cheat sheet](#13-interview-cheat-sheet)
 
 ---
 
@@ -82,7 +82,7 @@ DriveDex asks Windows ("does this drive have a *seek penalty*?" — `IOCTL_STORA
 
 When you browse an Android phone in Explorer, Windows talks **MTP** (Media Transfer Protocol). MTP is a polite, one-question-at-a-time protocol designed for syncing music: "list this folder" → wait for the answer → "list that folder" → wait… A camera roll with thousands of folders turns into thousands of slow round trips over USB, and Explorer's search over MTP is notoriously slow or hangs.
 
-**ADB** (Android Debug Bridge) is a developer tool that lets the PC run a *command on the phone itself*. DriveDex sends **one** command — roughly "find every file under /sdcard and print its size, date and path" — the phone runs it locally at full speed, and the whole list streams back in a single response. The same trick is used to copy: `adb pull` moves many files in one go.
+**ADB** (Android Debug Bridge) is a developer tool that lets the PC run a *command on the phone itself*. DriveDex sends **one** command — roughly "find every file under /sdcard and print its size, date and path" — the phone runs it locally at full speed, and the whole list streams back in a single response. The same trick is used to copy: 1.0 used `adb pull` (many files per command, but still one request per file inside it); 2.0 streams small files as one `tar` archive (section 12).
 
 What you need: turn on *USB debugging* on the phone and install Google's Platform-Tools (`drivedex index phone` prints the exact steps if something is missing, and `drivedex doctor` checks them). iPhones have no equivalent, so they aren't supported. DriveDex only ever **reads** from the phone (find, stat, pull); it never writes to it.
 
@@ -132,7 +132,7 @@ Results from a drive that's plugged in show its real path (`G:\Photos\IMG_001.jp
 
 ## 10. Copying, the agent, and staying safe
 
-- **Copy** (`drivedex copy`): first **plan** (list what would be copied, skipped or overwritten — that's `--dry-run`), then **run** with a pool of workers. Each file is written under a temporary name (`.ddxpart`) and renamed only when complete, so an unplug never leaves a half-file that looks real. Run the same command again and it **resumes**: files already there (same size and time) are skipped. Free space and the FAT32 4 GiB limit are checked *before* starting. `--verify` compares CRC-32 checksums afterwards. For phones, files are pulled into a hidden staging folder and renamed into place once they arrive.
+- **Copy** (`drivedex copy`): first **plan** (list what would be copied, skipped or overwritten — that's `--dry-run`), then **run** with a pool of workers. Each file is written under a temporary name (`.ddxpart`) and renamed only when complete, so an unplug never leaves a half-file that looks real. Run the same command again and it **resumes**: files already there (same size and time) are skipped. Free space and the FAT32 4 GiB limit are checked *before* starting. `--verify` compares CRC-32C checksums (in 2.0 the copy is re-read straight from the disk, not from RAM). For phones, pulled files land in a hidden staging folder and are renamed into place once they arrive; tar-streamed files go through the same `.ddxpart` writer as everything else.
 - **The agent** (`drivedex-agent.exe`) is a tiny program with no window. It checks for new USB drives and phones every few seconds and runs `drivedex index` for them, so your indexes stay fresh without you remembering. A lock file stops it and a hand-run `index` from rebuilding the same index at once.
 - **Safety rules.** DriveDex is **read-only** on the drives it indexes. The only commands that write to a drive are `copy` (what you asked for) and `doctor --bench` (one temporary file, always deleted). It never writes to a phone. `forget`/`uninstall` only ever delete DriveDex's own files, by exact name. Installing asks y/N before every change to your system, and nothing needs administrator rights unless you choose NTFS turbo mode.
 
@@ -156,7 +156,52 @@ Windows usually can't tell *where* a port is on the case, so `drivedex ports --w
 
 **In short:** speed lives in the wires; DriveDex can't add wires, but it tells you exactly which port, hub or cable is missing them.
 
-## 12. Interview cheat sheet
+## 12. DriveDex 2.0: where copy time goes, and how 2.0 saves it
+
+A copy of *N* files totalling *S* bytes costs roughly:
+
+```
+time ≈ listing the source  +  N × (cost per file)  +  S ÷ (speed of the slowest link)  +  head seeks (hard disks)
+```
+
+No software beats the slowest link — a USB 2.0 port moves about 40 MB/s, full stop. So for one 4 GB video, 2.0 can't do much. But for 20,000 photos, the *other* three terms dominate, and that's what 2.0 attacks. `drivedex copy --trace` measures each term on your drive, so you can see which case you're in.
+
+### Tar streams vs adb pull — ordering a whole crate instead of one bottle at a time
+
+`adb pull` asks the phone for a file, waits for it, acknowledges it, and asks for the next — even when 100 files are named in one command. Each request is a little round trip over USB. With thousands of small files, the link spends most of its time *waiting*. It's like a shop assistant fetching bottles from the storeroom one at a time.
+
+`tar` is an old Unix format that packs many files back to back into one stream. DriveDex asks the phone's own `tar` to pack up to 2,000 files and write the result to its output; `adb exec-out` carries those bytes to the PC untouched (unlike `adb shell`, which on older versions turns every line-feed byte into two bytes and would corrupt photos). On the PC, Go's `archive/tar` unpacks each file *as it arrives*. The phone never waits for the PC between files: one crate instead of 2,000 bottles.
+
+**Safety.** The phone is still only *read*: `tar -c` creates an archive and writes it to the USB link, never to the phone's storage. On the PC, a stream is treated as untrusted: an entry is written only if it is a regular file whose name DriveDex asked for in that very request — so a buggy or hacked phone can't slip in `../../Windows/evil.dll`, an absolute path or a link. And every file still goes through the same atomic writer (`.ddxpart`, then rename), so an unplug mid-stream leaves only finished files; the rest is asked for again (by tar once, then by `adb pull`).
+
+### Planning from the index — don't re-read the catalogue you already have
+
+Version 1 started every copy by listing the source again ("Reading the file list…"), on the slowest device in the chain, and copied nothing until the list was complete. But the agent already keeps a list of every file — the index. 2.0 starts copying from the index at once, and keeps the copy correct like this:
+
+- **Phone:** it asks the phone only "which files changed in the last *M* minutes?" (`find -cmin -M`, where *M* is the age of the index plus 2 minutes for clock differences). `-cmin` (status *change* time) catches moved and renamed files too, which keep their old *modification* time.
+- **Drive:** a quick sweep lists the folder again *while* the copy runs (two workers, `os.ReadDir` — on Windows the listing itself contains each file's size and date, so no file is opened). Anything new or changed joins the copy ("+N found while copying"); anything gone is reported as *vanished*. On a hard disk the sweep would make the read head jump between listing and reading, so there DriveDex lists first, like 1.0 — unless the NTFS change journal (Administrator) can refresh the index in milliseconds.
+
+Afterwards, what the delta or sweep learned is written back into the index, so the next copy plans from an even fresher list.
+
+### The autotuner — finding the right number of helpers by trying
+
+1.0 picked the number of parallel workers once: 2 if a hard disk is involved, 8 for flash, 4 if unsure. Real drives disagree — a cheap pen drive gets *slower* when written by several workers at once, a fast SSD wants more. 2.0 measures every 2 seconds (files per second for small files, MB/s for big ones), tries 2 more workers, keeps them if that's at least 5 % faster, otherwise goes back and tries 1 fewer, and settles when neither direction wins. This is called *hill climbing*: keep taking steps uphill until every step goes down. Every 30 seconds it looks again, because a drive can change behaviour when its own cache fills. A worker that's over a new, lower limit simply waits before its *next* file — no file is ever interrupted.
+
+### Unbuffered I/O — skipping the RAM waiting room
+
+Normally Windows puts written data into RAM first (the *cache*) and writes it to the disk later. For a huge file that looks great for a while — then the cache is full, and the copy "stalls" while Windows flushes gigabytes to a slow USB drive. With `FILE_FLAG_NO_BUFFERING`, data goes straight to the disk at a steady pace (it's what `robocopy /J` does). The rules are strict: the memory buffer must start at an address that's a multiple of the disk's sector size (4,096 bytes covers all disks), and every read and write must be a whole number of sectors. So the last, partial piece of a file is padded with zeros to a full sector, and then the file is cut back to its true length. It's off by default until a benchmark on your drives shows it helps (`--unbuffered on`).
+
+The same trick makes `--verify` honest: 1.0 re-read the copy right after writing it — from the RAM cache, so it checked the copy logic, not the disk. 2.0 computes the original's checksum while copying and re-reads the copy *unbuffered*, straight from the media.
+
+### Disk order — reading a hard disk like a record, not a jukebox
+
+A spinning disk has a read head on an arm. Reading files largest-first sends the arm back and forth across the platter — each jump costs ~10 ms. Windows will tell any program where a file's data starts (its first *logical cluster number*, LCN) without Administrator rights. Sorting small files by that number turns most jumps into short forward moves. Tiny files stored inside the NTFS master file table itself have no clusters; they're read first, together. Looking up every file's position costs time too, so DriveDex gives up and uses the normal order if it would take more than 10 % of the copy.
+
+### Measure, don't guess
+
+`drivedex bench copy` times Explorer's own copy engine, robocopy (single-threaded and `/MT:16`), DriveDex with every 2.0 feature off (`--v1`) and DriveDex 2.0, on the same folder. The order rotates each round so a warm cache can't favour one program, the median of the rounds is reported with the spread, and a "win" only counts if it's bigger than the spread. `--cold` asks you to unplug and replug the drive before each run — the only honest way to empty Windows' cache for a USB drive without Administrator rights.
+
+## 13. Interview cheat sheet
 
 **"What is it, in one sentence?"** A Windows tool that indexes external drives and Android phones once, then searches them instantly — even when unplugged — and copies files fast and resumably.
 
@@ -165,6 +210,8 @@ Windows usually can't tell *where* a port is on the case, so `drivedex ports --w
 **"What's the hardest bug / most interesting design decision?"** Pick one: (a) storing parent IDs instead of paths so renames are cheap and the index is small; (b) the Explorer right-click menu command line — `"E:\"` is read by Windows as an *escaped quote*, so the spec's form silently corrupted arguments; the fix is a trailing space inside the quotes, proved by a test that re-implements Windows' command-line parsing rules; (c) making all the Windows-only parts (raw disk access, registry, ADB) testable on any machine by hiding them behind small interfaces and writing in-memory fakes (a fake NTFS volume, a fake phone).
 
 **"How did you test things you can't run in CI?"** Interfaces + fakes for everything hardware-shaped (`ntfs.Device`, `phone.Runner`, the registry), and a checklist of hardware checks the owner runs on real drives and records in `PROGRESS.md` — with nothing marked "passed" without evidence.
+
+**"What changed in 2.0?"** Measurement first (a nil-safe phase tracer and a fair benchmark command), then: phone copies as one `tar` stream over `adb exec-out` with a strict whitelist on the PC side; copies planned from the saved index with a delta listing or a reconciling sweep; a hill-climbing worker autotuner; unbuffered I/O; disk-order reads. Every feature has a switch and a 1.0 fallback, and none is claimed faster until it wins on real hardware.
 
 **"Anything you're proud of that isn't search?"** The USB link check: following a drive letter through the Windows device tree to its hub port and asking the hub driver whether the device could run faster — so a user learns *the port is USB 2.0 only* instead of blaming the drive.
 

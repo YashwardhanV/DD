@@ -59,6 +59,24 @@ These are the numbers that matter for the project's claim ("faster than Explorer
 
 **Hardware notes to record with every result:** laptop/PC model, Windows version, drive make/model/capacity, file system, which USB port (blue/"SS" = USB 3), cable, whether the drive had been unplugged since the previous run (Windows caches folder listings, so only a *first* run after a replug is an honest cold-cache number).
 
+## 2a. DriveDex 2.0 — real hardware (BUILD-V2 section 7)
+
+How "faster" is decided:
+
+1. Same PC, same ports, laptop on its charger, other heavy programs closed. Record: PC model, Windows version, drive make/model/capacity, file system, port (USB 2.0 / 3.x, from `drivedex ports`), cable.
+2. Drives: `drivedex bench copy <src> <dst-folder> --rounds 3 --cold --markdown`. Phones: 3 rounds, phone unlocked, screen on, not in charging-only mode.
+3. The **median** counts; a win must be bigger than the spread between rounds, otherwise it's "no difference".
+4. `drivedex-v1` (the same program with `--v1`) is always in the table, so a gain can only come from the 2.0 features.
+5. Test sets (create once, keep): **(A)** 5,000+ files under 1 MB; **(B)** 300–500 camera photos of 2–8 MB; **(C)** a few files of 1–4 GB; **(D)** 10,000+ mixed files on a USB hard disk.
+
+`bench copy --markdown` prints rows in exactly this shape (times are medians in seconds, ± the spread):
+
+| Date | Test set | Source (model, FS, port) | Destination | Files / size | Expl. | robo MT | v1 | v2 | Notes |
+|---|---|---|---|---|---|---|---|---|---|
+| | | | | | | | | | |
+
+**Container-only measurement (not hardware):** the copy tracer's cost — a disabled tracer adds ~2 ns per call (≈ 0.01 % of a small-file copy); enabled, ~81 ns per phase (≈ 0.5 %). 2026-11-03, 4-vCPU cloud container.
+
 ## 3. Performance targets (from the project plan)
 
 | Operation | Target | Status |
@@ -69,3 +87,6 @@ These are the numbers that matter for the project's claim ("faster than Explorer
 | USN delta refresh | < 1 s for typical changes | needs an NTFS drive + Administrator |
 | Phone index (50k files) | under ~1 minute | needs a phone |
 | Copy of many small files | faster than Explorer; comparable to `robocopy /MT` | needs real drives |
+| 2.0: phone → PC, 5,000+ files under 1 MB | `drivedex` ≥ 1.5× faster than `drivedex-v1` | needs a phone (`bench copy phone:<folder> ...`) |
+| 2.0: phone → PC, big videos | within ±5 % of `drivedex-v1` (no regression) | needs a phone |
+| 2.0: pen drive with a fresh index | first file copied < 1 s; total ≤ v1 | needs a pen drive |
