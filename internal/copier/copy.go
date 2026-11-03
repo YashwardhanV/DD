@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -68,6 +69,11 @@ type Options struct {
 	// "brotli" to use that 'adb pull -z' algorithm for big compressible
 	// files when the phone supports it.
 	PullCompress string
+
+	// LateChecks are the free-space and FAT32 checks applied to files the
+	// reconciling sweep adds during the copy (the plan's own files were
+	// checked by Plan.Check before the copy started).
+	LateChecks Checks
 }
 
 // BigFileSize is where BigLanes starts to apply.
@@ -114,6 +120,9 @@ type Result struct {
 	// PhoneLane says how phone files were moved: "tar", "pull", or "pull
 	// (...)" with the reason tar wasn't used. "" for local copies.
 	PhoneLane string
+	// Found counts files the reconciling sweep found while copying (not in
+	// the plan, or changed since it was made).
+	Found int64
 	// StreamRejected counts entries in a phone's tar stream that were
 	// refused (not requested, not a regular file, or a name that would
 	// escape the destination). They are drained and ignored.
@@ -122,8 +131,8 @@ type Result struct {
 
 // state is the live, shared counters of a running copy.
 type state struct {
-	total                int64
-	bytesTotal           int64
+	total, bytesTotal    atomic.Int64 // grow when the sweep finds files the plan missed
+	found                atomic.Int64 // files the sweep added
 	filesDone, bytesDone atomic.Int64
 	skipped, failed      atomic.Int64
 	written, notRegular  atomic.Int64
@@ -163,9 +172,10 @@ func (s *state) fail(rel string, err error) {
 
 func (s *state) snapshot(speed float64) ui.CopyProgress {
 	return ui.CopyProgress{
-		FilesDone: s.filesDone.Load(), FilesTotal: s.total,
-		BytesDone: s.bytesDone.Load(), BytesTotal: s.bytesTotal,
+		FilesDone: s.filesDone.Load(), FilesTotal: s.total.Load(),
+		BytesDone: s.bytesDone.Load(), BytesTotal: s.bytesTotal.Load(),
 		Skipped: s.skipped.Load(), Failed: s.failed.Load(), BytesPerSec: speed,
+		Found: s.found.Load(),
 	}
 }
 
@@ -185,7 +195,9 @@ func Run(ctx context.Context, p *Plan, opt Options) (Result, error) {
 		opt.Trace = trace.From(ctx)
 	}
 	counts := p.Counts()
-	st := &state{total: counts.Files, bytesTotal: counts.WriteBytes}
+	st := &state{}
+	st.total.Store(counts.Files)
+	st.bytesTotal.Store(counts.WriteBytes)
 
 	// Files that need no copying count as done right away.
 	for _, it := range p.Items {
@@ -254,6 +266,7 @@ func Run(ctx context.Context, p *Plan, opt Options) (Result, error) {
 		Failures: append([]Failure(nil), st.failures...), Elapsed: elapsed,
 		Cancelled: ctx.Err() != nil, NotRegular: st.notRegular.Load(),
 		Vanished: st.vanished.Load(), StreamRejected: st.rejected.Load(),
+		Found: st.found.Load(),
 	}
 	st.laneMu.Lock()
 	res.PhoneLane = st.phoneLane
@@ -308,6 +321,18 @@ func runLocal(ctx context.Context, p *Plan, opt Options, st *state) {
 	}
 	isBig := func(it *Item) bool { return bigLanes > 0 && it.Size >= bigFileSize }
 
+	// The reconciling sweep (stage 17) runs alongside the copy and queues
+	// what the plan missed.
+	var lateQ *workQueue[LateJob]
+	if p.Reconciler != nil {
+		lateQ = newWorkQueue[LateJob]()
+		go func() {
+			defer lateQ.close()
+			p.Reconciler.Sweep(ctx, func(j Job, c Change) { lateQ.push(LateJob{Job: j, Change: c}) })
+		}()
+	}
+	inflight := newInflight()
+
 	smallQ := make(chan *Item)
 	bigQ := make(chan *Item)
 	var wg sync.WaitGroup
@@ -317,7 +342,12 @@ func runLocal(ctx context.Context, p *Plan, opt Options, st *state) {
 		defer bufPool.Put(bufp)
 		for _, q := range queues {
 			for it := range q {
-				copyWithRetries(ctx, p.DstRoot, it, *bufp, opt, st)
+				if it.late {
+					copyLate(ctx, p, it, *bufp, opt, st)
+				} else {
+					copyWithRetries(ctx, p, it, *bufp, opt, st)
+				}
+				inflight.finish(it)
 			}
 		}
 	}
@@ -335,9 +365,11 @@ func runLocal(ctx context.Context, p *Plan, opt Options, st *state) {
 	// work as soon as the user cancels. Big and small files have their own
 	// dispatcher, so small files flow while the big lanes are busy.
 	var dwg sync.WaitGroup
-	dispatch := func(q chan *Item, mine func(*Item) bool) {
+	dispatch := func(q chan *Item, mine func(*Item) bool, closeWhenDone bool) {
 		defer dwg.Done()
-		defer close(q)
+		if closeWhenDone {
+			defer close(q)
+		}
 		for i := range p.Items {
 			it := &p.Items[i]
 			if it.Decision.Skipped() || !mine(it) {
@@ -347,25 +379,151 @@ func runLocal(ctx context.Context, p *Plan, opt Options, st *state) {
 				st.fail(it.Rel, errors.New(it.Blocked))
 				continue
 			}
+			inflight.start(it)
 			select {
 			case q <- it:
 			case <-ctx.Done():
+				inflight.finish(it)
 				return
 			}
 		}
 	}
 	dwg.Add(2)
-	go dispatch(smallQ, func(it *Item) bool { return !isBig(it) })
-	go dispatch(bigQ, isBig)
+	go dispatch(smallQ, func(it *Item) bool { return !isBig(it) }, lateQ == nil)
+	go dispatch(bigQ, isBig, true)
 	dwg.Wait()
+	if lateQ != nil {
+		dispatchLate(ctx, p, opt, st, lateQ, smallQ, inflight)
+		close(smallQ)
+	}
 	wg.Wait()
+}
+
+// inflight remembers, per destination file, the copy most recently handed
+// to a worker, so a later copy of the same file (found by the sweep) waits
+// for it instead of writing the same .ddxpart at the same time.
+type inflightSet struct {
+	mu   sync.Mutex
+	last map[string]chan struct{}
+}
+
+func newInflight() *inflightSet { return &inflightSet{last: map[string]chan struct{}{}} }
+
+// start registers it as the newest copy of its file; it.waitFor is the
+// previous one (nil if none).
+func (s *inflightSet) start(it *Item) {
+	it.done = make(chan struct{})
+	s.mu.Lock()
+	it.waitFor = s.last[it.Rel]
+	s.last[it.Rel] = it.done
+	s.mu.Unlock()
+}
+
+// finish marks it as finished (copied, skipped, failed or cancelled).
+func (s *inflightSet) finish(it *Item) {
+	if it.done != nil {
+		select {
+		case <-it.done:
+		default:
+			close(it.done)
+		}
+	}
+}
+
+// dispatchLate hands the sweep's findings to the workers until the sweep ends.
+func dispatchLate(ctx context.Context, p *Plan, opt Options, st *state, lateQ *workQueue[LateJob], q chan *Item, inflight *inflightSet) {
+	var budget int64 = -1 // bytes late files may still use (-1 = unknown)
+	budgetKnown := false
+	for {
+		lj, ok := lateQ.pop()
+		if !ok || ctx.Err() != nil {
+			return
+		}
+		if lj.Change == Vanished {
+			continue // a planned file that is gone: its copy reports "vanished"
+		}
+		it := &Item{Job: lj.Job, late: true}
+		st.total.Add(1)
+		st.bytesTotal.Add(it.Size)
+		st.found.Add(1)
+		// Free space is re-checked for the added bytes: what is free now,
+		// minus what the plan still has to write.
+		if !budgetKnown {
+			budgetKnown = true
+			if c := opt.LateChecks; c.FreeBytes != nil {
+				if free, err := c.FreeBytes(nearestExisting(p.DstRoot)); err == nil {
+					budget = int64(free) - (st.bytesTotal.Load() - it.Size - st.bytesDone.Load())
+				}
+			}
+		}
+		if budget >= 0 {
+			if it.Size > budget {
+				st.fail(it.Rel, fmt.Errorf("%w: found while copying, but there is no room left for its %d bytes", ErrNotEnoughSpace, it.Size))
+				continue
+			}
+			budget -= it.Size
+		}
+		inflight.start(it)
+		select {
+		case q <- it:
+		case <-ctx.Done():
+			inflight.finish(it)
+			return
+		}
+	}
+}
+
+// copyLate copies a file the sweep found: once any earlier copy of the same
+// file has finished, it goes through the same rules as the plan (decide, the
+// FAT32 limit) and is copied.
+func copyLate(ctx context.Context, p *Plan, it *Item, buf []byte, opt Options, st *state) {
+	if it.waitFor != nil {
+		select {
+		case <-it.waitFor:
+		case <-ctx.Done():
+			return
+		}
+	}
+	dst := filepath.Join(p.DstRoot, it.Rel)
+	var info os.FileInfo
+	if fi, err := os.Lstat(dst); err == nil {
+		info = fi
+	}
+	it.Decision, it.Blocked = decide(p.OnConflict, it.Size, it.ModTime, info)
+	switch {
+	case it.Decision.Skipped():
+		st.skipped.Add(1)
+		st.filesDone.Add(1)
+		return
+	case it.Blocked != "":
+		st.fail(it.Rel, errors.New(it.Blocked))
+		return
+	}
+	if fsCheck := opt.LateChecks.FileSystem; fsCheck != nil && it.Size >= fat32MaxFile {
+		if name, err := fsCheck(nearestExisting(p.DstRoot)); err == nil && isFAT32(name) {
+			st.fail(it.Rel, fmt.Errorf("%w: %d bytes (FAT32 stores at most 4 GiB minus 1 byte)", ErrFileTooBigForFAT32, it.Size))
+			return
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		st.fail(it.Rel, fmt.Errorf("creating folder %s: %w", filepath.Dir(dst), err))
+		return
+	}
+	copyWithRetries(ctx, p, it, buf, opt, st)
 }
 
 // errNotRegular marks a link or device that is skipped rather than copied.
 var errNotRegular = errors.New("not a regular file")
 
-func copyWithRetries(ctx context.Context, dstRoot string, it *Item, buf []byte, opt Options, st *state) {
-	dst := filepath.Join(dstRoot, it.Rel)
+func copyWithRetries(ctx context.Context, p *Plan, it *Item, buf []byte, opt Options, st *state) {
+	if it.waitFor != nil {
+		select {
+		case <-it.waitFor:
+		case <-ctx.Done():
+			return
+		}
+	}
+	dst := filepath.Join(p.DstRoot, it.Rel)
 	var err error
 	for attempt := 0; attempt <= opt.retries(); attempt++ {
 		if attempt > 0 {
@@ -394,11 +552,18 @@ func copyWithRetries(ctx context.Context, dstRoot string, it *Item, buf []byte, 
 			st.filesDone.Add(1)
 			return
 		}
+		if errors.Is(err, errSourceGone) && p.MayBeStale {
+			st.vanish() // deleted since the index the plan came from was made
+			return
+		}
 		// Any other failure (including a verify mismatch, whose bad copy has
 		// already been deleted) is retried after a short pause.
 	}
 	st.fail(it.Rel, err)
 }
+
+// errSourceGone means the source file no longer exists.
+var errSourceGone = errors.New("the source file no longer exists")
 
 // errVerify marks a checksum mismatch.
 var errVerify = errors.New("verification failed")
@@ -410,6 +575,9 @@ func copyFile(ctx context.Context, src, dst string, mtime int64, buf []byte, ver
 	info, err := os.Lstat(src)
 	if err != nil {
 		tr.End(trace.SrcOpen, m)
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, fmt.Errorf("%w: %s", errSourceGone, src)
+		}
 		return 0, fmt.Errorf("reading %s: %w", src, err)
 	}
 	if !info.Mode().IsRegular() {

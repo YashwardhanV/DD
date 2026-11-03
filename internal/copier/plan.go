@@ -90,6 +90,12 @@ type Item struct {
 	Decision Decision
 	// Blocked is set when the destination exists but can't be replaced (it is a folder).
 	Blocked string
+
+	// Set while copying: late = found by the reconciling sweep; done is
+	// closed when this copy has finished; waitFor is the previous copy of the
+	// same file, which must finish first.
+	late          bool
+	done, waitFor chan struct{}
 }
 
 // Plan is everything a copy is going to do.
@@ -108,6 +114,10 @@ type Plan struct {
 	// file that no longer exists is then reported as "vanished" (deleted
 	// since the index was made), not as a failure.
 	MayBeStale bool
+	// Reconciler, when set, sweeps the source while the copy runs and hands
+	// over files the plan missed (BUILD-V2 stage 17). The spec's Plan.Late
+	// channel is internal to Run (a growable queue fed by the sweep).
+	Reconciler Reconciler
 }
 
 // Counts summarises the plan.

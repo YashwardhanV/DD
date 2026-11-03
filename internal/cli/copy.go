@@ -253,14 +253,29 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 			why = autoWhy(workers)
 		}
 		status.Update("Reading the file list from " + src + " …")
-		plan, err = copier.PlanLocal(ctx, src, dst, f.onConflict, max(workers, 2))
+		localMode := planMode
+		if localMode == "find" {
+			localMode = "walk"
+		}
+		res, err := planLocalCopy(ctx, src, dst, f.onConflict, max(workers, 2), localMode, anyAge)
 		status.Clear()
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				fmt.Fprintln(out, "Stopped. Nothing was copied.")
 				return nil
 			}
+			if errors.Is(err, copier.ErrIndexNotUsable) {
+				return userErr(err.Error(), "drop --plan index to let DriveDex list the source, or index the drive first: drivedex index "+src, nil)
+			}
 			return planError(srcArg, err)
+		}
+		plan = res.Plan
+		if res.Plan.Source != copier.PlanWalk || f.trace {
+			fmt.Fprintln(out, ui.Dim(res.Why))
+		}
+		if res.Sweeper != nil {
+			sweepStart := time.Now()
+			afterRun = func(copier.Result) { refreshLocalIndex(out, res.Scope, res.Sweeper.Result(), sweepStart) }
 		}
 	}
 
@@ -348,6 +363,7 @@ func finishPlan(ctx context.Context, out *bufio.Writer, status *ui.StatusLine, p
 		PhoneMode:    o.phoneMode,
 		TarStreams:   o.tarStreams,
 		PullCompress: o.pullCompress,
+		LateChecks:   copyChecks(),
 		Progress: func(p ui.CopyProgress) {
 			status.Update(ui.FormatCopyProgress(p))
 		},
@@ -372,6 +388,10 @@ func finishPlan(ctx context.Context, out *bufio.Writer, status *ui.StatusLine, p
 	if res.StreamRejected > 0 {
 		fmt.Fprintln(out, ui.Yellow("note:")+fmt.Sprintf(" the phone's tar stream held %d unexpected %s (not asked for, a link, or a name outside the folder); %s ignored.",
 			res.StreamRejected, plural(int(res.StreamRejected), "entry", "entries"), plural(int(res.StreamRejected), "it was", "they were")))
+	}
+	if res.Found > 0 {
+		fmt.Fprintln(out, ui.Dim(fmt.Sprintf("%d %s found while copying (added or changed since the index was made).",
+			res.Found, plural(int(res.Found), "file was", "files were"))))
 	}
 	if res.Vanished > 0 {
 		fmt.Fprintln(out, ui.Dim(fmt.Sprintf("%d %s had been deleted since the index was made (vanished) - nothing to copy, not an error.",

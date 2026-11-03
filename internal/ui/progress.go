@@ -12,6 +12,7 @@ type CopyProgress struct {
 	BytesDone, BytesTotal int64
 	Skipped, Failed       int64
 	BytesPerSec           float64 // smoothed speed; 0 = not known yet
+	Found                 int64   // files found while copying (v2: planned from an index)
 }
 
 // FormatCopyProgress renders the copy status line:
@@ -25,9 +26,13 @@ func FormatCopyProgress(p CopyProgress) string {
 	} else if p.BytesTotal <= p.BytesDone {
 		eta = "ETA 0s"
 	}
-	return fmt.Sprintf("[ %s/%s files ]  %s  ·  %s  ·  %s  ·  %d skipped  ·  %d failed",
+	line := fmt.Sprintf("[ %s/%s files ]  %s  ·  %s  ·  %s  ·  %d skipped  ·  %d failed",
 		Thousands(p.FilesDone), Thousands(p.FilesTotal),
 		HumanPair(p.BytesDone, p.BytesTotal), FormatRate(p.BytesPerSec), eta, p.Skipped, p.Failed)
+	if p.Found > 0 {
+		line += fmt.Sprintf("  ·  +%s found while copying", Thousands(p.Found))
+	}
+	return line
 }
 
 // HumanPair formats "done/total" in the unit of total: 12.1/18.3 GB.

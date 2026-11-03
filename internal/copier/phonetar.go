@@ -154,51 +154,6 @@ func makeTarChunks(items []*Item) []tarChunk {
 	return chunks
 }
 
-// batchQueue is the pull lane's work list. Unlike a channel it can be added
-// to while workers are already taking from it (the tar lane hands over the
-// files a stream didn't deliver) and is closed when nothing more will come.
-type batchQueue struct {
-	mu     sync.Mutex
-	cond   *sync.Cond
-	items  []pullBatch
-	closed bool
-}
-
-func newBatchQueue() *batchQueue {
-	q := &batchQueue{}
-	q.cond = sync.NewCond(&q.mu)
-	return q
-}
-
-func (q *batchQueue) push(b ...pullBatch) {
-	q.mu.Lock()
-	q.items = append(q.items, b...)
-	q.mu.Unlock()
-	q.cond.Broadcast()
-}
-
-func (q *batchQueue) close() {
-	q.mu.Lock()
-	q.closed = true
-	q.mu.Unlock()
-	q.cond.Broadcast()
-}
-
-// pop waits for a batch; ok is false once the queue is closed and empty.
-func (q *batchQueue) pop() (pullBatch, bool) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	for len(q.items) == 0 && !q.closed {
-		q.cond.Wait()
-	}
-	if len(q.items) == 0 {
-		return pullBatch{}, false
-	}
-	b := q.items[0]
-	q.items = q.items[1:]
-	return b, true
-}
-
 // runPhoneTar copies a phone plan with the tar lane for small files and the
 // pull lane (one worker while tar runs, two after) for everything else.
 func runPhoneTar(ctx context.Context, p *Plan, opt Options, st *state, lane phoneLane) error {
@@ -223,7 +178,7 @@ func runPhoneTar(ctx context.Context, p *Plan, opt Options, st *state, lane phon
 		}
 	}
 
-	queue := newBatchQueue()
+	queue := newWorkQueue[pullBatch]()
 	queue.push(makeBatchesFor(pullItems)...)
 	for _, b := range makeBatchesFor(compressItems) {
 		b.compress = lane.compress
@@ -287,7 +242,7 @@ dispatch:
 
 // copyTarChunk streams one chunk, retries a broken stream once with tar,
 // and hands what still didn't arrive to the pull lane.
-func copyTarChunk(ctx context.Context, p *Plan, c tarChunk, buf []byte, opt Options, st *state, queue *batchQueue) {
+func copyTarChunk(ctx context.Context, p *Plan, c tarChunk, buf []byte, opt Options, st *state, queue *workQueue[pullBatch]) {
 	done := map[*Item]bool{}
 	var streamErr error
 	for attempt := 0; attempt < tarAttempts; attempt++ {
