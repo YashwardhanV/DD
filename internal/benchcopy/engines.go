@@ -122,9 +122,11 @@ func (d DriveDex) Available() error {
 	return nil
 }
 
-// Args is the command line used.
+// Args is the command line used. The destination is a NEW folder inside the
+// run's folder, as for a first copy to a fresh place (so switches that only
+// apply to brand-new destinations, like --experimental-direct, are measured).
 func (d DriveDex) Args(src, dst string) []string {
-	args := []string{"copy", src, dst, "--no-color"}
+	args := []string{"copy", src, filepath.Join(dst, "copy"), "--no-color"}
 	if d.V1 {
 		args = append(args, "--v1")
 	}

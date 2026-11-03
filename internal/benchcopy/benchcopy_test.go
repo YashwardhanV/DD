@@ -221,7 +221,7 @@ func TestEnginesUseTheirRunner(t *testing.T) {
 	}
 	r.code = 0
 	d := DriveDex{Run: r, Exe: "drivedex.exe", V1: true}
-	if err := d.Copy(context.Background(), "s", "d"); err != nil || d.Name() != "drivedex-v1" || !strings.Contains(strings.Join(r.got, " "), "copy s d --no-color --v1") {
+	if err := d.Copy(context.Background(), "s", "d"); err != nil || d.Name() != "drivedex-v1" || !strings.Contains(strings.Join(r.got, " "), "copy s "+filepath.Join("d", "copy")+" --no-color --v1") {
 		t.Errorf("drivedex-v1: %v %q", err, r.got)
 	}
 	r.out = "noise\nDONE 1234\n"
