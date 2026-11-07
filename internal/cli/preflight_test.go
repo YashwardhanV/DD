@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/yashwardhanv/dd/internal/preflight"
 )
 
 // runIn2 is run with an answer on stdin, keeping stdout and stderr apart.
@@ -25,9 +27,13 @@ func runIn2(t *testing.T, in string, args ...string) (stdout, stderr string, err
 }
 
 // deepTree makes a source whose files' paths are longer than Explorer can open
-// once copied (a warning DriveDex can't fix by itself).
+// once copied (a warning DriveDex can't fix by itself). The warning is
+// turned on even off Windows, where Explorer's limit doesn't apply.
 func deepTree(t *testing.T) string {
 	t.Helper()
+	old := preflight.CheckLongPaths
+	preflight.CheckLongPaths = true
+	t.Cleanup(func() { preflight.CheckLongPaths = old })
 	t.Setenv("DRIVEDEX_INDEX_DIR", t.TempDir())
 	src := t.TempDir()
 	deep := filepath.Join(src, strings.Repeat("d", 120), strings.Repeat("e", 120))

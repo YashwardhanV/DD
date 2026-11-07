@@ -2,7 +2,11 @@
 
 package ui
 
-import "os"
+import (
+	"os"
+
+	"github.com/mattn/go-isatty"
+)
 
 // ansiSupported: every non-Windows terminal we care about understands ANSI.
 var ansiSupported = true
@@ -15,5 +19,6 @@ func termWidth() int {
 	return envWidth(os.Getenv("COLUMNS"))
 }
 
-// isConsole: on Unix a character device on stdin is a terminal.
-func isConsole(*os.File) bool { return true }
+// isConsole: a real terminal, not just any character device (/dev/null is
+// one too, and is what scripts and services often get as stdin).
+func isConsole(f *os.File) bool { return isatty.IsTerminal(f.Fd()) }
