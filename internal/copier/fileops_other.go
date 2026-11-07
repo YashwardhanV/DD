@@ -28,3 +28,6 @@ func unbufferedOpen(name string) (*os.File, error) { return os.Open(name) }
 
 // platformFirstLCN is unknown off Windows.
 func platformFirstLCN(string) (int64, bool) { return 0, false }
+
+// platformFileID is unknown off Windows.
+func platformFileID(*os.File) uint64 { return 0 }

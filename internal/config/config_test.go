@@ -28,6 +28,7 @@ func TestDefaultsMatchTheSpec(t *testing.T) {
 		DefaultLimit: 50, ShowHidden: true, Workers: "auto",
 		SkipDirs: []string{"System Volume Information", "$RECYCLE.BIN", "$Recycle.Bin"}, SkipDirsExtra: []string{},
 		StaleAfter: "24h", Notifications: true, AutoIndex: []string{}, AdbPath: "", PhoneRoot: "/sdcard/", Color: "auto",
+		KeepReplaced: true, TrashKeep: "30d",
 	}
 	if !reflect.DeepEqual(d, want) {
 		t.Errorf("defaults = %+v", d)
@@ -214,5 +215,20 @@ func TestHugeStaleAfterMeansNeverStale(t *testing.T) {
 		if err != nil || d < 100*365*24*time.Hour {
 			t.Errorf("stale_after %q = %v, %v; want a huge positive duration", s, d, err)
 		}
+	}
+}
+
+func TestTrashKeep(t *testing.T) {
+	for in, want := range map[string]time.Duration{"30d": 720 * time.Hour, "2w": 336 * time.Hour, "": 0, "12h": 12 * time.Hour} {
+		c := Defaults()
+		c.TrashKeep = in
+		if got, err := c.TrashKeepDuration(); err != nil || got != want {
+			t.Errorf("%q: %v, %v", in, got, err)
+		}
+	}
+	c := Defaults()
+	c.TrashKeep = "-3d"
+	if c.Validate() == nil {
+		t.Error("a negative trash_keep must be refused")
 	}
 }

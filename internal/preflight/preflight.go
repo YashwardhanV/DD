@@ -150,6 +150,9 @@ type Options struct {
 	// SyncRemovals is how many files a sync will move to the trash (they
 	// keep using space there, so pre-flight counts them).
 	TrashBytes int64
+	// Extra are issues the caller found itself (the copy manifest, sync
+	// guards); they are reported, and block, like the others.
+	Extra []Issue
 }
 
 // SlowPort is one drive on a USB link slower than it could be.
@@ -177,6 +180,9 @@ func Run(p *copier.Plan, opt Options) Report {
 	nr := p.FixNames(opt.Names)
 	rep.Renames = nr.Renames
 	namesIssues(nr, opt.Names, add)
+	for _, is := range opt.Extra {
+		add(is)
+	}
 
 	counts := p.Counts()
 	writing := counts.Copy + counts.Overwrite

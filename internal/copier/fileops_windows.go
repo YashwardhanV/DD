@@ -133,3 +133,14 @@ func platformFirstLCN(path string) (int64, bool) {
 	lcn := int64(binary.LittleEndian.Uint64(out[24:]))
 	return lcn, lcn >= 0
 }
+
+// platformFileID is the NTFS file reference number of an open file (the
+// FileIndex of GetFileInformationByHandle), 0 if unknown. It is the same
+// number the change journal and the saved index use for the file.
+func platformFileID(f *os.File) uint64 {
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &info); err != nil {
+		return 0
+	}
+	return uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow)
+}

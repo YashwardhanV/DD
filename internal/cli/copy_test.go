@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/yashwardhanv/dd/internal/copier"
+	"github.com/yashwardhanv/dd/internal/manifest"
 	"github.com/yashwardhanv/dd/internal/phone"
 	"github.com/yashwardhanv/dd/internal/phone/phonetest"
 )
@@ -30,6 +31,9 @@ func countFilesUnder(t *testing.T, root string) int {
 	t.Helper()
 	n := 0
 	filepath.WalkDir(root, func(_ string, d os.DirEntry, _ error) error {
+		if d != nil && d.IsDir() && d.Name() == manifest.DirName {
+			return filepath.SkipDir // DriveDex's own bookkeeping, not a copied file
+		}
 		if d != nil && !d.IsDir() {
 			n++
 		}

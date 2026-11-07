@@ -25,6 +25,7 @@
 | 13 | Correctness groundwork (design doc P0) | Exact times, changed-while-copying detection, FAT-aware comparison, `--verify` that reads the drive back | File-system time resolution, FlushFileBuffers, unbuffered I/O |
 | 14 | Pre-flight (design doc P1) | Every problem shown before a byte is written; names fixed; real space; time estimate | Allocation units, Windows name rules, a cost model |
 | 15 | Plan from the saved index (design doc P2) | `copy` plans from the NTFS index in well under a second when the journal proves it current | Folder enumeration by file ID, journal freshness proof, CSR trees |
+| 16 | Copy manifest, compare modes and sync (design doc P3) | `sync` keeps a mirror that follows moves and can never lose a file; `--compare journal/checksum` catch edits size-and-time miss | CRC-framed append-only logs, crash recovery, ownership rules |
 
 Stages 1–7 are the core tool. Stages 8–12 make it easy to use.
 
@@ -1723,6 +1724,41 @@ The owner should be able to explain the project in an interview after reading th
 - [ ] Hardware: USB NTFS drive, change a file, plan from index, confirm the change is picked up; disk order on a USB HDD (PROGRESS.md).
 
 **Commit:** `stage 15: plan from the saved index (P2)`
+
+---
+
+---
+
+## Stage 16 — Copy manifest, compare modes and sync (design doc P3)
+
+**Goal:** make "copy only what changed" trustworthy beyond size and time, recognise moved files, and add a mirror mode that can never lose data irrecoverably.
+
+### Files
+- `internal/manifest/` (new): `Record`, `Manifest` (keyed by destination path), `Encode`/`Decode` (`manifest.ddm`), the journal (`frame`, `ReplayJournal`), `Store` (`Open` = lock + load + replay + compact, `Put`, `Delete`, `Refresh`, `Close`, `Abandon`), `Read` (read-only), `lock_windows.go` (share-none `CreateFile`), `lock_other.go` (flock).
+- `internal/trash/` (new): `Run` (`Begin`, `Move`, `Close` → `run.json`), `List`, `Restore`, `Empty`, `ParseAge`.
+- `internal/copier/compare.go` (new): `--compare` modes, `JournalView`, `Plan.Compare` → `CompareReport`. `sync.go` (new): `PlanSync`, `SyncPlan` (moves, removals, adopt, mass-delete), `ApplyMoves`, `ApplyRemovals`. `plan.go`: `Item.Dst`, `Item.Why`, `Changed`, `DstModified`, `MoveFrom`, `Plan.Top`, `Plan.UnlistedDirs`; `.drivedex` folders are never copied. `copy.go`/`copyfile.go`/`phone.go`: `Options.Trash` (old version to the trash before the new one is renamed in) and `Options.Record` (after the file is in place and verified); the NTFS file ID is read from the open handle.
+- `internal/ntfs/device.go`: `ChangesSince` (every file reference number the journal mentions after a USN). `internal/scan`: `Stats.FailedDirs`.
+- `internal/cli/book.go` (new): the run's manifest + trash (`openBook` reads; `lock` takes it only when the run goes ahead), journal bookmark taken before listing (`startJournal`), records, adoption. `sync.go` (new): `drivedex sync`. `trashcmd.go` (new): `drivedex trash list|restore|empty`. `copyrun.go`: `finishPlan` serves copy and sync. Config: `keep_replaced` (true), `trash_keep` ("30d").
+
+### Spec (as built)
+- **`<dst>\.drivedex\`** (Hidden + System): `manifest.ddm` = `DDM1`, uint32 header length, JSON header `{format_version, written_by, dst_fs, record_count, dir_count}`, a gzip stream (interned source IDs, the folder table, records as folder index + name + fields), CRC-32C of the decompressed stream. `manifest.journal` = frames of uvarint length, payload (put or delete), CRC-32C. `lock` is held (no sharing) for the whole run; Windows releases it when the process dies.
+- **Record:** destination path, `SrcID` (`vol-…`, `adb-…`, `dir-…`), `SrcRel` when the name was changed, `SrcFileID`, source size/time at copy time, destination size/time after the copy (read back, so FAT's rounding is what is recorded), XXH3-128, `SrcUSN` + `JournalID`, `CopiedAt`, flags (VerifiedMedia, Sanitised, CaseRenamed, Adopted). A record is appended only after the file is in place (and verified); the journal is flushed every 500 records or 2 s and at the end; the next run replays a leftover journal up to its first bad frame and compacts it.
+- **Nothing is written before pre-flight passes:** the manifest is read first, and `<dst>\.drivedex` is created only when the run goes ahead. A dry run reads only. `--no-manifest` turns it off.
+- **`--compare`:** `fast` = size + `SameTime` (DST hour tolerated); `strict` = no DST tolerance; `journal` = the record exists for this source with the same journal ID, the destination still has the recorded size and time, and the source's reference number has no journal entry after `SrcUSN` (an entry → copied again even if size and time match); `checksum` = fresh source hash vs the destination's (from the record when the destination is unchanged since, otherwise read). `auto` (default) = journal where its preconditions hold, fast elsewhere. Journal and strict can only make a copy copy MORE (INV-1).
+- **Journal bookmark:** the journal's NextUsn is read *before* the source is listed and stored as `SrcUSN` for every file copied or confirmed; any later change shows in the journal. Journal-confirmed files get the new bookmark (in memory, saved at close) so the journal never has to reach back further than the last run.
+- **Report:** `12,031 unchanged (journal), 220 unchanged (size and time), 31 changed, 4 replaced because the copy on D: had been modified`.
+- **Moves.** Copy: counted only (`86 files were moved in the source since last time … Use 'drivedex sync' to mirror moves.`). Sync: a vanished record and a new file pair by NTFS file ID, else by name + size + `SameTime`, unique one-to-one pairs only (and by hash with `--compare checksum`); paired files are renamed on the destination. The journal bookmark of a moved file is kept, so journal comparison looks at it again next time.
+- **`drivedex sync <src> <dst>`:** `dst\<folder name>` mirrors `src`, planned with `overwrite`. (1) only files recorded as placed by DriveDex for this source are ever removed; (2) an existing folder with no records → adopt: copy and record, delete nothing; (3) a source with no files is refused; nothing under a source folder that couldn't be listed is removed; (4) more than 50 % of the mirrored files or more than 1,000 → Block `mass-delete` unless `--allow-mass-delete`; (5) moves, then copies, then removals (skipped if the copy was stopped); (6) interactive runs ask `Go ahead?` before removing or replacing; a run that can't ask needs `--yes`; (7) removed and replaced files go to the trash, never deleted. `--detect-moves auto|off`, `--dry-run`, `--json` (`moved`, `removed`, `trashed`, `trash_run`, `compare`).
+- **Trash:** `<dst>\.drivedex\trash\<YYYYMMDD-HHMMSS>\<path>` filled by rename, `run.json` describes it (a run that crashed before writing it is still listed, reason "unknown"). Also used by `copy` for replaced files (`keep_replaced = true`). `trash_keep = "30d"` purges older runs at the start of each copy or sync to that destination, after one line of notice. `trash restore` never overwrites without asking (the file in the way goes to a new trash run); `trash empty` asks, or needs `--yes`.
+
+### Acceptance
+- [x] Manifest round trip and corruption detection (`TestManifestRoundTrip`), fuzzed reader (`FuzzDecode`, `FuzzReplayJournal`; 3.5 M executions, no crash), torn tail cut at every byte offset of the last frame (`TestJournalReplayStopsAtTornTail`), recovery after a crash (`TestStoreRecoversAfterACrash`), exclusive lock (`TestStoreIsExclusive`).
+- [x] Journal mode through the fake NTFS: an edit with its old time put back is copied again, the untouched file is skipped as "unchanged (journal)" (`TestINV1_CompareJournalCatchesAnEditThatKeptItsTime`, `TestINV1_JournalCatchesAnEditWithTheOldTime`).
+- [x] Sync: adopt deletes nothing, empty source refused, mass-delete guard blocks, removals go to the trash, restore brings them back, moves are renames (`TestSyncMirrorsMovesAndRemovesToTheTrash`, `TestSyncAdoptModeDeletesNothing`, `TestSyncRefusesAnEmptySource`, `TestSyncMassDeleteGuard`, `TestSyncNeedsYesWhenItCantAsk`, copier-level `TestSync*`).
+- [x] Crash test: 12 random runs stopped during the copies or the removals with the manifest unflushed; the re-run is an exact mirror and every earlier file is in the mirror or the trash (`TestINV3_CrashedSyncConvergesAndLosesNothing`).
+- [ ] Hardware: a sync to a USB pen drive unplugged mid-run, then re-run (PROGRESS.md).
+
+**Commit:** `stage 16: copy manifest, compare modes and sync (P3)`
 
 ---
 

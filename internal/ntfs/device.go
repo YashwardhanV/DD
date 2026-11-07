@@ -217,3 +217,27 @@ func Refresh(ctx context.Context, s *Session, ix *index.Index) (RefreshResult, e
 	h.NextUsn = next
 	return RefreshResult{Changes: ap.Changes(), Records: ap.Records, Touched: ap.Touched()}, nil
 }
+
+// ChangesSince reads the change journal from usn to now and returns every
+// file reference number it mentions (created, written, renamed, deleted,
+// attributes changed...), with the journal's state. It is how copy
+// --compare journal knows a file was edited even if its time was put back.
+//
+// ErrJournalEntryDeleted means the journal no longer reaches back to usn.
+func ChangesSince(ctx context.Context, s *Session, journalID uint64, usn int64) (JournalData, map[uint64]bool, error) {
+	jd, err := QueryJournal(s.Dev)
+	if err != nil {
+		return jd, nil, err
+	}
+	if jd.ID != journalID || usn < jd.FirstUsn || usn < jd.LowestValidUsn {
+		return jd, nil, ErrJournalEntryDeleted
+	}
+	touched := map[uint64]bool{}
+	if usn >= jd.NextUsn {
+		return jd, touched, nil
+	}
+	if _, err := ReadJournal(ctx, s.Dev, jd.ID, usn, func(r Record) { touched[r.FRN] = true }); err != nil {
+		return jd, nil, err
+	}
+	return jd, touched, nil
+}

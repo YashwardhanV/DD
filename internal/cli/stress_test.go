@@ -65,6 +65,9 @@ func TestSearchCopyToKeepsSameLabelSourcesApart(t *testing.T) {
 	}
 	var found []string
 	filepath.Walk(dst, func(p string, info os.FileInfo, err error) error {
+		if err == nil && info.IsDir() && info.Name() == ".drivedex" {
+			return filepath.SkipDir
+		}
 		if err == nil && !info.IsDir() {
 			b, _ := os.ReadFile(p)
 			found = append(found, string(b))

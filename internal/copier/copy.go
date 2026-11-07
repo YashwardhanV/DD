@@ -120,7 +120,24 @@ type Options struct {
 	// unplugged (resume restarts unfinished files) and more fragmentation on
 	// the destination. 0 = big files share all workers (the old behaviour).
 	BigLanes int
+	// Trash, when set, receives the old version of every file an Overwrite
+	// replaces (moved there just before the new one is renamed in), instead
+	// of it being lost (keep_replaced, INV-3).
+	Trash Trasher
+	// Record, when set, is called for each file once it is in place (and
+	// verified, when verifying), from several goroutines at once. The item's
+	// Dst then describes the copy, and Hash its content when hashing.
+	Record func(it *Item)
 }
+
+// Trasher moves a destination file (relative to the plan's DstRoot) to the
+// trash. *trash.Run is one.
+type Trasher interface {
+	Move(rel, why string) error
+}
+
+// TrashReplaced is the reason given to the Trasher for an overwritten file.
+const TrashReplaced = "replaced"
 
 // BigFileSize is where BigLanes starts to apply.
 const BigFileSize = 32 << 20

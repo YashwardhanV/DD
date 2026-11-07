@@ -36,6 +36,10 @@ type Stats struct {
 	// FirstErrors holds up to 20 "path: reason" strings so the user can see
 	// *why* some folders were skipped without drowning in output.
 	FirstErrors []string
+	// FailedDirs are the folders (relative to the root, OS separators) that
+	// could not be listed completely. A sync never removes anything under
+	// them: their files may still exist.
+	FailedDirs []string
 }
 
 // Entries is the number of files plus folders.

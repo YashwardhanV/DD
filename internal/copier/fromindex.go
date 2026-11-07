@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/yashwardhanv/dd/internal/fsinfo"
 	"github.com/yashwardhanv/dd/internal/index"
@@ -126,6 +127,8 @@ func PlanFromIndex(ctx context.Context, ix *index.Index, folderID uint64, srcAbs
 				// A link or junction (a junction is a folder with a reparse
 				// point): never followed or copied, as PlanLocal does.
 				links++
+			case fl&index.FlagDir != 0 && strings.EqualFold(ix.Names[s], ManifestDirName):
+				// DriveDex's own manifest folder: skipped, as PlanLocal does.
 			case fl&index.FlagDir != 0:
 				dirs = append(dirs, name+sep+rel)
 				stack = append(stack, frame{id: ix.IDs[s], rel: rel})
@@ -143,7 +146,7 @@ func PlanFromIndex(ctx context.Context, ix *index.Index, folderID uint64, srcAbs
 		}
 	}
 	p := finalize(dstRoot, dirs, jobs, policy, workers, fsinfo.OrDefault(srcAbs))
-	p.LinksSkipped = links
+	p.LinksSkipped, p.Top = links, name
 	p.FromIndex = true
 	return p, nil
 }

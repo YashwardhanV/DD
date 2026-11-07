@@ -183,6 +183,9 @@ func (p *Parallel) Scan(ctx context.Context, b *index.Builder, report func(Progr
 				return
 			}
 			noteError(job.abs, err)
+			errMu.Lock()
+			p.stats.FailedDirs = append(p.stats.FailedDirs, job.rel)
+			errMu.Unlock()
 			// fall through: entries read before the error are still useful
 		}
 

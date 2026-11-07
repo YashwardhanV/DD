@@ -27,6 +27,7 @@ import (
 
 	"github.com/yashwardhanv/dd/internal/fsinfo"
 	"github.com/yashwardhanv/dd/internal/index"
+	"github.com/yashwardhanv/dd/internal/manifest"
 	"github.com/yashwardhanv/dd/internal/scan"
 )
 
@@ -101,10 +102,48 @@ func (j Job) MTimeNs() int64 {
 	return j.ModTime * 1e9
 }
 
+// DstState is what the destination held for an item when it was planned
+// (and, after a copy, what the copy looks like).
+type DstState struct {
+	Exists, IsDir bool
+	Size, MTimeNs int64
+}
+
+func dstStateOf(fi os.FileInfo) DstState {
+	if fi == nil {
+		return DstState{}
+	}
+	return DstState{Exists: true, IsDir: fi.IsDir(), Size: fi.Size(), MTimeNs: fi.ModTime().UnixNano()}
+}
+
+// SkipWhy says why a file was found up to date (for the report).
+type SkipWhy uint8
+
+const (
+	WhyNone     SkipWhy = iota
+	WhySizeTime         // same size and time (fast / strict)
+	WhyJournal          // the manifest and the NTFS change journal prove it unchanged
+	WhyChecksum         // same content hash
+	WhyMoved            // sync: moved on the destination to follow a source move
+)
+
 // Item is a Job plus what the plan decided about it.
 type Item struct {
 	Job
 	Decision Decision
+	// Dst is the destination as found when planning.
+	Dst DstState
+	// Why says which comparison found it up to date (skipped items).
+	Why SkipWhy
+	// Changed: size and time looked the same, but the comparison mode found
+	// different content (checksum) or a change in the journal (journal).
+	Changed bool
+	// DstModified: the destination copy is not what DriveDex wrote there
+	// (it differs from its manifest record): something else changed it.
+	DstModified bool
+	// MoveFrom (sync): the file is already on the destination at this other
+	// path, from before the source moved it; it is renamed instead of copied.
+	MoveFrom string
 	// Blocked is set when the destination exists but can't be replaced (it is a folder).
 	Blocked string
 	// DSTShift: the destination differs by exactly one hour on a drive that
@@ -148,6 +187,12 @@ type Plan struct {
 	NamesFixed bool
 	// FromIndex: planned from a saved index (PlanFromIndex), not a listing.
 	FromIndex bool
+	// Top is the folder the source becomes inside DstRoot (the source
+	// folder's own name), "" when single files are copied.
+	Top string
+	// UnlistedDirs are source folders (destination-relative, like Rel) that
+	// could not be listed completely. A sync removes nothing under them.
+	UnlistedDirs []string
 
 	// dstNames caches the destination folders read while deciding (one
 	// directory read per folder), for FixNames.
@@ -222,6 +267,12 @@ type decision struct {
 // (fsinfo.SameTime), not a fixed 2 seconds: NTFS to NTFS needs no slack at
 // all, so an edit within the same second is not missed (INV-1).
 func decide(policy string, j Job, dst os.FileInfo, srcFS, dstFS fsinfo.Info) decision {
+	return decideWith(policy, j, dst, srcFS, dstFS, true)
+}
+
+// decideWith is decide; allowShift=false is --compare strict: a daylight-
+// saving hour is a difference like any other.
+func decideWith(policy string, j Job, dst os.FileInfo, srcFS, dstFS fsinfo.Info, allowShift bool) decision {
 	if dst == nil {
 		return decision{d: Copy}
 	}
@@ -234,7 +285,7 @@ func decide(policy string, j Job, dst os.FileInfo, srcFS, dstFS fsinfo.Info) dec
 		if same {
 			return decision{d: SkipSame}
 		}
-		if shift {
+		if shift && allowShift {
 			return decision{d: SkipSame, shift: true}
 		}
 	}
@@ -284,6 +335,10 @@ func finalize(dstRoot string, dirs []string, jobs []Job, policy string, workers 
 		st := listing.lookup(j.Rel)
 		dec := decide(policy, j, st, srcFS, dstFS)
 		items[i].Decision, items[i].Blocked, items[i].DSTShift = dec.d, dec.blocked, dec.shift
+		items[i].Dst = dstStateOf(st)
+		if dec.d == SkipSame {
+			items[i].Why = WhySizeTime
+		}
 	})
 	sort.Strings(dirs)
 	p := &Plan{DstRoot: dstRoot, Dirs: dirs, Items: items, OnConflict: policy, SrcFS: srcFS, DstFS: dstFS, dstNames: listing.names}
@@ -553,6 +608,9 @@ func PlanLocal(ctx context.Context, src, dstRoot, policy string, workers int) (*
 
 	name := srcName(src)
 	sc := scan.NewParallel(src, workers)
+	// A copy manifest folder in the source (it was once a destination) is
+	// DriveDex's own bookkeeping, not data: never copied.
+	sc.SkipDirs = append(append([]string(nil), scan.DefaultSkipDirs...), ManifestDirName)
 	b := index.NewBuilder(index.Header{})
 	if err := sc.Scan(ctx, b, nil); err != nil {
 		return nil, fmt.Errorf("listing %s: %w", src, err)
@@ -583,9 +641,16 @@ func PlanLocal(ctx context.Context, src, dstRoot, policy string, workers int) (*
 		})
 	}
 	p := finalize(dstRoot, dirs, jobs, policy, workers, srcFS)
-	p.LinksSkipped = links
+	p.LinksSkipped, p.Top = links, name
+	for _, d := range sc.Stats().FailedDirs {
+		p.UnlistedDirs = append(p.UnlistedDirs, filepath.Join(name, d))
+	}
 	return p, nil
 }
+
+// ManifestDirName is the copy manifest's folder (manifest.DirName), skipped
+// in every source.
+const ManifestDirName = manifest.DirName
 
 // ErrDestinationInsideSource means a folder would be copied into itself (or
 // one of its own sub-folders). Explorer refuses that too: every run would copy

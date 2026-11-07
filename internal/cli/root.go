@@ -138,6 +138,8 @@ saved index instantly - even for drives that are not plugged in.`,
 	root.AddCommand(newBenchScanCmd())
 	root.AddCommand(newJournalCmd())
 	root.AddCommand(newCopyCmd())
+	root.AddCommand(newSyncCmd())
+	root.AddCommand(newTrashCmd())
 	root.AddCommand(newTUICmd())
 	root.AddCommand(newAgentCmd())
 	root.AddCommand(newStartupCmd())

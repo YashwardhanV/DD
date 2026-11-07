@@ -351,6 +351,10 @@ func (p *Plan) FixNames(opt NameOptions) NameReport {
 		}
 		dec := decide(p.OnConflict, it.Job, st, p.SrcFS, p.DstFS)
 		it.Decision, it.Blocked, it.DSTShift = dec.d, dec.blocked, dec.shift
+		it.Dst, it.Why = dstStateOf(st), WhyNone
+		if dec.d == SkipSame {
+			it.Why = WhySizeTime
+		}
 	}
 	p.countNewDirs()
 	return rep

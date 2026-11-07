@@ -23,8 +23,8 @@ var copyChecks = copier.DefaultChecks
 
 // newCopyCmd implements `drivedex copy <src> <dst>`.
 func newCopyCmd() *cobra.Command {
-	var workers, onConflict, verify, onCase, onBad, sourceList, readOrder string
-	var dryRun, yes, asJSON, verbose, caseSensitive bool
+	var workers, onConflict, verify, onCase, onBad, sourceList, readOrder, compare string
+	var dryRun, yes, asJSON, verbose, caseSensitive, noManifest bool
 
 	cmd := &cobra.Command{
 		Use:   "copy <src> <dst>",
@@ -57,13 +57,8 @@ for speed, DriveDex does not force every file to be flushed to the disk.`,
 			if err != nil {
 				return err
 			}
-			switch sourceList {
-			case sourceListAuto, sourceListIndex, sourceListScan:
-			default:
-				return userErr(fmt.Sprintf("--source-list %q isn't valid", sourceList), "use auto, index or scan", nil)
-			}
-			if !copier.ValidReadOrder(readOrder) {
-				return userErr(fmt.Sprintf("--read-order %q isn't valid", readOrder), "use auto, disk or size", nil)
+			if err := checkCopyModes(sourceList, readOrder, compare); err != nil {
+				return err
 			}
 			stdout := cmd.OutOrStdout()
 			human := stdout
@@ -74,17 +69,10 @@ for speed, DriveDex does not force every file to be flushed to the disk.`,
 			err = runCopy(cmd.Context(), human, args[0], args[1], copyFlags{
 				workers: effectiveWorkers(cmd, workers), onConflict: onConflict, verify: mode, dryRun: dryRun,
 				names: names, yes: yes, verbose: verbose, in: cmd.InOrStdin(), json: js,
-				sourceList: sourceList, readOrder: readOrder, human: human,
+				sourceList: sourceList, readOrder: readOrder, human: human, compare: compare, noManifest: noManifest,
 			})
 			if asJSON {
-				if err != nil && js.Error == "" {
-					js.Error, js.ExitCode = err.Error(), 1
-					var ue *UserError
-					if errors.As(err, &ue) && ue.Code != 0 {
-						js.ExitCode = ue.Code
-					}
-				}
-				printJSON(stdout, js)
+				finishJSON(stdout, js, err)
 			}
 			return err
 		},
@@ -95,6 +83,7 @@ for speed, DriveDex does not force every file to be flushed to the disk.`,
 	cmd.Flags().Lookup("verify").NoOptDefVal = "media"
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "show what would be copied, skipped or overwritten, without writing anything")
 	addNameFlags(cmd, &onCase, &onBad, &caseSensitive)
+	addCompareFlags(cmd, &compare, &noManifest)
 	cmd.Flags().StringVar(&sourceList, "source-list", sourceListAuto, "where the list of files to copy comes from: auto (the saved index of an NTFS drive when the change journal proves it is current - needs Administrator - otherwise a fresh listing), index (fail if it can't be used), or scan (always list the source)")
 	cmd.Flags().StringVar(&readOrder, "read-order", copier.ReadOrderAuto, "order of small files: size (biggest first), disk (where they lie on the disk; experimental, for USB hard disks), or auto (= size for now)")
 	cmd.Flags().BoolVar(&yes, "yes", false, "continue past pre-flight warnings without asking")
@@ -139,6 +128,9 @@ type copyFlags struct {
 	sourceList          string
 	readOrder           string
 	human               io.Writer // where messages go (stdout, or stderr with --json)
+	compare             string    // --compare
+	noManifest          bool      // --no-manifest
+	sync                *syncRun  // set by 'drivedex sync'
 }
 
 // phoneSpec is a parsed "phone:..." copy source.
@@ -193,6 +185,8 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 	var srcDev preflight.Device
 	plannedFrom := "scan"
 	srcRoot := "" // the local source, for the USB speed check ("" for a phone)
+	var srcID string
+	var jstart *journalStart
 	spec, isPhone, err := parsePhoneSource(srcArg)
 	if err != nil {
 		return err
@@ -217,6 +211,7 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 			why = autoWhy(workers)
 		}
 		srcDev = preflight.Device{Label: dev.Name(), ID: phone.SourceID(dev.Serial), Class: preflight.ClassPhone}
+		srcID = phone.SourceID(dev.Serial)
 		plannedFrom = "phone"
 		remote := copier.PhonePathRoot(spec.path, activePhoneRoot())
 		status.Update("Reading the file list from " + dev.Name() + " …")
@@ -247,6 +242,10 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 			workers = copier.AutoWorkers(srcPenalty, srcKnown, dstPenalty, dstKnown)
 			why = autoWhy(workers)
 		}
+		srcID = srcIDFor(src)
+		if f.compare != copier.CompareFast && f.compare != copier.CompareStrict && !f.noManifest {
+			jstart = startJournal(src) // before listing: every later change shows in the journal
+		}
 		status.Update("Reading the file list from " + src + " …")
 		out.Flush()
 		plan, plannedFrom, err = planLocalSource(ctx, out, src, dst, f, workers)
@@ -264,6 +263,7 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 		workers: workers, why: why, verify: f.verify, dryRun: f.dryRun, dstArg: dstArg, srcArg: srcArg, srcRoot: srcRoot,
 		names: f.names, yes: f.yes, verbose: f.verbose, in: f.in, json: f.json,
 		srcDev: srcDev, plannedFrom: plannedFrom, readOrder: f.readOrder,
+		compare: f.compare, noManifest: f.noManifest, srcID: srcID, jstart: jstart, sync: f.sync,
 	})
 }
 

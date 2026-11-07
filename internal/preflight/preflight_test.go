@@ -161,11 +161,11 @@ func TestPhoneFixtureCopiesEveryFileAndReportsRenames(t *testing.T) {
 	}
 	// "A.jpg" sorts before "a.jpg", so it keeps its name.
 	want := map[string]string{
-		"A.jpg":            "UPPER",
-		"a (case 2).jpg":   "lower",
-		"notes：1.txt": "notes",
-		"CON_.txt":         "con",
-		"trailing_":        "dot",
+		"A.jpg":          "UPPER",
+		"a (case 2).jpg": "lower",
+		"notes：1.txt":    "notes",
+		"CON_.txt":       "con",
+		"trailing_":      "dot",
 	}
 	for name, content := range want {
 		b, err := os.ReadFile(filepath.Join(dst, "Stuff", name))

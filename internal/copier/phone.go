@@ -104,7 +104,7 @@ func PlanPhone(ctx context.Context, adb *phone.ADB, serial, remote, dstRoot, pol
 		})
 	}
 	plan := finalize(dstRoot, dirs, jobs, policy, workers, fsinfo.ForPhone())
-	plan.Phone = src
+	plan.Phone, plan.Top = src, name
 	return plan, nil
 }
 
@@ -292,6 +292,15 @@ func pullAndPlace(ctx context.Context, p *Plan, files []*Item, opt Options, st *
 		os.Chtimes(staged, t, t) // keep the phone's modification time (so a re-run sees "same")
 		final := filepath.Join(p.DstRoot, it.Rel)
 		os.MkdirAll(filepath.Dir(final), 0o755)
+		if opt.Trash != nil && it.Decision == Overwrite {
+			if _, serr := os.Lstat(final); serr == nil {
+				if terr := opt.Trash.Move(it.Rel, TrashReplaced); terr != nil {
+					failed = append(failed, it)
+					err = fmt.Errorf("keeping the old version of %s: %w", it.Rel, terr)
+					continue
+				}
+			}
+		}
 		if rerr := os.Rename(staged, final); rerr != nil {
 			failed = append(failed, it)
 			err = fmt.Errorf("moving %s into place: %w", it.Rel, rerr)
@@ -311,6 +320,12 @@ func pullAndPlace(ctx context.Context, p *Plan, files []*Item, opt Options, st *
 		if bad[pf.it] {
 			failed = append(failed, pf.it)
 			continue
+		}
+		if opt.Record != nil {
+			if fi, serr := os.Lstat(pf.path); serr == nil {
+				pf.it.Dst = dstStateOf(fi)
+			}
+			opt.Record(pf.it)
 		}
 		st.written.Add(1)
 		st.bytesDone.Add(pf.size)

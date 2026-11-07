@@ -47,6 +47,12 @@ func copyWithRetries(ctx context.Context, dstRoot string, it *Item, buf []byte, 
 		var n int64
 		n, err = copyFile(ctx, it, dst, buf, abuf, opt, st, locked)
 		if err == nil {
+			if opt.Record != nil {
+				if fi, serr := os.Lstat(dst); serr == nil {
+					it.Dst = dstStateOf(fi) // what the copy really got (FAT rounds times)
+				}
+				opt.Record(it)
+			}
 			st.written.Add(1)
 			st.bytesDone.Add(n)
 			st.filesDone.Add(1)
@@ -98,6 +104,9 @@ func copyFile(ctx context.Context, it *Item, dst string, buf, abuf []byte, opt O
 		return 0, fmt.Errorf("opening %s: %w", src, err)
 	}
 	defer in.Close()
+	if it.SrcFileID == 0 {
+		it.SrcFileID = platformFileID(in)
+	}
 
 	part := dst + PartSuffix
 	out, err := os.OpenFile(part, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
@@ -169,6 +178,17 @@ func copyFile(ctx context.Context, it *Item, dst string, buf, abuf []byte, opt O
 		if err := os.Chtimes(part, mtime, mtime); err != nil {
 			os.Remove(part)
 			return 0, fmt.Errorf("setting the time of %s: %w", part, err)
+		}
+	}
+	if opt.Trash != nil && it.Decision == Overwrite {
+		// Keep the old version: into the trash first (a rename on the same
+		// drive), then the new one into its place. If the trash can't take
+		// it, the old file stays and this copy fails (INV-3).
+		if _, serr := os.Lstat(dst); serr == nil {
+			if terr := opt.Trash.Move(it.Rel, TrashReplaced); terr != nil {
+				os.Remove(part)
+				return 0, fmt.Errorf("keeping the old version of %s: %w", it.Rel, terr)
+			}
 		}
 	}
 	if err := os.Rename(part, dst); err != nil {
