@@ -8,6 +8,7 @@ package scan
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"time"
 
@@ -35,6 +36,10 @@ type Stats struct {
 	// FirstErrors holds up to 20 "path: reason" strings so the user can see
 	// *why* some folders were skipped without drowning in output.
 	FirstErrors []string
+	// FailedDirs are the folders (relative to the root, OS separators) that
+	// could not be listed completely. A sync never removes anything under
+	// them: their files may still exist.
+	FailedDirs []string
 }
 
 // Entries is the number of files plus folders.
@@ -51,6 +56,25 @@ const maxRememberedErrors = 20
 // DefaultSkipDirs are Windows system folders that are never worth indexing.
 // Matching is case-insensitive and applies at any depth.
 var DefaultSkipDirs = []string{"System Volume Information", "$RECYCLE.BIN", "$Recycle.Bin"}
+
+// SkipRules is the sorted, lowercase, de-duplicated form of a skip list, as
+// stored in an index header (Header.SkipRules). nil means DefaultSkipDirs.
+func SkipRules(names []string) []string {
+	if names == nil {
+		names = DefaultSkipDirs
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, n := range names {
+		l := strings.ToLower(strings.TrimSpace(n))
+		if l != "" && !seen[l] {
+			seen[l] = true
+			out = append(out, l)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
 
 // skipSet is a case-insensitive set of folder names.
 type skipSet map[string]struct{}

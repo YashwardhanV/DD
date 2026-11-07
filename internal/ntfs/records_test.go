@@ -183,3 +183,23 @@ func TestRecordNumberStripsSequence(t *testing.T) {
 		t.Errorf("got %#x", got)
 	}
 }
+
+// A rename (and the close that follows it) is not a content change; a
+// write, a time put back, a delete or a reason we do not know are.
+func TestMayChangeContent(t *testing.T) {
+	for reason, want := range map[uint32]bool{
+		0x00001000:              false, // RENAME_OLD_NAME
+		0x00002000 | 0x80000000: false, // RENAME_NEW_NAME | CLOSE
+		0x00000800:              false, // SECURITY_CHANGE
+		0x00000001:              true,  // DATA_OVERWRITE
+		0x00000002 | 0x80000000: true,  // DATA_EXTEND | CLOSE
+		0x00008000:              true,  // BASIC_INFO_CHANGE (times)
+		UsnReasonFileDelete:     true,
+		0x00002000 | 0x00000004: true, // renamed and truncated
+		0x01000000:              true, // unknown
+	} {
+		if got := (Record{Reason: reason}).MayChangeContent(); got != want {
+			t.Errorf("reason %#x: %v, want %v", reason, got, want)
+		}
+	}
+}

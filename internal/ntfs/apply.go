@@ -1,6 +1,7 @@
 package ntfs
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/yashwardhanv/dd/internal/index"
@@ -20,6 +21,12 @@ func flagsFromAttrs(attrs uint32) uint8 {
 	}
 	if attrs&AttrSystem != 0 {
 		f |= index.FlagSystem
+	}
+	if attrs&AttrReparse != 0 {
+		// A link (symlink, junction) or another reparse point. The folder
+		// listing that fills sizes and dates refines this with the reparse
+		// tag (deduplicated files are ordinary files).
+		f |= index.FlagReparse
 	}
 	return f
 }
@@ -184,6 +191,17 @@ func NewApplier(ix *index.Index, rootFRN uint64, skipNames []string) *Applier {
 // changed or removed. (One file save writes several journal records; this
 // counts the file once.)
 func (a *Applier) Changes() int { return len(a.touched) }
+
+// Touched lists the IDs of every entry the replay added, changed or removed
+// (sorted). RefreshTouched fills in their sizes and dates.
+func (a *Applier) Touched() []uint64 {
+	ids := make([]uint64, 0, len(a.touched))
+	for id := range a.touched {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
 
 func (a *Applier) remove(frn uint64) {
 	if a.ix.Delete(frn) {

@@ -11,10 +11,10 @@ import (
 	"os"
 )
 
-// The .ddx file format (version 1, little-endian):
+// The .ddx file format (little-endian):
 //
 //	"DDX1"                     magic, 4 bytes
-//	uint16                     format version (1)
+//	uint16                     format version (2; version 1 files still load)
 //	uint32                     H = length of the header JSON
 //	H bytes                    header JSON (UTF-8)
 //	uvarint                    N = number of entries
@@ -23,7 +23,8 @@ import (
 //	    uvarint parent_id
 //	    byte    flags          (never includes FlagDeleted)
 //	    varint  size           (signed)
-//	    varint  mtime          (signed)
+//	    varint  mtime          (signed, unix seconds)
+//	    uvarint nanos          (version 2 only: sub-second part of mtime)
 //	    uvarint name_len
 //	    name bytes (UTF-8)
 //	uint32                     CRC-32 (IEEE) of every preceding byte
@@ -32,7 +33,12 @@ import (
 // small numbers take 1 byte, so the file stays small.
 const (
 	magic         = "DDX1"
-	FormatVersion = 1
+	FormatVersion = 2
+
+	// formatV1 files (written before nanosecond times existed) have no
+	// nanos field. They keep loading forever (INV-8); their times are whole
+	// seconds, which Header.ExactTimes reports.
+	formatV1 = 1
 
 	// minEntryBytes is the smallest an entry can be (id, parent, flags, size,
 	// mtime, name_len each take at least one byte). It lets Read reject an
@@ -86,6 +92,7 @@ func Write(w io.Writer, ix *Index) error {
 		bw.WriteByte(fl)
 		putVarint(ix.Sizes[slot])
 		putVarint(ix.MTimes[slot])
+		putUvarint(uint64(ix.Nanos[slot]))
 		putUvarint(uint64(len(ix.Names[slot])))
 		bw.WriteString(ix.Names[slot])
 	}
@@ -112,8 +119,9 @@ func Read(data []byte) (*Index, error) {
 	if string(data[:4]) != magic {
 		return nil, corrupt("not a DriveDex index (bad magic)")
 	}
-	if v := binary.LittleEndian.Uint16(data[4:6]); v != FormatVersion {
-		return nil, corrupt("unsupported format version %d", v)
+	version := binary.LittleEndian.Uint16(data[4:6])
+	if version != FormatVersion && version != formatV1 {
+		return nil, corrupt("unsupported format version %d", version)
 	}
 	body := data[:len(data)-4]
 	if want, got := binary.LittleEndian.Uint32(data[len(data)-4:]), crc32.ChecksumIEEE(body); want != got {
@@ -141,6 +149,7 @@ func Read(data []byte) (*Index, error) {
 		Names:   make([]string, n),
 		Sizes:   make([]int64, n),
 		MTimes:  make([]int64, n),
+		Nanos:   make([]uint32, n),
 		Flags:   make([]uint8, n),
 	}
 	// One string copy of the whole file; every name is a slice of it. That is
@@ -152,6 +161,13 @@ func Read(data []byte) (*Index, error) {
 		ix.Flags[i] = r.byte() &^ FlagDeleted
 		ix.Sizes[i] = r.varint()
 		ix.MTimes[i] = r.varint()
+		if version >= 2 {
+			ns := r.uvarint()
+			if ns >= 1e9 {
+				r.err = errBadNanos
+			}
+			ix.Nanos[i] = uint32(ns)
+		}
 		nameLen := r.uvarint()
 		if r.err == nil && nameLen > uint64(len(body)-r.off) {
 			r.err = errTruncated
@@ -169,6 +185,9 @@ func Read(data []byte) (*Index, error) {
 	}
 
 	h.EntryCount = int(n)
+	if version == formatV1 {
+		h.MTimeUnit = "" // whole seconds, whatever the header says
+	}
 	ix.Header = h
 	ix.fillLower()
 	ix.rebuildByID()
@@ -220,7 +239,10 @@ func ReadHeaderFile(path string) (Header, error) {
 	return h, nil
 }
 
-var errTruncated = errors.New("file ends in the middle of an entry")
+var (
+	errTruncated = errors.New("file ends in the middle of an entry")
+	errBadNanos  = errors.New("sub-second time out of range")
+)
 
 // reader decodes numbers from a byte slice. After the first problem it stays
 // in the error state and returns zeros, so the parsing loop can stay simple

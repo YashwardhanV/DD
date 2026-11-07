@@ -2,8 +2,10 @@ package copier
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -12,9 +14,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yashwardhanv/dd/internal/fsinfo"
 	"github.com/yashwardhanv/dd/internal/index"
 	"github.com/yashwardhanv/dd/internal/phone"
 	"github.com/yashwardhanv/dd/internal/scan"
+	"github.com/yashwardhanv/dd/internal/winname"
 )
 
 // PhoneSource marks a plan whose files are on an Android phone.
@@ -22,6 +26,11 @@ type PhoneSource struct {
 	ADB    *phone.ADB
 	Serial string
 	Remote string // the folder or file being copied, e.g. "/sdcard/DCIM/Camera"
+	// HashTool is the checksum program found on the phone ("sha256sum",
+	// "sha1sum", "md5sum"; see phone.ADB.HashTool). With --verify, each
+	// pulled batch is hashed ON THE PHONE and compared with the same
+	// algorithm computed on the PC copy. "" = phone copies can't be verified.
+	HashTool string
 }
 
 const (
@@ -62,8 +71,8 @@ func PlanPhone(ctx context.Context, adb *phone.ADB, serial, remote, dstRoot, pol
 	}
 
 	if !info.IsDir {
-		job := Job{Src: remote, Rel: SafeName(path.Base(remote)), Size: info.Size, ModTime: info.ModTime}
-		plan := finalize(dstRoot, nil, []Job{job}, policy, 1)
+		job := Job{Src: remote, Rel: path.Base(remote), Size: info.Size, ModTime: info.ModTime, TimeCoarse: true}
+		plan := finalize(dstRoot, nil, []Job{job}, policy, 1, fsinfo.ForPhone())
 		plan.Phone = src
 		return plan, nil
 	}
@@ -76,26 +85,26 @@ func PlanPhone(ctx context.Context, adb *phone.ADB, serial, remote, dstRoot, pol
 	}
 	ix := b.Index()
 
-	name = SafeName(name)
 	dirs := []string{name}
 	var jobs []Job
 	cache := map[uint64]string{}
 	for slot := 0; slot < ix.Len(); slot++ {
 		relBack := ix.RelPathCached(slot, cache)
-		rel := filepath.Join(name, SafeRel(relBack))
+		rel := filepath.Join(name, toOSRel(relBack))
 		if ix.Flags[slot]&index.FlagDir != 0 {
 			dirs = append(dirs, rel)
 			continue
 		}
 		jobs = append(jobs, Job{
-			Src:     path.Join(remote, strings.ReplaceAll(relBack, `\`, "/")),
-			Rel:     rel,
-			Size:    max(ix.Sizes[slot], 0),
-			ModTime: ix.MTimes[slot],
+			Src:        path.Join(remote, strings.ReplaceAll(relBack, `\`, "/")),
+			Rel:        rel,
+			Size:       max(ix.Sizes[slot], 0),
+			ModTime:    ix.MTimes[slot],
+			TimeCoarse: true, // adb's stat gives whole seconds
 		})
 	}
-	plan := finalize(dstRoot, dirs, jobs, policy, workers)
-	plan.Phone = src
+	plan := finalize(dstRoot, dirs, jobs, policy, workers, fsinfo.ForPhone())
+	plan.Phone, plan.Top = src, name
 	return plan, nil
 }
 
@@ -112,8 +121,8 @@ func makeBatches(p *Plan) []pullBatch {
 		if it.Decision.Skipped() || it.Blocked != "" {
 			continue
 		}
-		if base := path.Base(it.Src); SafeName(base) != base {
-			batches = append(batches, pullBatch{items: []*Item{it}}) // pulled alone, to a safe name
+		if pulledAlone(it) {
+			batches = append(batches, pullBatch{items: []*Item{it}}) // pulled alone, to its new name
 			continue
 		}
 		dir := path.Dir(it.Src)
@@ -222,7 +231,7 @@ func pullBatchInto(ctx context.Context, p *Plan, b pullBatch, opt Options, st *s
 		}
 		var stillPending []*Item
 		for _, files := range group {
-			failed, err := pullAndPlace(ctx, p, files, st)
+			failed, err := pullAndPlace(ctx, p, files, opt, st)
 			if err != nil {
 				lastErr = err
 			}
@@ -244,7 +253,7 @@ func pullBatchInto(ctx context.Context, p *Plan, b pullBatch, opt Options, st *s
 
 // pullAndPlace pulls files into a fresh staging folder and moves each
 // delivered file to its final place. It returns the files that did not arrive.
-func pullAndPlace(ctx context.Context, p *Plan, files []*Item, st *state) (failed []*Item, err error) {
+func pullAndPlace(ctx context.Context, p *Plan, files []*Item, opt Options, st *state) (failed []*Item, err error) {
 	staging, mkErr := os.MkdirTemp(p.DstRoot, stagingPrefix)
 	if mkErr != nil {
 		return files, fmt.Errorf("creating a staging folder in %s: %w", p.DstRoot, mkErr)
@@ -255,11 +264,12 @@ func pullAndPlace(ctx context.Context, p *Plan, files []*Item, st *state) (faile
 	for i, it := range files {
 		srcs[i] = it.Src
 	}
-	// A name Windows can't store (such as "a:b.jpg") is pulled on its own, to
-	// an explicit safe local name; makeBatches gives such files a batch each.
-	unsafe := len(files) == 1 && SafeName(path.Base(files[0].Src)) != path.Base(files[0].Src)
+	// A file whose name changed (a name Windows can't store, such as
+	// "a:b.jpg", or the second of a.jpg / A.jpg) is pulled on its own, to an
+	// explicit local name; makeBatches gives such files a batch each.
+	unsafe := len(files) == 1 && pulledAlone(files[0])
 	if unsafe {
-		err = p.Phone.ADB.PullFile(ctx, p.Phone.Serial, files[0].Src, filepath.Join(staging, SafeName(path.Base(files[0].Src))))
+		err = p.Phone.ADB.PullFile(ctx, p.Phone.Serial, files[0].Src, filepath.Join(staging, filepath.Base(files[0].Rel)))
 	} else {
 		err = p.Phone.ADB.Pull(ctx, p.Phone.Serial, srcs, staging)
 	}
@@ -267,10 +277,11 @@ func pullAndPlace(ctx context.Context, p *Plan, files []*Item, st *state) (faile
 		return nil, ctx.Err()
 	}
 
+	var placed []placedFile
 	for _, it := range files {
 		staged := filepath.Join(staging, path.Base(it.Src))
 		if unsafe {
-			staged = filepath.Join(staging, SafeName(path.Base(it.Src)))
+			staged = filepath.Join(staging, filepath.Base(it.Rel))
 		}
 		info, statErr := os.Stat(staged)
 		if statErr != nil || info.IsDir() {
@@ -281,30 +292,143 @@ func pullAndPlace(ctx context.Context, p *Plan, files []*Item, st *state) (faile
 		os.Chtimes(staged, t, t) // keep the phone's modification time (so a re-run sees "same")
 		final := filepath.Join(p.DstRoot, it.Rel)
 		os.MkdirAll(filepath.Dir(final), 0o755)
+		if opt.Trash != nil && it.Decision == Overwrite {
+			if _, serr := os.Lstat(final); serr == nil {
+				if terr := opt.Trash.Move(it.Rel, TrashReplaced); terr != nil {
+					failed = append(failed, it)
+					err = fmt.Errorf("keeping the old version of %s: %w", it.Rel, terr)
+					continue
+				}
+			}
+		}
 		if rerr := os.Rename(staged, final); rerr != nil {
 			failed = append(failed, it)
 			err = fmt.Errorf("moving %s into place: %w", it.Rel, rerr)
 			continue
 		}
+		it.SrcSize, it.SrcMTimeNs, it.DstMTimeNs = it.Size, it.MTimeNs(), it.MTimeNs()
+		placed = append(placed, placedFile{it: it, path: final, size: info.Size()})
+	}
+
+	// Verify the batch: one command hashes every file on the phone, the PC
+	// hashes its copies (read back from the drive) with the same algorithm.
+	bad := map[*Item]bool{}
+	if opt.Verify != VerifyOff && p.Phone.HashTool != "" && len(placed) > 0 {
+		bad, err = verifyPhoneBatch(ctx, p, placed, opt, st, err)
+	}
+	for _, pf := range placed {
+		if bad[pf.it] {
+			failed = append(failed, pf.it)
+			continue
+		}
+		if opt.Record != nil {
+			if fi, serr := os.Lstat(pf.path); serr == nil {
+				pf.it.Dst = dstStateOf(fi)
+			}
+			opt.Record(pf.it)
+		}
 		st.written.Add(1)
-		st.bytesDone.Add(info.Size())
+		st.bytesDone.Add(pf.size)
 		st.filesDone.Add(1)
 	}
 	return failed, err
+}
+
+type placedFile struct {
+	it   *Item
+	path string
+	size int64
+}
+
+// verifyPhoneBatch compares the phone's checksums with the copies'. A copy
+// that differs (or can't be checked) is deleted and returned as bad, so it is
+// pulled again.
+func verifyPhoneBatch(ctx context.Context, p *Plan, placed []placedFile, opt Options, st *state, prevErr error) (map[*Item]bool, error) {
+	bad := map[*Item]bool{}
+	remotes := make([]string, len(placed))
+	for i, pf := range placed {
+		remotes[i] = pf.it.Src
+	}
+	sums, herr := p.Phone.ADB.HashFiles(ctx, p.Phone.Serial, p.Phone.HashTool, remotes)
+	if herr != nil {
+		for _, pf := range placed {
+			os.Remove(pf.path)
+			bad[pf.it] = true
+		}
+		return bad, fmt.Errorf("%w: the phone couldn't compute checksums (%v)", errVerify, herr)
+	}
+	var abuf []byte
+	if opt.Verify == VerifyMedia {
+		abufp := alignedPool.Get().(*[]byte)
+		defer alignedPool.Put(abufp)
+		abuf = *abufp
+	}
+	for _, pf := range placed {
+		want, ok := sums[pf.it.Src]
+		if !ok {
+			continue // the tool couldn't name it unambiguously: not verified, not failed
+		}
+		got, err := hashFileWith(ctx, pf.path, p.Phone.HashTool, opt.Verify == VerifyMedia, abuf)
+		if err != nil || got != want {
+			os.Remove(pf.path)
+			bad[pf.it] = true
+			st.mismatches.Add(1)
+			prevErr = fmt.Errorf("%w: the copy of %s differs from the file on the phone", errVerify, pf.it.Src)
+			continue
+		}
+		pf.it.MediaChecked = opt.Verify == VerifyMedia
+	}
+	return bad, prevErr
+}
+
+// hashFileWith hashes a local file with the phone tool's algorithm, read back
+// without the cache when unbuffered is set.
+func hashFileWith(ctx context.Context, path, tool string, unbuffered bool, abuf []byte) (string, error) {
+	h, ok := phone.NewHash(tool)
+	if !ok {
+		return "", fmt.Errorf("unknown hash tool %s", tool)
+	}
+	var f *os.File
+	var err error
+	if unbuffered {
+		f, err = openUnbuffered(path)
+	} else {
+		f, err = os.Open(path)
+		abuf = make([]byte, 1<<20)
+	}
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		n, rerr := f.Read(abuf)
+		h.Write(abuf[:n])
+		if rerr == io.EOF || (rerr == nil && n == 0) {
+			break
+		}
+		if rerr != nil {
+			return "", rerr
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // PlanPhoneJobs plans pulling an explicit list of files (for example every
 // search match on one phone) into dstRoot. Each Job.Src must be an absolute
 // path on the phone.
 //
-// Each Job.Rel is made safe for Windows (see SafeRel): phone file names may
-// contain characters such as ':' that Windows doesn't allow.
+// Job.Rel may use `\` (index paths) or this OS's separator. Names Windows
+// can't store are fixed by Plan.FixNames (pre-flight), like for any plan.
 func PlanPhoneJobs(adb *phone.ADB, serial string, jobs []Job, dstRoot, policy string, workers int) *Plan {
 	jobs = append([]Job(nil), jobs...)
 	for i := range jobs {
-		jobs[i].Rel = SafeRel(jobs[i].Rel)
+		jobs[i].Rel = toOSRel(jobs[i].Rel)
+		jobs[i].TimeCoarse = true
 	}
-	plan := finalize(dstRoot, nil, jobs, policy, workers)
+	plan := finalize(dstRoot, nil, jobs, policy, workers, fsinfo.ForPhone())
 	plan.Phone = &PhoneSource{ADB: adb, Serial: serial}
 	return plan
 }
@@ -327,47 +451,12 @@ func PhonePathRoot(p, root string) string {
 	return path.Clean(root + p)
 }
 
-// SafeName makes one phone file or folder name storable on Windows. Android
-// allows names Windows doesn't: a ':' would even silently write an NTFS
-// "alternate data stream" instead of a file. So:
-//
-//   - < > : " | ? * \ and control characters become '_'
-//   - trailing dots and spaces (which Windows strips) become '_'
-//   - reserved device names (CON, NUL, COM1, LPT1, ... even with an
-//     extension, like "aux.txt") get a '_' in front
-//
-// A name that is already fine is returned unchanged.
+// SafeName makes one file or folder name storable on Windows (see
+// winname.Fix: look-alike characters for : ? * and friends, CON.txt becomes
+// CON_.txt, trailing dots become _). A name that is already fine is returned
+// unchanged.
 func SafeName(name string) string {
-	var b strings.Builder
-	changed := false
-	for _, r := range name {
-		if r < 0x20 || strings.ContainsRune(`<>:"|?*\`, r) {
-			b.WriteByte('_')
-			changed = true
-			continue
-		}
-		b.WriteRune(r)
-	}
-	s := name
-	if changed {
-		s = b.String()
-	}
-	if t := strings.TrimRight(s, ". "); t != s {
-		s = t + strings.Repeat("_", len(s)-len(t))
-	}
-	if s == "" {
-		return "_"
-	}
-	stem := s
-	if i := strings.IndexByte(stem, '.'); i >= 0 {
-		stem = stem[:i]
-	}
-	switch strings.ToUpper(strings.TrimRight(stem, " ")) {
-	case "CON", "PRN", "AUX", "NUL",
-		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
-		s = "_" + s
-	}
+	s, _ := winname.Fix(name)
 	return s
 }
 
@@ -375,9 +464,25 @@ func SafeName(name string) string {
 // this OS's separator or by the index's `\`) and joins them with this OS's
 // separator.
 func SafeRel(rel string) string {
-	parts := strings.FieldsFunc(rel, func(r rune) bool { return r == '\\' || r == filepath.Separator })
+	parts := splitRel(rel)
 	for i, p := range parts {
 		parts[i] = SafeName(p)
 	}
 	return filepath.Join(parts...)
+}
+
+// toOSRel turns an index path (`\`) into one with this OS's separators.
+func toOSRel(rel string) string { return filepath.Join(splitRel(rel)...) }
+
+// splitRel splits a relative path at `\` and at this OS's separator.
+func splitRel(rel string) []string {
+	return strings.FieldsFunc(rel, func(r rune) bool { return r == '\\' || r == filepath.Separator })
+}
+
+// pulledAlone reports whether a phone file must be pulled on its own, to an
+// explicit local name: its destination name differs from its name on the
+// phone (fixed by FixNames), so a batch pull, which keeps phone names, would
+// write the wrong name (or two names that are one on Windows).
+func pulledAlone(it *Item) bool {
+	return path.Base(it.Src) != filepath.Base(it.Rel)
 }

@@ -149,6 +149,11 @@ func (p *Parallel) Scan(ctx context.Context, b *index.Builder, report func(Progr
 		skipNames = DefaultSkipDirs
 	}
 	skip := newSkipSet(skipNames)
+	// File-system listings know exact (nanosecond) times; record which
+	// folders were left out, so a copy planned from this index later knows
+	// it skips the same ones.
+	b.Index().Header.MTimeUnit = "ns"
+	b.Index().Header.SkipRules = SkipRules(skipNames)
 
 	var (
 		nextID   atomic.Uint64
@@ -178,6 +183,9 @@ func (p *Parallel) Scan(ctx context.Context, b *index.Builder, report func(Progr
 				return
 			}
 			noteError(job.abs, err)
+			errMu.Lock()
+			p.stats.FailedDirs = append(p.stats.FailedDirs, job.rel)
+			errMu.Unlock()
 			// fall through: entries read before the error are still useful
 		}
 
@@ -195,7 +203,11 @@ func (p *Parallel) Scan(ctx context.Context, b *index.Builder, report func(Progr
 			} else {
 				e.Size = info.Size()
 				e.ModTime = info.ModTime().Unix()
+				e.Nanos = uint32(info.ModTime().Nanosecond())
 				e.Flags |= attrFlags(info, name)
+				if !isDir && !info.Mode().IsRegular() {
+					e.Flags |= index.FlagReparse // a link (or device): listed, never copied
+				}
 			}
 			if isDir {
 				e.Flags |= index.FlagDir

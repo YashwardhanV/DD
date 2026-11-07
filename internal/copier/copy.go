@@ -4,14 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/crc32"
-	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
+	"github.com/yashwardhanv/dd/internal/fsinfo"
 	"github.com/yashwardhanv/dd/internal/ui"
 )
 
@@ -30,22 +31,88 @@ const (
 // bufPool shares 1 MB buffers between workers instead of allocating one per file.
 var bufPool = sync.Pool{New: func() any { b := make([]byte, bufferSize); return &b }}
 
-// castagnoli is the CRC-32C table; modern CPUs compute it in hardware.
-var castagnoli = crc32.MakeTable(crc32.Castagnoli)
+// alignedPool shares buffers for unbuffered reads (VerifyMedia). Windows only
+// reads without the cache into memory aligned to the disk's sector size, in
+// whole sectors; 1 MiB is a multiple of every sector size in use.
+var alignedPool = sync.Pool{New: func() any { b := alignedBuffer(bufferSize, maxSectorAlign); return &b }}
+
+// maxSectorAlign is the alignment used for unbuffered reads. 4096 covers both
+// 512-byte and 4 KB sector drives (a 4096-aligned address is 512-aligned too).
+const maxSectorAlign = 4096
+
+// alignedBuffer returns a size-byte slice whose first byte sits at an address
+// that is a multiple of align: over-allocate by one alignment and slice.
+func alignedBuffer(size, align int) []byte {
+	raw := make([]byte, size+align)
+	off := 0
+	if r := int(uintptr(unsafe.Pointer(&raw[0])) % uintptr(align)); r != 0 {
+		off = align - r
+	}
+	return raw[off : off+size : off+size]
+}
+
+// VerifyMode says how (and whether) each copied file is checked.
+type VerifyMode int
+
+const (
+	// VerifyOff: no check after writing (the default without --verify).
+	VerifyOff VerifyMode = iota
+	// VerifyMedia: the source is hashed while it is copied (read once), the
+	// copy is flushed to the device, then read back WITHOUT the Windows
+	// cache (unbuffered) and its hash compared. This proves the bytes came
+	// back from the drive itself, not from the PC's memory.
+	VerifyMedia
+	// VerifyCache: the copy is read back through the Windows cache. Cheaper,
+	// but it only proves DriveDex wrote the right bytes, not that the drive
+	// stored them (the read is usually served from RAM).
+	VerifyCache
+)
+
+// ParseVerifyMode understands the values of --verify.
+func ParseVerifyMode(s string) (VerifyMode, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "off", "false", "no", "none":
+		return VerifyOff, true
+	case "media", "true", "yes", "on":
+		return VerifyMedia, true
+	case "cache":
+		return VerifyCache, true
+	}
+	return VerifyOff, false
+}
+
+func (v VerifyMode) String() string {
+	switch v {
+	case VerifyMedia:
+		return "media"
+	case VerifyCache:
+		return "cache"
+	}
+	return "off"
+}
 
 // Options controls a copy.
 type Options struct {
 	// Workers is how many files are copied at once (local copies). <= 0 means 4.
 	Workers int
-	// Verify re-reads source and destination after each file and compares
-	// CRC-32C checksums.
-	Verify bool
+	// Verify says how each copied file is checked (see VerifyMode).
+	Verify VerifyMode
+	// Hash computes the XXH3-128 hash of every copied file even without
+	// verification (the copy manifest records it).
+	Hash bool
 	// Progress, if set, is called about every 200 ms and once at the end.
 	Progress func(ui.CopyProgress)
 	// Retries is how many extra attempts a failing file gets (default 2);
 	// RetryDelay is the wait between attempts (default 500 ms).
 	Retries    int
 	RetryDelay time.Duration
+	// ReadOrder is the order small files are read in: ReadOrderSize (biggest
+	// first, the default) or ReadOrderDisk (where they lie on the disk; for
+	// spinning hard disks, experimental). Big files keep their own lanes.
+	ReadOrder string
+	// CaseSensitiveDirs: folders the copy creates get NTFS per-folder case
+	// sensitivity (see NameOptions.CaseSensitiveDest).
+	CaseSensitiveDirs bool
 	// BigLanes, when > 0, is how many BIG files (BigFileSize and up) are
 	// copied at once; the other workers keep copying small files meanwhile.
 	// For USB drives: the link moves one stream as fast as eight, so eight
@@ -53,13 +120,32 @@ type Options struct {
 	// unplugged (resume restarts unfinished files) and more fragmentation on
 	// the destination. 0 = big files share all workers (the old behaviour).
 	BigLanes int
+	// Trash, when set, receives the old version of every file an Overwrite
+	// replaces (moved there just before the new one is renamed in), instead
+	// of it being lost (keep_replaced, INV-3).
+	Trash Trasher
+	// Record, when set, is called for each file once it is in place (and
+	// verified, when verifying), from several goroutines at once. The item's
+	// Dst then describes the copy, and Hash its content when hashing.
+	Record func(it *Item)
 }
+
+// Trasher moves a destination file (relative to the plan's DstRoot) to the
+// trash. *trash.Run is one.
+type Trasher interface {
+	Move(rel, why string) error
+}
+
+// TrashReplaced is the reason given to the Trasher for an overwritten file.
+const TrashReplaced = "replaced"
 
 // BigFileSize is where BigLanes starts to apply.
 const BigFileSize = 32 << 20
 
 // bigFileSize is BigFileSize (a variable so tests can use small files).
 var bigFileSize int64 = BigFileSize
+
+func (o Options) hashing() bool { return o.Hash || o.Verify != VerifyOff }
 
 func (o Options) retries() int {
 	if o.Retries <= 0 {
@@ -125,10 +211,21 @@ func (s *state) snapshot(speed float64) ui.CopyProgress {
 	}
 }
 
-// Test hooks (never set in real use).
+// Test hooks (never set in real use, except the defaults).
 var (
-	openSource = os.Open
-	afterCopy  func(dst string) // runs after a file is renamed into place, before verification
+	// openSource opens a source file. locked=true opens it so that no other
+	// program can write to it while it is read (Windows: share-read only); a
+	// file open for writing elsewhere then fails with errInUse. locked=false
+	// is a normal open (other programs may keep writing; the before/after
+	// check catches that).
+	openSource = defaultOpenSource
+	// openUnbuffered opens a copy for reading without the Windows cache
+	// (VerifyMedia); unbufferedOpens counts its calls in tests.
+	openUnbuffered = unbufferedOpen
+	afterCopy      func(dst string) // runs after a file is renamed into place, before verification
+	// duringCopy runs after the source has been read and before it is
+	// checked again (tests use it to change the source mid-copy).
+	duringCopy func(src string)
 )
 
 // Run carries out the plan. It stops promptly when ctx is cancelled (Result.Cancelled).
@@ -148,7 +245,12 @@ func Run(ctx context.Context, p *Plan, opt Options) (Result, error) {
 		}
 	}
 
-	if err := makeDirs(p); err != nil {
+	if !p.NamesFixed {
+		// Nobody checked the names (a library caller): apply the safe defaults
+		// rather than write a name Windows can't store.
+		p.FixNames(NameOptions{})
+	}
+	if err := makeDirs(p, opt.CaseSensitiveDirs); err != nil {
 		return Result{}, err
 	}
 
@@ -211,19 +313,42 @@ func Run(ctx context.Context, p *Plan, opt Options) (Result, error) {
 	return res, err
 }
 
+func defaultOpenSource(name string, locked bool) (*os.File, error) {
+	if locked {
+		return lockedOpen(name)
+	}
+	return os.Open(name)
+}
+
+// joinDst is the full destination path of an item.
+func joinDst(root, rel string) string { return filepath.Join(root, rel) }
+
 // makeDirs creates every destination folder up front (including empty ones).
-func makeDirs(p *Plan) error {
+// With caseSensitive, each folder it creates gets NTFS per-folder case
+// sensitivity (copy --case-sensitive-dest).
+func makeDirs(p *Plan, caseSensitive bool) error {
 	if err := os.MkdirAll(p.DstRoot, 0o755); err != nil {
 		return fmt.Errorf("creating %s: %w", p.DstRoot, err)
 	}
 	made := map[string]bool{}
-	mk := func(rel string) error {
+	var mk func(rel string) error
+	mk = func(rel string) error {
 		if rel == "" || rel == "." || made[rel] {
 			return nil
 		}
 		made[rel] = true
-		if err := os.MkdirAll(filepath.Join(p.DstRoot, rel), 0o755); err != nil {
-			return fmt.Errorf("creating folder %s: %w", filepath.Join(p.DstRoot, rel), err)
+		full := filepath.Join(p.DstRoot, rel)
+		if _, err := os.Lstat(full); err == nil {
+			return nil
+		}
+		if err := mk(filepath.Dir(rel)); err != nil {
+			return err
+		}
+		if err := os.Mkdir(full, 0o755); err != nil && !os.IsExist(err) {
+			return fmt.Errorf("creating folder %s: %w", full, err)
+		}
+		if caseSensitive {
+			fsinfo.SetCaseSensitiveDir(full) // best effort: needs NTFS and Windows 10 1803+
 		}
 		return nil
 	}
@@ -264,9 +389,15 @@ func runLocal(ctx context.Context, p *Plan, opt Options, st *state) {
 		defer wg.Done()
 		bufp := bufPool.Get().(*[]byte)
 		defer bufPool.Put(bufp)
+		var abuf []byte
+		if opt.Verify == VerifyMedia {
+			abufp := alignedPool.Get().(*[]byte)
+			defer alignedPool.Put(abufp)
+			abuf = *abufp
+		}
 		for _, q := range queues {
 			for it := range q {
-				copyWithRetries(ctx, p.DstRoot, it, *bufp, opt, st)
+				copyWithRetries(ctx, p.DstRoot, it, *bufp, abuf, opt, st)
 			}
 		}
 	}
@@ -304,163 +435,27 @@ func runLocal(ctx context.Context, p *Plan, opt Options, st *state) {
 		}
 	}
 	dwg.Add(2)
-	go dispatch(smallQ, func(it *Item) bool { return !isBig(it) })
+	if opt.ReadOrder == ReadOrderDisk {
+		ordered := diskOrder(p.Items, isBig)
+		go func() {
+			defer dwg.Done()
+			defer close(smallQ)
+			for _, it := range ordered {
+				if it.Blocked != "" {
+					st.fail(it.Rel, errors.New(it.Blocked))
+					continue
+				}
+				select {
+				case smallQ <- it:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	} else {
+		go dispatch(smallQ, func(it *Item) bool { return !isBig(it) })
+	}
 	go dispatch(bigQ, isBig)
 	dwg.Wait()
 	wg.Wait()
-}
-
-// errNotRegular marks a link or device that is skipped rather than copied.
-var errNotRegular = errors.New("not a regular file")
-
-func copyWithRetries(ctx context.Context, dstRoot string, it *Item, buf []byte, opt Options, st *state) {
-	dst := filepath.Join(dstRoot, it.Rel)
-	var err error
-	for attempt := 0; attempt <= opt.retries(); attempt++ {
-		if attempt > 0 {
-			select {
-			case <-time.After(opt.retryDelay()):
-			case <-ctx.Done():
-				return
-			}
-		}
-		var n int64
-		n, err = copyFile(ctx, it.Src, dst, it.ModTime, buf, opt.Verify, st)
-		if err == nil {
-			st.written.Add(1)
-			st.bytesDone.Add(n)
-			st.filesDone.Add(1)
-			return
-		}
-		if ctx.Err() != nil {
-			return // cancelled: not a failure
-		}
-		if errors.Is(err, errNotRegular) {
-			st.notRegular.Add(1)
-			st.skipped.Add(1)
-			st.filesDone.Add(1)
-			return
-		}
-		// Any other failure (including a verify mismatch, whose bad copy has
-		// already been deleted) is retried after a short pause.
-	}
-	st.fail(it.Rel, err)
-}
-
-// errVerify marks a checksum mismatch.
-var errVerify = errors.New("verification failed")
-
-// copyFile copies one file atomically: write "<dst>.ddxpart", set the modification
-// time, then rename it to the real name.
-//
-// There is deliberately no fsync here: forcing every small file to the platter
-// destroys USB throughput. (Use "Safely Remove" before unplugging a drive.)
-func copyFile(ctx context.Context, src, dst string, mtime int64, buf []byte, verify bool, st *state) (written int64, err error) {
-	info, err := os.Lstat(src)
-	if err != nil {
-		return 0, fmt.Errorf("reading %s: %w", src, err)
-	}
-	if !info.Mode().IsRegular() {
-		return 0, errNotRegular // never follow links: that could copy files from elsewhere
-	}
-	in, err := openSource(src)
-	if err != nil {
-		return 0, fmt.Errorf("opening %s: %w", src, err)
-	}
-	defer in.Close()
-
-	part := dst + PartSuffix
-	out, err := os.OpenFile(part, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return 0, fmt.Errorf("creating %s: %w", part, err)
-	}
-	cleanup := func() { out.Close(); os.Remove(part) }
-
-	// Reserve the whole file's space up front: one allocation instead of
-	// growing the file a megabyte at a time. With several files written at
-	// once this keeps each file in one piece on the destination instead of
-	// interleaving them. Best effort: if it can't, the writes still work.
-	if info.Size() >= preallocMin {
-		preallocate(out, info.Size())
-	}
-
-	// struct{ io.Writer } hides *os.File's ReadFrom method; otherwise
-	// io.CopyBuffer would ignore our big buffer and use a small default one.
-	n, err := io.CopyBuffer(struct{ io.Writer }{out}, &ctxReader{ctx: ctx, r: in}, buf)
-	if err != nil {
-		cleanup()
-		return 0, fmt.Errorf("copying %s: %w", src, err)
-	}
-	// Set the time through the handle we already have, before closing. Doing
-	// it by name afterwards (os.Chtimes) opens the file a second time and
-	// rewrites its folder entry a second time - on a pen drive each of those
-	// is a slow little write, paid once per file.
-	t := time.Unix(mtime, 0)
-	timeSet, err := setModTime(out, t)
-	if err != nil {
-		cleanup()
-		return 0, fmt.Errorf("setting the time of %s: %w", part, err)
-	}
-	if err := out.Close(); err != nil {
-		os.Remove(part)
-		return 0, fmt.Errorf("writing %s: %w", part, err)
-	}
-	if !timeSet {
-		if err := os.Chtimes(part, t, t); err != nil {
-			os.Remove(part)
-			return 0, fmt.Errorf("setting the time of %s: %w", part, err)
-		}
-	}
-	if err := os.Rename(part, dst); err != nil {
-		os.Remove(part)
-		return 0, fmt.Errorf("moving %s into place: %w", part, err)
-	}
-	if afterCopy != nil {
-		afterCopy(dst)
-	}
-
-	if verify {
-		a, errA := checksum(ctx, src, buf)
-		b, errB := checksum(ctx, dst, buf)
-		switch {
-		case ctx.Err() != nil:
-			return n, ctx.Err()
-		case errA != nil || errB != nil:
-			return n, fmt.Errorf("%w: couldn't re-read the files (%v %v)", errVerify, errA, errB)
-		case a != b:
-			// Remove the bad copy: it has the right size and time, so a re-run
-			// would otherwise consider it "already there" and keep it.
-			os.Remove(dst)
-			st.mismatches.Add(1)
-			return n, fmt.Errorf("%w: checksum of the copy differs from the original", errVerify)
-		}
-	}
-	return n, nil
-}
-
-// checksum computes the CRC-32C of a file.
-func checksum(ctx context.Context, path string, buf []byte) (uint32, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	h := crc32.New(castagnoli)
-	if _, err := io.CopyBuffer(h, &ctxReader{ctx: ctx, r: f}, buf); err != nil {
-		return 0, err
-	}
-	return h.Sum32(), nil
-}
-
-// ctxReader makes a long read stop promptly when the context is cancelled.
-type ctxReader struct {
-	ctx context.Context
-	r   io.Reader
-}
-
-func (c *ctxReader) Read(p []byte) (int, error) {
-	if err := c.ctx.Err(); err != nil {
-		return 0, err
-	}
-	return c.r.Read(p)
 }

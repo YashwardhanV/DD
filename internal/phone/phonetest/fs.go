@@ -34,6 +34,13 @@ type FS struct {
 	FailTimes map[string]int
 	// OnPull, if set, runs at the start of every pull (to slow it down or cancel).
 	OnPull func(ctx context.Context)
+	// HashTools are the checksum programs the phone has, in the order the
+	// probe finds them. Defaults to sha256sum and md5sum; empty = none.
+	HashTools []string
+	// CorruptPull: these paths arrive with one byte flipped (a bad cable),
+	// CorruptTimes times (0 = always).
+	CorruptPull  map[string]bool
+	CorruptTimes map[string]int
 
 	mu      sync.Mutex
 	files   map[string]File
@@ -44,7 +51,8 @@ type FS struct {
 
 // NewFS returns an empty fake phone with the default Pixel 7 attached.
 func NewFS() *FS {
-	return &FS{Devices: []string{Pixel}, Unreadable: map[string]bool{}, FailTimes: map[string]int{}, files: map[string]File{}}
+	return &FS{Devices: []string{Pixel}, Unreadable: map[string]bool{}, FailTimes: map[string]int{}, files: map[string]File{},
+		HashTools: []string{"sha256sum", "md5sum"}, CorruptPull: map[string]bool{}, CorruptTimes: map[string]int{}}
 }
 
 // Add puts a file (absolute phone path such as "/sdcard/DCIM/a.jpg") on the phone.
@@ -97,6 +105,13 @@ func (f *FS) handle(ctx context.Context, args []string) (string, error) {
 			return f.stat(cmd), nil
 		case strings.HasPrefix(cmd, "find "):
 			return f.find(cmd), nil
+		case cmd == phone.HashToolCommand:
+			if len(f.HashTools) == 0 {
+				return "", nil
+			}
+			return f.HashTools[0] + "\n", nil
+		case strings.HasPrefix(cmd, "printf '%s\\0'"):
+			return f.hash(cmd)
 		}
 	}
 	return "", fmt.Errorf("phonetest: unexpected adb call %q", args)
@@ -125,6 +140,63 @@ func (f *FS) stat(cmd string) string {
 		}
 	}
 	return ""
+}
+
+// hash answers `printf '%s\0' 'a' 'b' | xargs -0 <tool>` like the real tools.
+func (f *FS) hash(cmd string) (string, error) {
+	i := strings.LastIndex(cmd, "| xargs -0 ")
+	if i < 0 {
+		return "", fmt.Errorf("phonetest: bad hash command %q", cmd)
+	}
+	tool := strings.Fields(cmd[i+len("| xargs -0 "):])[0]
+	h, ok := phone.NewHash(tool)
+	if !ok {
+		return "", &phone.ExitError{Code: 127, Stderr: tool + ": not found"}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var sb strings.Builder
+	for _, p := range quotedWords(cmd[len("printf '%s\\0'"):i]) {
+		file, ok := f.files[p]
+		if !ok {
+			continue
+		}
+		h.Reset()
+		h.Write([]byte(file.Content))
+		fmt.Fprintf(&sb, "%x  %s\n", h.Sum(nil), p)
+	}
+	return sb.String(), nil
+}
+
+// quotedWords splits shell words as phone.HashCommand writes them: bare
+// words, or single-quoted ones where '\'' stands for a quote.
+func quotedWords(s string) []string {
+	var out []string
+	for {
+		s = strings.TrimLeft(s, " ")
+		if s == "" {
+			return out
+		}
+		var w strings.Builder
+		for s != "" && s[0] != ' ' {
+			switch {
+			case strings.HasPrefix(s, `\'`):
+				w.WriteByte('\'')
+				s = s[2:]
+			case s[0] == '\'':
+				end := strings.IndexByte(s[1:], '\'')
+				if end < 0 {
+					return out
+				}
+				w.WriteString(s[1 : 1+end])
+				s = s[end+2:]
+			default:
+				w.WriteByte(s[0])
+				s = s[1:]
+			}
+		}
+		out = append(out, w.String())
+	}
 }
 
 func (f *FS) find(cmd string) string {
@@ -188,7 +260,18 @@ func (f *FS) pull(ctx context.Context, args []string) (string, error) {
 		if st, err := os.Stat(local); len(remotes) == 1 && (err != nil || !st.IsDir()) {
 			dst = local // like adb: one file pulled to a path that isn't a folder is saved under that name
 		}
-		if err := os.WriteFile(dst, []byte(file.Content), 0o644); err != nil {
+		content := []byte(file.Content)
+		f.mu.Lock()
+		if f.CorruptPull[r] && len(content) > 0 {
+			if n, limited := f.CorruptTimes[r]; !limited || n > 0 {
+				content[0] ^= 0xFF
+				if limited {
+					f.CorruptTimes[r] = n - 1
+				}
+			}
+		}
+		f.mu.Unlock()
+		if err := os.WriteFile(dst, content, 0o644); err != nil {
 			return "", err
 		}
 		t := time.Unix(file.MTime, 0)

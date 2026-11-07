@@ -55,6 +55,11 @@ func (w *Walk) Scan(ctx context.Context, b *index.Builder, report func(Progress)
 		skipNames = DefaultSkipDirs
 	}
 	skip := newSkipSet(skipNames)
+	// File-system listings know exact (nanosecond) times; record which
+	// folders were left out, so a copy planned from this index later knows
+	// it skips the same ones.
+	b.Index().Header.MTimeUnit = "ns"
+	b.Index().Header.SkipRules = SkipRules(skipNames)
 
 	// WalkDir builds child paths as root + separator + name, so stripping this
 	// prefix gives each entry's path relative to the root.
@@ -119,7 +124,11 @@ func (w *Walk) Scan(ctx context.Context, b *index.Builder, report func(Progress)
 		} else {
 			e.Size = info.Size()
 			e.ModTime = info.ModTime().Unix()
+			e.Nanos = uint32(info.ModTime().Nanosecond())
 			e.Flags |= attrFlags(info, name)
+			if !isDir && !info.Mode().IsRegular() {
+				e.Flags |= index.FlagReparse // a link (or device): listed, never copied
+			}
 		}
 		if isDir {
 			e.Flags |= index.FlagDir

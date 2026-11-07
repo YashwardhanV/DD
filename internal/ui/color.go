@@ -31,11 +31,16 @@ func SetColorMode(enabled, force bool) {
 
 // IsTerminal reports whether f is an interactive console (not a pipe or file).
 func IsTerminal(f *os.File) bool {
+	if f == nil {
+		return false
+	}
 	st, err := f.Stat()
 	if err != nil {
 		return false
 	}
-	return st.Mode()&os.ModeCharDevice != 0
+	// A character device is not always a console: on Windows the NUL device
+	// (what scheduled tasks and redirected scripts often get) is one too.
+	return st.Mode()&os.ModeCharDevice != 0 && isConsole(f)
 }
 
 func wrap(code, s string) string {

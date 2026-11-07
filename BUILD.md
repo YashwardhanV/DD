@@ -22,6 +22,10 @@
 | 10 | Explorer integration | Right-click → "Search with DriveDex" | Windows registry |
 | 11 | Doctor, config, power search | `doctor` diagnoses slow USB; `ext:` `size:` filters; JSON output | Diagnostics, query parsing |
 | 12 | Packaging & release | One-command install, GitHub release, README | Distribution, CI |
+| 13 | Correctness groundwork (design doc P0) | Exact times, changed-while-copying detection, FAT-aware comparison, `--verify` that reads the drive back | File-system time resolution, FlushFileBuffers, unbuffered I/O |
+| 14 | Pre-flight (design doc P1) | Every problem shown before a byte is written; names fixed; real space; time estimate | Allocation units, Windows name rules, a cost model |
+| 15 | Plan from the saved index (design doc P2) | `copy` plans from the NTFS index in well under a second when the journal proves it current | Folder enumeration by file ID, journal freshness proof, CSR trees |
+| 16 | Copy manifest, compare modes and sync (design doc P3) | `sync` keeps a mirror that follows moves and can never lose a file; `--compare journal/checksum` catch edits size-and-time miss | CRC-framed append-only logs, crash recovery, ownership rules |
 
 Stages 1–7 are the core tool. Stages 8–12 make it easy to use.
 
@@ -1605,6 +1609,156 @@ The owner should be able to explain the project in an interview after reading th
 - [ ] README renders correctly on GitHub.
 
 **Commit:** `stage 12: packaging, install and release` → then tag `v1.0.0` (ask first).
+
+---
+
+---
+
+## Stage 13 — Correctness groundwork (design doc P0)
+
+**Source:** `DriveDex-Design-Doc.pdf` v1.0 (7 Nov 2026), chapter 5. Stages 13 onwards implement that document phase by phase; it is the specification, this section records what was built.
+
+**Goal:** make a single file copy exact and honest before anything is built on top of it.
+
+### Files
+- `internal/fsinfo/` (new): `Info` per volume (file system, cluster and sector size, time resolution, local-time flag, case sensitivity, read-only), `Of(path)` cached per volume root, `ForPhone`/`ForDevice`, `SameTime`/`Tolerance`, per-folder case sensitivity (Windows).
+- `internal/index/model.go`, `format.go`: `Entry.Nanos` / `Index.Nanos` (sub-second part of the modification time), `.ddx` **format version 2** (one extra uvarint per entry); version 1 files keep loading (INV-8). New optional header fields `meta_complete`, `skip_rules`, `mtime_unit`.
+- `internal/scan/`: walkers record nanoseconds, `mtime_unit = "ns"` and the skip rules they used.
+- `internal/copier/copyfile.go` (new), `copy.go`, `plan.go`, `phone.go`, `fileops_*.go`.
+- `internal/phone/hash.go` (new), fake phone gains hash tools and corrupting pulls.
+- `internal/cli/copy.go`, `searchcopy.go`.
+
+### Spec (as built)
+1. **Exact times.** `copier.Job` has `ModTimeNs` and `TimeCoarse`. The time written to a copy comes from the source's `Lstat` taken at copy time (not from the plan), at full precision through the open handle (`SetFileTime`), together with the creation time.
+2. **Changed while copying.** `Lstat` before and after reading; size, exact modification time and bytes read must agree, otherwise the `.ddxpart` is deleted and the file retried; after the last retry: *"the file kept changing while it was copied"*. Every attempt but the last opens the source **share-read only** (`CreateFile` with `FILE_SHARE_READ`): a file another program has open for writing fails as *in use, will retry*; the last attempt opens normally, still guarded by the check.
+3. **Comparing times.** `decide()` uses `fsinfo.SameTime`: tolerance = the coarser of both file systems (100 ns NTFS, 10 ms exFAT, 2 s FAT32, 1 s phone; unknown = 2 s), at least 1 s for coarse times. A difference of exactly one hour (± tolerance) when either side stores local time is a **daylight-saving shift**: same size → treated as unchanged, counted and reported once.
+4. **`--verify` proves the media.** `--verify` (= `--verify=media`): the source is hashed (XXH3-128) while it is copied, so it is read once; the copy is flushed (`FlushFileBuffers`, which also flushes the device cache) and read back with `FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN` into a 4096-aligned 1 MiB buffer per worker. `--verify=cache` reads it back through the cache. A mismatch deletes the copy and retries. The help text states the honest limit (devices that acknowledge a flush without writing).
+5. **Phone verify.** `adb shell` is probed once for `sha256sum`, `sha1sum`, `md5sum`; after each pulled batch one remote command (`printf '%s\0' ... | xargs -0 <tool>`) hashes the files on the phone and the PC hashes its copies (read back unbuffered) with the same algorithm. No tool: the old "can't be verified" note.
+
+### Acceptance
+- [x] NTFS → NTFS copy keeps the modification time to 100 ns (`TestModTimePreservedTo100ns`, run on Windows/NTFS).
+- [x] Appending to the source during the copy → failure, nothing under the real name (`TestINV4_SourceThatChangesDuringCopyIsRejected`).
+- [x] Table-driven `SameTime` tests for every pair incl. FAT ±1 h (`TestSameTimeTable`).
+- [x] `--verify` opens the copy with `FILE_FLAG_NO_BUFFERING` and reads the source exactly once (`TestVerifyMediaOpensWithoutTheCache`, `TestVerifyMediaReadsSourceOnceAndDestinationUnbuffered`).
+- [ ] Hardware: FAT32 pen drive across a daylight-saving change; `--verify` on a USB pen drive (PROGRESS.md).
+
+**Commit:** `stage 13: correctness groundwork (P0)`
+
+---
+
+---
+
+## Stage 14 — Planning ahead: pre-flight checks (design doc P1)
+
+**Goal:** before a single byte is written, tell the user everything that will go wrong or be slow, and fix the fixable automatically.
+
+### Files
+- `internal/preflight/` (new): `Severity` (Info / Warn / Block), `Issue`, `Report`, `Run(plan, Options)`, `Print`, `EstimateCopy` and `Estimate.Text`.
+- `internal/winname/` (new): Windows' name rules (`Check`, `Valid`, `Fix`, `Fold`, `CaseVariant`), used by the planner and the phone copier.
+- `internal/copier/names.go` (new): `Plan.FixNames` — the rename engine for bad names and letter-case clashes; `plan.go`: `SpaceNeeded`, `LinksSkipped`, `NewDirs`; `index.FlagReparse` marks links so they are counted before copying.
+- `internal/cli/copyrun.go` (new): `finishPlan` with pre-flight, the estimate, the y/N, exit code 3 and the `--json` result object; `copy.go` gains `--on-case-collision`, `--on-bad-name`, `--case-sensitive-dest`, `--yes`, `--json`, `--verbose`.
+
+### Spec (as built)
+| Code | Severity | When |
+|---|---|---|
+| `no-space` | Block | the space the files really take (6.5) exceeds free space |
+| `fat32-4gib` | Block | a file of 4 GiB or more to FAT32 |
+| `case-collision` | Warn (fixed) / Block with `fail` | two planned paths, or a planned path and an existing destination entry, differ only in case on a case-insensitive destination |
+| `bad-name` | Warn (fixed) / Block with `fail` | a name Windows can't store |
+| `name-too-long` | Warn (fixed by shortening) / Block with `fail` | a name over 255 UTF-16 units |
+| `long-path` | Warn | full destination path over 259 characters |
+| `fat-dir-full` | Warn | a FAT folder over 65,534 directory entries (1 + ceil(len/13) per name) |
+| `read-only` | Block | read-only volume, or a probe file can't be created (SD lock switch); no probe in a dry run |
+| `slow-port` | Info | a USB drive below its speed (the stage 12+ USB check) |
+| `source-offline` | Block | a plan from an index whose source is unplugged (used by P4/P7) |
+| `links-skipped` | Info | links/junctions in the source |
+| `cluster-slack` | Info | files take more than 10 % more space than their size ("2.1 GB of files will use 6.8 GB on this exFAT drive (128 KB clusters)") |
+| `dst-shift` | Info | P0's daylight-saving count |
+
+- **Names:** look-alike full-width characters for `: ? * < > | " \`, U+FFFD for control characters, `_` for a trailing dot/space, `CON.txt` → `CON_.txt`, over-long names cut with `~` + 8 hex digits of the name's XXH3. The second of two names that differ in case becomes `name (case 2).ext`. Every new name is checked again. Names that were already valid are handled first, so a fixed name never displaces one that was fine. NTFS per-folder case sensitivity (`FILE_CASE_SENSITIVE_DIR`) is honoured; `--case-sensitive-dest` sets it on created folders.
+- **Space:** each written file rounded up to whole clusters, NTFS files under ~700 bytes count 0 (resident in the MFT), one cluster per new folder, +1 %.
+- **Estimate:** `bytes/read + bytes/write + files × (perFile(src) + perFile(dst))`, rates capped by the USB link (USB 2.0 × 0.70, USB 3 × 0.80); defaults HDD 100 MB/s, SSD 300 MB/s, pen drive read 80 / write 15 MB/s, phone 30 MB/s; per file SSD 0.3 ms, HDD 4 ms, pen drive 8 ms, phone 15 ms. Shown as a range (×0.75 to ×1.5) until P6 learns real rates; plus the USB 3 comparison and the verify cost.
+- **Interaction:** issues are printed grouped by severity (5 paths each, every path with `--dry-run`/`--verbose`). A Block stops the copy with exit code 3. An unfixed Warn asks `Continue? [y/N]` when stdin is a console; `--yes` continues; a non-interactive run (pipe, NUL, file) continues after printing it.
+- **`--json`:** one object on stdout (`ok, kind, source, destination, planned_from, dry_run, verify, files, bytes, to_write, write_bytes, skipped, written, bytes_written, failed, cancelled, elapsed_ms, failures, preflight, error, exit_code`); every human line goes to stderr.
+
+### Acceptance
+- [x] Golden tests for each issue's text (`TestIssueMessages`) and the JSON shape (`TestReportJSONShape`, `TestCopyJSONResult`).
+- [x] Fuzz: names are valid, collision-free, and valid ones unchanged (`FuzzNamesAreValidAndCollisionFree`, `FuzzFix`). The fuzzer found a real crash on its first minute (below).
+- [x] Phone fixture a.jpg / A.jpg / notes:1.txt / CON.txt / trailing. copies with all five files present and four renames reported (`TestPhoneFixtureCopiesEveryFileAndReportsRenames`, on real NTFS).
+- [x] 128 KiB cluster slack is counted (`TestSlackIsCountedWith128KClusters`).
+- [x] Estimate unit tests with fixed inputs (`TestEstimateFixedInputs`, `TestEstimateUsesLearnedRatesAndDropsTheRange`).
+- [ ] Hardware: calibrate per-file overheads and rates (PROGRESS.md).
+
+**Commit:** `stage 14: pre-flight checks and time estimate (P1)`
+
+---
+
+---
+
+## Stage 15 — Plan from the saved index (design doc P2)
+
+**Goal:** `drivedex copy E:\Photos D:\Backup` plans in well under a second on a large NTFS drive, because the file list already exists. The index is used only when it is provably current (INV-5); otherwise the copy lists the source exactly as before.
+
+### Files
+- `internal/ntfs/dirlist.go` (new): `DirRecord`, `DirLister`, `ParseDirInfo`/`EncodeDirInfo` (the `FILE_ID_BOTH_DIR_INFO` layout), `FillMetadataByDir`, `RefreshTouched`, `MetaComplete`, `Fresh(ctx, ix, FreshEnv)`. `dirlist_windows.go`: `WindowsLister` (`GetFileInformationByHandleEx`, classes 10/11, 64 KiB buffer).
+- `internal/ntfs/apply.go`: `Applier.Touched()` (every entry a journal replay changed) and `FlagReparse` from attributes; `scanner.go`: `MFTScanner.Lister`, `Header.SkipRules`.
+- `internal/copier/fromindex.go` (new): `Children` (compressed-sparse-row children table, built in O(n)), `PlanFromIndex`. `plan.go`: the destination check reads one folder at a time. `readorder.go` (new): `--read-order` and `diskOrder`.
+- `internal/cli/sourcelist.go` (new): `copy --source-list auto|index|scan`; `scanner.go`/`turbo.go`: metadata is read by default, `--no-metadata` opts out, a journal refresh keeps it complete.
+
+### Spec (as built)
+- **Fill by folder.** For each folder of the index: open it, list it with `FileIdBothDirectoryInfo`, match each record's FileId (the NTFS reference number = the index ID), set size, time (ns) and attributes. One call per folder, not one `Lstat` per file. A folder that can't be opened leaves `FlagNoMeta` on its children. Turbo indexes now do this by default (`--no-metadata` keeps the old names-only index; `--with-metadata` is accepted and does nothing new).
+- **Keep it current.** After a journal replay the touched entries are grouped by parent: a folder with 32 or more touched children is listed again, others are looked up one by one; deleted files simply don't resolve.
+- **`Header.MetaComplete`** is true when no live file has `FlagNoMeta`; **`Header.SkipRules`** records the skipped folder names; **`MTimeUnit = "ns"`** (stage 13's format v2).
+- **Freshness (`ntfs.Fresh`)**, first failure is the reason shown: (1) NTFS, mounted, same serial; (2) Administrator (to read the journal); (3) same journal ID and the journal still reaches back to the index's `NextUsn`; (4) the replay and the touched-metadata refresh succeed, and the index is saved under the store lock; (5) the skip rules are the default ones the copy also uses; (6) no file under the source folder lacks metadata — fewer than 1,000 are looked up, more means "list the source".
+- **The store lock is held from the replay until the plan is built**, so the agent can't rewrite the index meanwhile; between planning and copying, stage 13's before/after check covers changes.
+- **`PlanFromIndex`** walks the children table depth-first from the folder, carrying the relative path, and emits exactly the `Dirs` and jobs `PlanLocal` would (links skipped and counted, the folder's own name on top), then the shared `finalize`.
+- **Faster destination check.** Destination folders are read once each, top-down, in parallel waves by depth; a folder that doesn't exist means every file below it is a plain copy and nothing below it is read. The names read are kept for stage 14's case-collision check.
+- **CLI.** `--source-list auto` (default) prints one line either way: `Planned from the saved index of E: (journal checked, 0.08 s).` or `Listing E:\Photos … (index not usable: not running as Administrator)`. `index` fails with the reason instead of listing; `scan` always lists. `--json` reports `planned_from: "index"`.
+- **Read order (experimental).** `--read-order disk` sorts small files by their first cluster (`FSCTL_GET_RETRIEVAL_POINTERS`, no Administrator), then by reference number. `auto` = `size` until a USB hard-disk benchmark shows a gain.
+
+### Acceptance
+- [x] Equivalence property test: fixture trees and random fake-NTFS trees give identical (Rel, Size, ModTime) sets and Dirs (`TestPlanFromIndexEqualsPlanLocal`, `TestPlanFromATurboIndexEqualsPlanLocal`, links in `TestPlanFromIndexSkipsLinksAndDedupFilesAreCopied`).
+- [x] `FillMetadataByDir` through the fake NTFS, including unreadable folders (`TestFillMetadataByDirListsEachFolderOnce`); the real lister agrees with per-file `Lstat` on this PC (`TestWindowsListerMatchesPerFileAnswers`).
+- [x] Every freshness failure has a test with its message (`TestFreshFailurePaths`, `TestFreshLooksUpAFewMissingEntriesButNotMany`), and the CLI fall-backs (`TestSourceListAutoNeedsAdministrator`, `TestSourceListIndexFailsInsteadOfListing`, …). A file edited after indexing is copied with its new size (`TestINV5_PlanFromIndexAfterEdits`).
+- [x] Benchmark: 1,000,000 indexed entries, a 200,000-file subtree, **172 ms** on an i7-8750H (target < 500 ms; `BenchmarkPlanFromIndex`).
+- [ ] Hardware: USB NTFS drive, change a file, plan from index, confirm the change is picked up; disk order on a USB HDD (PROGRESS.md).
+
+**Commit:** `stage 15: plan from the saved index (P2)`
+
+---
+
+---
+
+## Stage 16 — Copy manifest, compare modes and sync (design doc P3)
+
+**Goal:** make "copy only what changed" trustworthy beyond size and time, recognise moved files, and add a mirror mode that can never lose data irrecoverably.
+
+### Files
+- `internal/manifest/` (new): `Record`, `Manifest` (keyed by destination path), `Encode`/`Decode` (`manifest.ddm`), the journal (`frame`, `ReplayJournal`), `Store` (`Open` = lock + load + replay + compact, `Put`, `Delete`, `Refresh`, `Close`, `Abandon`), `Read` (read-only), `lock_windows.go` (share-none `CreateFile`), `lock_other.go` (flock).
+- `internal/trash/` (new): `Run` (`Begin`, `Move`, `Close` → `run.json`), `List`, `Restore`, `Empty`, `ParseAge`.
+- `internal/copier/compare.go` (new): `--compare` modes, `JournalView`, `Plan.Compare` → `CompareReport`. `sync.go` (new): `PlanSync`, `SyncPlan` (moves, removals, adopt, mass-delete), `ApplyMoves`, `ApplyRemovals`. `plan.go`: `Item.Dst`, `Item.Why`, `Changed`, `DstModified`, `MoveFrom`, `Plan.Top`, `Plan.UnlistedDirs`; `.drivedex` folders are never copied. `copy.go`/`copyfile.go`/`phone.go`: `Options.Trash` (old version to the trash before the new one is renamed in) and `Options.Record` (after the file is in place and verified); the NTFS file ID is read from the open handle.
+- `internal/ntfs/device.go`: `ChangesSince` (every file reference number the journal mentions after a USN). `internal/scan`: `Stats.FailedDirs`.
+- `internal/cli/book.go` (new): the run's manifest + trash (`openBook` reads; `lock` takes it only when the run goes ahead), journal bookmark taken before listing (`startJournal`), records, adoption. `sync.go` (new): `drivedex sync`. `trashcmd.go` (new): `drivedex trash list|restore|empty`. `copyrun.go`: `finishPlan` serves copy and sync. Config: `keep_replaced` (true), `trash_keep` ("30d").
+
+### Spec (as built)
+- **`<dst>\.drivedex\`** (Hidden + System): `manifest.ddm` = `DDM1`, uint32 header length, JSON header `{format_version, written_by, dst_fs, record_count, dir_count}`, a gzip stream (interned source IDs, the folder table, records as folder index + name + fields), CRC-32C of the decompressed stream. `manifest.journal` = frames of uvarint length, payload (put or delete), CRC-32C. `lock` is held (no sharing) for the whole run; Windows releases it when the process dies.
+- **Record:** destination path, `SrcID` (`vol-…`, `adb-…`, `dir-…`), `SrcRel` when the name was changed, `SrcFileID`, source size/time at copy time, destination size/time after the copy (read back, so FAT's rounding is what is recorded), XXH3-128, `SrcUSN` + `JournalID`, `CopiedAt`, flags (VerifiedMedia, Sanitised, CaseRenamed, Adopted). A record is appended only after the file is in place (and verified); the journal is flushed every 500 records or 2 s and at the end; the next run replays a leftover journal up to its first bad frame and compacts it.
+- **Nothing is written before pre-flight passes:** the manifest is read first, and `<dst>\.drivedex` is created only when the run goes ahead. A dry run reads only. `--no-manifest` turns it off.
+- **`--compare`:** `fast` = size + `SameTime` (DST hour tolerated); `strict` = no DST tolerance; `journal` = the record exists for this source with the same journal ID, the destination still has the recorded size and time, and the source's reference number has no journal entry at or after its own `SrcUSN` that can change content (a write, create, delete, times or attributes; a rename doesn't count) - such an entry → copied again even if size and time match; `checksum` = fresh source hash vs the destination's (from the record when the destination is unchanged since, otherwise read). `auto` (default) = journal where its preconditions hold, fast elsewhere. Journal and strict can only make a copy copy MORE (INV-1), and no comparison overrides `--on-conflict`: a file kept because the destination is newer, or because of `skip`, stays.
+- **Journal bookmark:** the journal's NextUsn is read *before* the source is listed and stored as `SrcUSN` for every file copied or confirmed; any later change shows in the journal. Journal-confirmed files get the new bookmark (in memory, saved at close) so the journal never has to reach back further than the last run.
+- **Report:** `12,031 unchanged (journal), 220 unchanged (size and time), 31 changed, 4 replaced because the copy on D: had been modified`.
+- **Moves.** Copy: counted only (`86 files were moved in the source since last time … Use 'drivedex sync' to mirror moves.`). Sync: a vanished record and a new file pair by NTFS file ID, else by name + size + `SameTime`, unique one-to-one pairs only (and by hash with `--compare checksum`); paired files are renamed on the destination. The journal bookmark of a moved file is kept: the rename doesn't count as a change, but a write made in the same interval still shows next time.
+- **`drivedex sync <src> <dst>`:** `dst\<folder name>` mirrors `src`, planned with `overwrite`. (1) only files recorded as placed by DriveDex for this source are ever removed; (2) an existing folder with no records → adopt: copy and record, delete nothing; (3) a source with no files is refused; nothing under a source folder that couldn't be listed is removed; (4) more than 50 % of the mirrored files or more than 1,000 → Block `mass-delete` unless `--allow-mass-delete`; (5) moves, then copies, then removals (skipped if the copy was stopped); (6) interactive runs ask `Go ahead?` before removing or replacing; a run that can't ask needs `--yes`; (7) removed and replaced files go to the trash, never deleted. `--detect-moves auto|off`, `--dry-run`, `--json` (`moved`, `removed`, `trashed`, `trash_run`, `compare`).
+- **Trash:** `<dst>\.drivedex\trash\<YYYYMMDD-HHMMSS>\<path>` filled by rename, `run.json` describes it (a run that crashed before writing it is still listed, reason "unknown"). Also used by `copy` for replaced files (`keep_replaced = true`). `trash_keep = "30d"` purges older runs at the start of each copy or sync to that destination, after one line of notice. `trash restore` never overwrites without asking (the file in the way goes to a new trash run); `trash empty` asks, or needs `--yes`.
+
+### Acceptance
+- [x] Manifest round trip and corruption detection (`TestManifestRoundTrip`), fuzzed reader (`FuzzDecode`, `FuzzReplayJournal`; 3.5 M executions, no crash), torn tail cut at every byte offset of the last frame (`TestJournalReplayStopsAtTornTail`), recovery after a crash (`TestStoreRecoversAfterACrash`), exclusive lock (`TestStoreIsExclusive`).
+- [x] Journal mode through the fake NTFS: an edit with its old time put back is copied again, the untouched file is skipped as "unchanged (journal)" (`TestINV1_CompareJournalCatchesAnEditThatKeptItsTime`, `TestINV1_JournalCatchesAnEditWithTheOldTime`).
+- [x] Sync: adopt deletes nothing, empty source refused, mass-delete guard blocks, removals go to the trash, restore brings them back, moves are renames (`TestSyncMirrorsMovesAndRemovesToTheTrash`, `TestSyncAdoptModeDeletesNothing`, `TestSyncRefusesAnEmptySource`, `TestSyncMassDeleteGuard`, `TestSyncNeedsYesWhenItCantAsk`, copier-level `TestSync*`).
+- [x] Crash test: 12 random runs stopped during the copies or the removals with the manifest unflushed; the re-run is an exact mirror and every earlier file is in the mirror or the trash (`TestINV3_CrashedSyncConvergesAndLosesNothing`).
+- [ ] Hardware: a sync to a USB pen drive unplugged mid-run, then re-run (PROGRESS.md).
+
+**Commit:** `stage 16: copy manifest, compare modes and sync (P3)`
 
 ---
 

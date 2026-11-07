@@ -37,15 +37,15 @@ func TestPlanLocalRefusesCopyingIntoItself(t *testing.T) {
 func TestSafeName(t *testing.T) {
 	for in, want := range map[string]string{
 		"plain.jpg":         "plain.jpg",
-		"meeting 10:30.txt": "meeting 10_30.txt",
-		`a<b>c"d|e?f*g\h`:   "a_b_c_d_e_f_g_h",
-		"tab\there":         "tab_here",
+		"meeting 10:30.txt": "meeting 10\uFF1A30.txt",
+		`a<b>c"d|e?f*g\h`:   "a\uFF1Cb\uFF1Ec\uFF02d\uFF5Ce\uFF1Ff\uFF0Ag\uFF3Ch",
+		"tab\there":         "tab\uFFFDhere",
 		"trailing.":         "trailing_",
 		"spaces  ":          "spaces__",
-		"CON":               "_CON",
-		"con.txt":           "_con.txt",
-		"Com1.tar.gz":       "_Com1.tar.gz",
-		"lpt9":              "_lpt9",
+		"CON":               "CON_",
+		"con.txt":           "con_.txt",
+		"Com1.tar.gz":       "Com1_.tar.gz",
+		"lpt9":              "lpt9_",
 		"console.txt":       "console.txt",
 		"COM10":             "COM10",
 		"":                  "_",
@@ -56,7 +56,7 @@ func TestSafeName(t *testing.T) {
 			t.Errorf("SafeName(%q) = %q, want %q", in, got, want)
 		}
 	}
-	if got, want := SafeRel(`DCIM\a:b\c?.jpg`), filepath.Join("DCIM", "a_b", "c_.jpg"); got != want {
+	if got, want := SafeRel(`DCIM\a:b\c?.jpg`), filepath.Join("DCIM", "a\uFF1Ab", "c\uFF1F.jpg"); got != want {
 		t.Errorf("SafeRel = %q, want %q", got, want)
 	}
 }
@@ -106,7 +106,7 @@ func TestStressCancelAndResume(t *testing.T) {
 				cancel()
 			}
 		}
-		res, err := Run(ctx, p, Options{Workers: 8, Verify: round%2 == 0})
+		res, err := Run(ctx, p, Options{Workers: 8, Verify: map[bool]VerifyMode{true: VerifyMedia, false: VerifyOff}[round%2 == 0]})
 		cancel()
 		if err != nil {
 			t.Fatalf("round %d: %v", round, err)

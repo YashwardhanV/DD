@@ -25,7 +25,9 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/yashwardhanv/dd/internal/fsinfo"
 	"github.com/yashwardhanv/dd/internal/index"
+	"github.com/yashwardhanv/dd/internal/manifest"
 	"github.com/yashwardhanv/dd/internal/scan"
 )
 
@@ -35,10 +37,6 @@ const (
 	OnConflictSkip      = "skip"      // never overwrite
 	OnConflictOverwrite = "overwrite" // always overwrite
 )
-
-// mtimeTolerance: FAT stores modification times in 2-second steps, so two
-// copies of the "same" file can differ by up to 2 s. Within that, times are equal.
-const mtimeTolerance = 2 // seconds
 
 // fat32MaxFile is the largest file FAT32 can store (4 GiB minus one byte).
 const fat32MaxFile = 4 << 30
@@ -81,14 +79,88 @@ type Job struct {
 	Rel string
 	// Size in bytes, and ModTime in unix seconds, as reported by the source.
 	Size, ModTime int64
+	// ModTimeNs is the modification time in nanoseconds since 1970 (UTC). 0
+	// means "only ModTime is known" (see MTimeNs).
+	ModTimeNs int64
+	// TimeCoarse: the source only knows whole seconds (phones, indexes written
+	// before exact times existed), so comparisons allow at least one second.
+	TimeCoarse bool
+	// SrcRel is the original destination-relative path when FixNames had to
+	// change it (a name Windows can't store, or a letter-case clash); the
+	// copy manifest keeps it so later runs recognise the file.
+	SrcRel string
+	// SrcFileID is the source's NTFS file reference number when known
+	// (plans from an index), 0 otherwise.
+	SrcFileID uint64
 }
+
+// MTimeNs is the job's modification time in nanoseconds.
+func (j Job) MTimeNs() int64 {
+	if j.ModTimeNs != 0 {
+		return j.ModTimeNs
+	}
+	return j.ModTime * 1e9
+}
+
+// DstState is what the destination held for an item when it was planned
+// (and, after a copy, what the copy looks like).
+type DstState struct {
+	Exists, IsDir bool
+	Size, MTimeNs int64
+}
+
+func dstStateOf(fi os.FileInfo) DstState {
+	if fi == nil {
+		return DstState{}
+	}
+	return DstState{Exists: true, IsDir: fi.IsDir(), Size: fi.Size(), MTimeNs: fi.ModTime().UnixNano()}
+}
+
+// SkipWhy says why a file was found up to date (for the report).
+type SkipWhy uint8
+
+const (
+	WhyNone     SkipWhy = iota
+	WhySizeTime         // same size and time (fast / strict)
+	WhyJournal          // the manifest and the NTFS change journal prove it unchanged
+	WhyChecksum         // same content hash
+	WhyMoved            // sync: moved on the destination to follow a source move
+)
 
 // Item is a Job plus what the plan decided about it.
 type Item struct {
 	Job
 	Decision Decision
+	// Dst is the destination as found when planning.
+	Dst DstState
+	// Why says which comparison found it up to date (skipped items).
+	Why SkipWhy
+	// Changed: size and time looked the same, but the comparison mode found
+	// different content (checksum) or a change in the journal (journal).
+	Changed bool
+	// DstModified: the destination copy is not what DriveDex wrote there
+	// (it differs from its manifest record): something else changed it.
+	DstModified bool
+	// MoveFrom (sync): the file is already on the destination at this other
+	// path, from before the source moved it; it is renamed instead of copied.
+	MoveFrom string
 	// Blocked is set when the destination exists but can't be replaced (it is a folder).
 	Blocked string
+	// DSTShift: the destination differs by exactly one hour on a drive that
+	// stores local time (FAT32), the mark of a daylight-saving change, and is
+	// treated as unchanged (SkipSame).
+	DSTShift bool
+
+	// Filled in when the file is copied (they feed the copy manifest):
+	Hash         [16]byte // XXH3-128 of the bytes read from the source
+	Hashed       bool     // Hash is valid
+	SrcSize      int64    // the source as it was when it was copied
+	SrcMTimeNs   int64
+	DstMTimeNs   int64 // the modification time given to the copy
+	MediaChecked bool  // read back from the destination without the cache and compared
+	// Renamed: FixNames gave this file a different destination name (SrcRel
+	// holds the original).
+	Renamed bool
 }
 
 // Plan is everything a copy is going to do.
@@ -99,6 +171,44 @@ type Plan struct {
 	Phone   *PhoneSource
 
 	OnConflict string
+
+	// SrcFS and DstFS describe the two file systems; they decide how
+	// modification times are compared (fsinfo.SameTime).
+	SrcFS, DstFS fsinfo.Info
+
+	// LinksSkipped counts symbolic links and junctions in the source. They are
+	// never followed or copied (that could copy files from somewhere else).
+	LinksSkipped int64
+	// NewDirs are the destination folders that don't exist yet (filled by
+	// finalize); each takes at least one cluster.
+	NewDirs int
+	// NamesFixed is set once FixNames has run (Run runs it with the defaults
+	// if nobody did, so a name Windows can't store is never written as-is).
+	NamesFixed bool
+	// FromIndex: planned from a saved index (PlanFromIndex), not a listing.
+	FromIndex bool
+	// Top is the folder the source becomes inside DstRoot (the source
+	// folder's own name), "" when single files are copied.
+	Top string
+	// UnlistedDirs are source folders (destination-relative, like Rel) that
+	// could not be listed completely. A sync removes nothing under them.
+	UnlistedDirs []string
+
+	// dstNames caches the destination folders read while deciding (one
+	// directory read per folder), for FixNames.
+	dstNames map[string][]string
+}
+
+// DSTShifts counts files treated as unchanged although their times differ by
+// exactly one hour (daylight saving on a FAT32 drive).
+func (p *Plan) DSTShifts() int64 {
+	var n int64
+	for i := range p.Items {
+		if p.Items[i].DSTShift {
+			n++
+		}
+	}
+	return n
 }
 
 // Counts summarises the plan.
@@ -137,73 +247,300 @@ func ValidPolicy(s string) bool {
 	return false
 }
 
+// decision is what decide concluded about one file.
+type decision struct {
+	d       Decision
+	blocked string
+	shift   bool // unchanged except for a daylight-saving hour
+}
+
 // decide applies the conflict rules to one file. dst is nil when the
 // destination doesn't exist.
 //
-//	same size and times within 2 s  -> skip  (this is how resume works)
-//	different + newer               -> overwrite only if the source is newer
-//	different + skip                -> skip
-//	different + overwrite           -> overwrite
-func decide(policy string, srcSize, srcMTime int64, dst os.FileInfo) (Decision, string) {
+//	same size and SameTime            -> skip  (this is how resume works)
+//	same size, exactly 1 h apart, FAT -> skip, counted as a daylight-saving shift
+//	different + newer                 -> overwrite only if the source is newer
+//	different + skip                  -> skip
+//	different + overwrite             -> overwrite
+//
+// Times are compared with the coarser of the two file systems' resolutions
+// (fsinfo.SameTime), not a fixed 2 seconds: NTFS to NTFS needs no slack at
+// all, so an edit within the same second is not missed (INV-1).
+func decide(policy string, j Job, dst os.FileInfo, srcFS, dstFS fsinfo.Info) decision {
+	return decideWith(policy, j, dst, srcFS, dstFS, true)
+}
+
+// decideWith is decide; allowShift=false is --compare strict: a daylight-
+// saving hour is a difference like any other.
+func decideWith(policy string, j Job, dst os.FileInfo, srcFS, dstFS fsinfo.Info, allowShift bool) decision {
 	if dst == nil {
-		return Copy, ""
+		return decision{d: Copy}
 	}
 	if dst.IsDir() {
-		return Copy, "the destination is a folder, not a file"
+		return decision{d: Copy, blocked: "the destination is a folder, not a file"}
 	}
-	dstMTime := dst.ModTime().Unix()
-	if dst.Size() == srcSize && abs64(dstMTime-srcMTime) <= mtimeTolerance {
-		return SkipSame, ""
+	srcNs, dstNs := j.MTimeNs(), dst.ModTime().UnixNano()
+	if dst.Size() == j.Size {
+		same, shift := fsinfo.SameTime(srcNs, dstNs, srcFS, dstFS, j.TimeCoarse)
+		if same {
+			return decision{d: SkipSame}
+		}
+		if shift && allowShift {
+			return decision{d: SkipSame, shift: true}
+		}
 	}
 	switch policy {
 	case OnConflictSkip:
-		return SkipPolicy, ""
+		return decision{d: SkipPolicy}
 	case OnConflictOverwrite:
-		return Overwrite, ""
+		return decision{d: Overwrite}
 	default: // newer
-		if srcMTime > dstMTime {
-			return Overwrite, ""
+		if srcNs > dstNs {
+			return decision{d: Overwrite}
 		}
-		return SkipNewer, ""
+		return decision{d: SkipNewer}
 	}
-}
-
-func abs64(v int64) int64 {
-	if v < 0 {
-		return -v
-	}
-	return v
 }
 
 // finalize resolves conflicts for jobs (statting destinations in parallel),
-// sorts so big files go first, and assembles the Plan.
-func finalize(dstRoot string, dirs []string, jobs []Job, policy string, workers int) *Plan {
+// sorts so big files go first, and assembles the Plan. srcFS describes where
+// the jobs are read from.
+func finalize(dstRoot string, dirs []string, jobs []Job, policy string, workers int, srcFS fsinfo.Info) *Plan {
 	if policy == "" {
 		policy = OnConflictNewer
 	}
-	items := make([]Item, len(jobs))
-	parallelFor(len(jobs), workers, func(i int) {
-		j := jobs[i]
-		items[i].Job = j
-		st, err := os.Lstat(filepath.Join(dstRoot, j.Rel))
-		if err != nil {
-			st = nil // not there (or unreadable: copying will report the real problem)
-		}
-		items[i].Decision, items[i].Blocked = decide(policy, j.Size, j.ModTime, st)
-	})
+	dstFS := fsinfo.OrDefault(dstRoot)
+	listing := checkDestination(dstRoot, jobs, workers, dstFS)
 
 	// Largest first: big files start early instead of ending as one lonely
 	// straggler while every other worker sits idle. Ties by name for a
 	// predictable order.
-	sort.SliceStable(items, func(a, b int) bool {
-		if items[a].Size != items[b].Size {
-			return items[a].Size > items[b].Size
+	// PERF: sort positions, not Items: an Item is ~200 bytes, and moving
+	// them around was a sixth of planning a 200,000-file copy.
+	order := make([]int32, len(jobs))
+	for i := range order {
+		order[i] = int32(i)
+	}
+	sort.Slice(order, func(a, b int) bool {
+		ja, jb := &jobs[order[a]], &jobs[order[b]]
+		if ja.Size != jb.Size {
+			return ja.Size > jb.Size
 		}
-		return items[a].Rel < items[b].Rel
+		return ja.Rel < jb.Rel
+	})
+	items := make([]Item, len(jobs))
+	parallelFor(len(jobs), workers, func(i int) {
+		j := jobs[order[i]]
+		items[i].Job = j
+		st := listing.lookup(j.Rel)
+		dec := decide(policy, j, st, srcFS, dstFS)
+		items[i].Decision, items[i].Blocked, items[i].DSTShift = dec.d, dec.blocked, dec.shift
+		items[i].Dst = dstStateOf(st)
+		if dec.d == SkipSame {
+			items[i].Why = WhySizeTime
+		}
 	})
 	sort.Strings(dirs)
-	return &Plan{DstRoot: dstRoot, Dirs: dirs, Items: items, OnConflict: policy}
+	p := &Plan{DstRoot: dstRoot, Dirs: dirs, Items: items, OnConflict: policy, SrcFS: srcFS, DstFS: dstFS, dstNames: listing.names}
+	p.countNewDirsWith(listing)
+	return p
 }
+
+// dstListing is what the destination folders hold, read once per folder.
+type dstListing struct {
+	infos   map[string]os.FileInfo // "<folder>\x00<folded name>" -> info
+	names   map[string][]string    // folder -> every name in it (for case collisions)
+	missing map[string]bool        // folders known not to exist
+	allNew  bool                   // the destination itself doesn't exist yet
+	fold    func(string) string
+}
+
+func (d *dstListing) lookup(rel string) os.FileInfo {
+	if d.allNew || len(d.infos) == 0 {
+		return nil
+	}
+	dir, name := splitDirBase(rel)
+	return d.infos[dir+"\x00"+d.fold(name)]
+}
+
+// splitDirBase splits a relative path at its last separator, without the
+// cleaning (and allocations) filepath.Dir and Base do.
+func splitDirBase(rel string) (dir, name string) {
+	i := strings.LastIndexByte(rel, filepath.Separator)
+	if filepath.Separator != '/' {
+		if j := strings.LastIndexByte(rel, '/'); j > i {
+			i = j
+		}
+	}
+	if i < 0 {
+		return "", rel
+	}
+	return rel[:i], rel[i+1:]
+}
+
+// checkDestination reads every destination folder the jobs go to, once, in
+// parallel (instead of one Lstat per file). A folder that doesn't exist means
+// every file below it is new, and nothing below it is read. On Windows the
+// sizes and times come with the folder listing itself (FindFirstFile data),
+// so this costs one call per folder. Names are matched the way the
+// destination matches them: ignoring case unless it is case-sensitive.
+func checkDestination(dstRoot string, jobs []Job, workers int, dstFS fsinfo.Info) *dstListing {
+	d := &dstListing{infos: map[string]os.FileInfo{}, names: map[string][]string{}, missing: map[string]bool{}, fold: func(s string) string { return s }}
+	if !dstFS.CaseSensitive {
+		d.fold = strings.ToUpper
+	}
+	if _, err := os.Lstat(dstRoot); err != nil {
+		d.allNew = true // nothing there yet: every file is new, nothing to read
+		return d
+	}
+	seen := map[string]bool{}
+	var folders []string
+	for _, j := range jobs {
+		dir, _ := splitDirBase(j.Rel)
+		if !seen[dir] {
+			seen[dir] = true
+			folders = append(folders, dir)
+		}
+	}
+	sort.Strings(folders) // parents before children
+	missing := d.missing
+	var mu sync.Mutex
+	// Walk folders top-down in "waves" by depth, so a missing parent is known
+	// before its children are tried.
+	byDepth := map[int][]string{}
+	maxDepth := 0
+	for _, f := range folders {
+		depth := 0
+		if f != "" {
+			depth = strings.Count(f, string(filepath.Separator)) + 1
+		}
+		byDepth[depth] = append(byDepth[depth], f)
+		maxDepth = max(maxDepth, depth)
+	}
+	parentMissing := func(f string) bool {
+		for p := filepath.Dir(f); p != "." && p != f; p = filepath.Dir(p) {
+			if missing[p] {
+				return true
+			}
+			f = p
+		}
+		return false
+	}
+	for depth := 0; depth <= maxDepth; depth++ {
+		wave := byDepth[depth]
+		parallelFor(len(wave), workers, func(i int) {
+			f := wave[i]
+			mu.Lock()
+			skip := parentMissing(f)
+			mu.Unlock()
+			if skip {
+				mu.Lock()
+				missing[f] = true
+				mu.Unlock()
+				return
+			}
+			entries, err := os.ReadDir(filepath.Join(dstRoot, f))
+			if err != nil {
+				mu.Lock()
+				missing[f] = true
+				mu.Unlock()
+				return
+			}
+			names := make([]string, 0, len(entries))
+			infos := make(map[string]os.FileInfo, len(entries))
+			for _, e := range entries {
+				names = append(names, e.Name())
+				if info, err := e.Info(); err == nil {
+					infos[f+"\x00"+d.fold(e.Name())] = info
+				}
+			}
+			mu.Lock()
+			d.names[f] = names
+			for k, v := range infos {
+				d.infos[k] = v
+			}
+			mu.Unlock()
+		})
+	}
+	return d
+}
+
+// countNewDirs counts the destination folders the copy will create.
+func (p *Plan) countNewDirs() { p.countNewDirsWith(nil) }
+
+// countNewDirsWith is countNewDirs using what checkDestination already knows,
+// so planning a big copy to a new folder makes no extra system calls.
+func (p *Plan) countNewDirsWith(known *dstListing) {
+	seen := map[string]bool{}
+	n := 0
+	exists := func(rel string) bool {
+		if known != nil {
+			if known.allNew || known.missing[rel] {
+				return false
+			}
+			if _, ok := known.names[rel]; ok {
+				return true
+			}
+		}
+		_, err := os.Lstat(filepath.Join(p.DstRoot, rel))
+		return err == nil
+	}
+	var walk func(rel string)
+	walk = func(rel string) {
+		for rel != "" && rel != "." && !seen[rel] {
+			seen[rel] = true
+			if exists(rel) {
+				return // it exists, and so do its parents
+			}
+			n++
+			rel, _ = splitDirBase(rel)
+		}
+	}
+	for _, d := range p.Dirs {
+		walk(d)
+	}
+	for i := range p.Items {
+		if !p.Items[i].Decision.Skipped() {
+			dir, _ := splitDirBase(p.Items[i].Rel)
+			walk(dir)
+		}
+	}
+	p.NewDirs = n
+}
+
+// SpaceNeeded is how much free space writing the plan really takes: every
+// written file rounded up to whole clusters (allocation units), plus one
+// cluster per new folder, plus 1 percent margin. On NTFS, files under about
+// 700 bytes live inside their MFT record and take no cluster at all.
+//
+// The difference matters for many small files on exFAT drives, whose default
+// clusters are 32 to 128 KB: 10,000 files of 1 KB take 1.25 GB at 128 KB each.
+func (p *Plan) SpaceNeeded() (files, onDisk int64) {
+	cl := p.DstFS.ClusterBytes
+	if cl <= 0 {
+		cl = 4096
+	}
+	for i := range p.Items {
+		it := &p.Items[i]
+		if it.Decision.Skipped() {
+			continue
+		}
+		files += it.Size
+		if p.DstFS.IsNTFS() && it.Size < ntfsResidentMax {
+			continue
+		}
+		onDisk += (it.Size + cl - 1) / cl * cl
+	}
+	onDisk += int64(p.NewDirs) * cl
+	onDisk += onDisk / 100
+	return files, onDisk
+}
+
+// ntfsResidentMax: NTFS stores files smaller than this inside their MFT
+// record ("resident"), using no cluster. The real limit depends on the length
+// of the name and other attributes; ~700 bytes is the usual figure for a
+// 1 KB record. A starting value to calibrate on real hardware.
+const ntfsResidentMax = 700
 
 // parallelFor runs fn(0..n-1) on up to `workers` goroutines.
 func parallelFor(n, workers int, fn func(i int)) {
@@ -259,9 +596,10 @@ func PlanLocal(ctx context.Context, src, dstRoot, policy string, workers int) (*
 		return nil, fmt.Errorf("opening %s: %w", src, err)
 	}
 
+	srcFS := fsinfo.OrDefault(src)
 	if !st.IsDir() {
-		job := Job{Src: src, Rel: filepath.Base(src), Size: st.Size(), ModTime: st.ModTime().Unix()}
-		return finalize(dstRoot, nil, []Job{job}, policy, 1), nil
+		job := Job{Src: src, Rel: filepath.Base(src), Size: st.Size(), ModTime: st.ModTime().Unix(), ModTimeNs: st.ModTime().UnixNano()}
+		return finalize(dstRoot, nil, []Job{job}, policy, 1, srcFS), nil
 	}
 
 	if inside(src, dstRoot) {
@@ -270,6 +608,9 @@ func PlanLocal(ctx context.Context, src, dstRoot, policy string, workers int) (*
 
 	name := srcName(src)
 	sc := scan.NewParallel(src, workers)
+	// A copy manifest folder in the source (it was once a destination) is
+	// DriveDex's own bookkeeping, not data: never copied.
+	sc.SkipDirs = append(append([]string(nil), scan.DefaultSkipDirs...), ManifestDirName)
 	b := index.NewBuilder(index.Header{})
 	if err := sc.Scan(ctx, b, nil); err != nil {
 		return nil, fmt.Errorf("listing %s: %w", src, err)
@@ -278,6 +619,7 @@ func PlanLocal(ctx context.Context, src, dstRoot, policy string, workers int) (*
 
 	dirs := []string{name} // the top folder itself, even if the source is empty
 	var jobs []Job
+	var links int64
 	cache := map[uint64]string{}
 	for slot := 0; slot < ix.Len(); slot++ {
 		rel := filepath.Join(name, strings.ReplaceAll(ix.RelPathCached(slot, cache), `\`, string(filepath.Separator)))
@@ -285,15 +627,30 @@ func PlanLocal(ctx context.Context, src, dstRoot, policy string, workers int) (*
 			dirs = append(dirs, rel)
 			continue
 		}
+		if ix.Flags[slot]&index.FlagReparse != 0 {
+			links++
+			continue
+		}
 		jobs = append(jobs, Job{
-			Src:     index.JoinRoot(src, ix.RelPathCached(slot, cache)),
-			Rel:     rel,
-			Size:    max(ix.Sizes[slot], 0),
-			ModTime: ix.MTimes[slot],
+			Src:        index.JoinRoot(src, ix.RelPathCached(slot, cache)),
+			Rel:        rel,
+			Size:       max(ix.Sizes[slot], 0),
+			ModTime:    ix.MTimes[slot],
+			ModTimeNs:  ix.ModTimeNs(slot),
+			TimeCoarse: !ix.Header.ExactTimes(),
 		})
 	}
-	return finalize(dstRoot, dirs, jobs, policy, workers), nil
+	p := finalize(dstRoot, dirs, jobs, policy, workers, srcFS)
+	p.LinksSkipped, p.Top = links, name
+	for _, d := range sc.Stats().FailedDirs {
+		p.UnlistedDirs = append(p.UnlistedDirs, filepath.Join(name, d))
+	}
+	return p, nil
 }
+
+// ManifestDirName is the copy manifest's folder (manifest.DirName), skipped
+// in every source.
+const ManifestDirName = manifest.DirName
 
 // ErrDestinationInsideSource means a folder would be copied into itself (or
 // one of its own sub-folders). Explorer refuses that too: every run would copy
@@ -311,9 +668,10 @@ func inside(dir, path string) bool {
 }
 
 // PlanJobs plans copying an explicit list of files (for example every match of
-// a search) into dstRoot.
-func PlanJobs(dstRoot string, jobs []Job, policy string, workers int) *Plan {
-	return finalize(dstRoot, nil, append([]Job(nil), jobs...), policy, workers)
+// a search) into dstRoot. srcFS describes the files' file system (they may
+// come from several drives; pass the most tolerant one).
+func PlanJobs(dstRoot string, jobs []Job, policy string, workers int, srcFS fsinfo.Info) *Plan {
+	return finalize(dstRoot, nil, append([]Job(nil), jobs...), policy, workers, srcFS)
 }
 
 // ---------------------------------------------------------------------------
@@ -351,8 +709,9 @@ func (p *Plan) Check(c Checks) error {
 
 	probe := nearestExisting(p.DstRoot)
 	if c.FreeBytes != nil {
-		if free, err := c.FreeBytes(probe); err == nil && uint64(counts.WriteBytes) > free {
-			return fmt.Errorf("%w: need %d bytes but only %d are free", ErrNotEnoughSpace, counts.WriteBytes, free)
+		_, need := p.SpaceNeeded()
+		if free, err := c.FreeBytes(probe); err == nil && uint64(need) > free {
+			return fmt.Errorf("%w: need %d bytes but only %d are free", ErrNotEnoughSpace, need, free)
 		}
 	}
 	if c.FileSystem != nil {

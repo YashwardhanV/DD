@@ -53,6 +53,8 @@ type Config struct {
 	AdbPath       string   `toml:"adb_path"`
 	PhoneRoot     string   `toml:"phone_root"`
 	Color         string   `toml:"color"`
+	KeepReplaced  bool     `toml:"keep_replaced"`
+	TrashKeep     string   `toml:"trash_keep"`
 }
 
 // Defaults returns the built-in settings (BUILD.md stage 11).
@@ -69,6 +71,8 @@ func Defaults() Config {
 		AdbPath:       "",
 		PhoneRoot:     "/sdcard/",
 		Color:         "auto",
+		KeepReplaced:  true,
+		TrashKeep:     "30d",
 	}
 }
 
@@ -113,6 +117,15 @@ phone_root      = "/sdcard/"
 
 # Colored output: "auto", "always" or "never". (The NO_COLOR environment variable is also respected.)
 color           = "auto"
+
+# When a copy or sync replaces a file on the destination, keep the old version
+# in the destination's trash (<destination>\.drivedex\trash) instead of losing it.
+# 'drivedex trash list <destination>' shows it; 'drivedex trash restore' brings it back.
+keep_replaced   = true
+
+# Trash runs older than this are deleted for good at the start of the next
+# copy or sync to that destination (one line says so). "" keeps them forever.
+trash_keep      = "30d"
 `
 
 // Path returns where the config file lives.
@@ -193,6 +206,9 @@ func (c Config) Validate() error {
 			return fmt.Errorf("auto_index entries must be drive letters like \"D:\", not %q", a)
 		}
 	}
+	if _, err := c.TrashKeepDuration(); err != nil {
+		return err
+	}
 	if pr := strings.TrimSpace(c.PhoneRoot); pr != "" && !strings.HasPrefix(pr, "/") {
 		return fmt.Errorf("phone_root must start with / (for example \"/sdcard/\"), not %q", c.PhoneRoot)
 	}
@@ -255,6 +271,30 @@ func (c Config) StaleDuration() (time.Duration, error) {
 	d, err := time.ParseDuration(s)
 	if err != nil || d < 0 {
 		return 0, fmt.Errorf("stale_after must be a time like \"24h\", \"90m\" or \"7d\", not %q", c.StaleAfter)
+	}
+	return d, nil
+}
+
+// TrashKeepDuration parses trash_keep ("30d", "2w", "720h"); 0 = keep forever.
+func (c Config) TrashKeepDuration() (time.Duration, error) {
+	s := strings.TrimSpace(strings.ToLower(c.TrashKeep))
+	if s == "" {
+		return 0, nil
+	}
+	for suffix, unit := range map[string]float64{"d": 24, "w": 24 * 7} {
+		if strings.HasSuffix(s, suffix) {
+			var n float64
+			if _, err := fmt.Sscanf(strings.TrimSuffix(s, suffix), "%g", &n); err == nil && n > 0 {
+				if d := n * unit * float64(time.Hour); d < math.MaxInt64 {
+					return time.Duration(d), nil
+				}
+				return 0, nil // more than Go can count: forever
+			}
+		}
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("trash_keep must be a time like \"30d\", \"2w\" or \"720h\" (or \"\" to keep the trash forever), not %q", c.TrashKeep)
 	}
 	return d, nil
 }

@@ -65,6 +65,9 @@ func TestSearchCopyToKeepsSameLabelSourcesApart(t *testing.T) {
 	}
 	var found []string
 	filepath.Walk(dst, func(p string, info os.FileInfo, err error) error {
+		if err == nil && info.IsDir() && info.Name() == ".drivedex" {
+			return filepath.SkipDir
+		}
 		if err == nil && !info.IsDir() {
 			b, _ := os.ReadFile(p)
 			found = append(found, string(b))
@@ -92,6 +95,7 @@ func TestPhoneCopyMakesNamesSafeForWindows(t *testing.T) {
 	fs.Add("/sdcard/Notes/con.txt", "device name", 1_700_000_004)
 	useFS(t, fs)
 	fakeDriveType(t, false, true)
+	fakeChecks(t, 1<<40, "NTFS") // names are fixed for what the destination can store
 
 	dst := filepath.Join(t.TempDir(), "out")
 	out, err := run(t, "--no-color", "copy", "phone:/Notes", dst)
@@ -99,7 +103,7 @@ func TestPhoneCopyMakesNamesSafeForWindows(t *testing.T) {
 		t.Fatalf("%v\n%s", err, out)
 	}
 	for name, want := range map[string]string{
-		"meeting 10_30.txt": "colon", "what_.txt": "question", "plain.txt": "plain", "_con.txt": "device name",
+		"meeting 10\uFF1A30.txt": "colon", "what\uFF1F.txt": "question", "plain.txt": "plain", "con_.txt": "device name",
 	} {
 		if got := string(readFile(t, dst, "Notes", name)); got != want {
 			t.Errorf("%s = %q, want %q", name, got, want)

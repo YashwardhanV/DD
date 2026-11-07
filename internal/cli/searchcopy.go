@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/yashwardhanv/dd/internal/copier"
+	"github.com/yashwardhanv/dd/internal/fsinfo"
 	"github.com/yashwardhanv/dd/internal/index"
 	"github.com/yashwardhanv/dd/internal/ui"
 )
@@ -87,7 +88,8 @@ func copyMatches(ctx context.Context, in io.Reader, out *bufio.Writer, indexes [
 			groups[h.Index] = g
 		}
 		relOS := strings.ReplaceAll(rel, `\`, string(filepath.Separator))
-		job := copier.Job{Rel: filepath.Join(g.label, relOS), Size: ix.Sizes[h.Slot], ModTime: ix.MTimes[h.Slot]}
+		job := copier.Job{Rel: filepath.Join(g.label, relOS), Size: ix.Sizes[h.Slot], ModTime: ix.MTimes[h.Slot],
+			ModTimeNs: ix.ModTimeNs(h.Slot), TimeCoarse: !hd.ExactTimes()}
 
 		switch hd.SourceKind {
 		case index.KindDevice:
@@ -116,7 +118,7 @@ func copyMatches(ctx context.Context, in io.Reader, out *bufio.Writer, indexes [
 					unreadable++
 					return
 				}
-				job.Size, job.ModTime = st.Size(), st.ModTime().Unix()
+				job.Size, job.ModTime, job.ModTimeNs, job.TimeCoarse = st.Size(), st.ModTime().Unix(), st.ModTime().UnixNano(), false
 			}
 		}
 		if job.Size < 0 {
@@ -196,10 +198,11 @@ func copyMatches(ctx context.Context, in io.Reader, out *bufio.Writer, indexes [
 			}
 			plan = copier.PlanPhoneJobs(adb, g.serial, g.jobs, dst, copier.OnConflictNewer, max(workers, 4))
 		} else {
-			plan = copier.PlanJobs(dst, g.jobs, copier.OnConflictNewer, max(workers, 4))
+			plan = copier.PlanJobs(dst, g.jobs, copier.OnConflictNewer, max(workers, 4), fsinfo.ForFileSystem(g.index.Header.FileSystem))
 		}
 		fmt.Fprintf(out, "\n%s\n", ui.Bold(g.label))
-		if err := finishPlan(ctx, out, status, plan, planRun{workers: workers, why: why, dstArg: f.copyTo}); err != nil {
+		if err := finishPlan(ctx, out, status, plan, planRun{workers: workers, why: why, dstArg: f.copyTo, srcArg: g.label, plannedFrom: "search",
+			names: copier.NameOptions{OnCaseCollision: copier.OnCaseRename, OnBadName: copier.OnBadReplace}, yes: f.yes, in: in}); err != nil {
 			failed++
 			fmt.Fprintln(out, ui.Red("  "+err.Error()))
 		}

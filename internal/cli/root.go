@@ -37,6 +37,11 @@ type UserError struct {
 	Msg  string
 	Hint string
 	Err  error // underlying cause, shown only with --debug
+	// Code is the process exit code (0 = the usual 1). Pre-flight blocks use 3,
+	// a fake or faulty drive 4.
+	Code int
+	// Quiet: the message has already been shown; only set the exit code.
+	Quiet bool
 }
 
 func (e *UserError) Error() string { return e.Msg }
@@ -65,8 +70,18 @@ func Execute(ctx context.Context, version string) int {
 func executeRoot(ctx context.Context, root *cobra.Command, in io.Reader, out io.Writer) int {
 	code := 0
 	if err := root.ExecuteContext(ctx); err != nil {
-		printError(err)
 		code = 1
+		var ue *UserError
+		if errors.As(err, &ue) {
+			if ue.Code != 0 {
+				code = ue.Code
+			}
+			if !ue.Quiet {
+				printError(err)
+			}
+		} else {
+			printError(err)
+		}
 	}
 	if flagPause {
 		waitForEnter(in, out)
@@ -123,6 +138,8 @@ saved index instantly - even for drives that are not plugged in.`,
 	root.AddCommand(newBenchScanCmd())
 	root.AddCommand(newJournalCmd())
 	root.AddCommand(newCopyCmd())
+	root.AddCommand(newSyncCmd())
+	root.AddCommand(newTrashCmd())
 	root.AddCommand(newTUICmd())
 	root.AddCommand(newAgentCmd())
 	root.AddCommand(newStartupCmd())

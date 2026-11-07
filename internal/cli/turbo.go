@@ -17,6 +17,8 @@ import (
 var (
 	openNTFS   = ntfs.Open
 	isElevated = ntfs.IsElevated
+	// ntfsLister reads folders of a drive (sizes, dates, file IDs).
+	ntfsLister = func(root string) ntfs.DirLister { return ntfs.WindowsLister{} }
 )
 
 // adminTip is shown (once) when an NTFS drive is indexed without Administrator
@@ -96,10 +98,20 @@ func indexMFT(ctx context.Context, out io.Writer, root string, header index.Head
 	sess.SkipDirs = activeSkipDirs()
 
 	// 1. Incremental refresh: read only the changes since the last time.
-	if !opts.full && !opts.withMetadata {
+	if !opts.full {
 		if old, lerr := store.Load(header.SourceID); lerr == nil && old.Header.Scanner == "mft" {
 			start := time.Now()
 			res, rerr := ntfs.Refresh(ctx, sess, old)
+			if rerr == nil && !opts.noMetadata {
+				// Keep sizes and dates complete: refresh only what changed, or
+				// fill everything once if the index was made names-only.
+				lister := ntfsLister(root)
+				if old.Header.MetaComplete {
+					_, rerr = ntfs.RefreshTouched(ctx, old, root, res.Touched, lister, 8)
+				} else {
+					_, rerr = ntfs.FillMetadataByDir(ctx, old, root, lister, 8, nil)
+				}
+			}
 			switch {
 			case rerr == nil:
 				old.Header.Label, old.Header.FileSystem = header.Label, header.FileSystem
@@ -124,7 +136,10 @@ func indexMFT(ctx context.Context, out io.Writer, root string, header index.Head
 	}
 
 	// 2. Full MFT scan.
-	sc := &ntfs.MFTScanner{Session: sess, Root: root, WithMetadata: opts.withMetadata, SkipDirs: activeSkipDirs()}
+	sc := &ntfs.MFTScanner{Session: sess, Root: root, WithMetadata: !opts.noMetadata, SkipDirs: activeSkipDirs()}
+	if !opts.noMetadata {
+		sc.Lister = ntfsLister(root)
+	}
 	fmt.Fprintln(out, ui.Dim("Using NTFS turbo mode (reading the master file table)"))
 	err = runIndexJob(ctx, out, header, sc, root, opts.quiet)
 	switch {
@@ -149,12 +164,16 @@ func printTurboNotes(out io.Writer, root string, sc *ntfs.MFTScanner, opts scanO
 		fmt.Fprintf(out, "%s no change journal on this drive, so future refreshes will re-read everything. Switch it on: drivedex journal enable %s\n",
 			ui.Yellow("note:"), letterOrRoot(root))
 	}
-	if opts.withMetadata {
+	if !opts.noMetadata {
 		filled, missing := sc.MetadataFilled()
-		fmt.Fprintln(out, ui.Dim(fmt.Sprintf("Sizes and dates read for %s entries (%s could not be read).", ui.Thousands(filled), ui.Thousands(missing))))
+		msg := fmt.Sprintf("Sizes and dates read folder by folder for %s entries.", ui.Thousands(filled))
+		if missing > 0 {
+			msg = fmt.Sprintf("Sizes and dates read for %s entries (%s in folders that couldn't be opened).", ui.Thousands(filled), ui.Thousands(missing))
+		}
+		fmt.Fprintln(out, ui.Dim(msg))
 		return
 	}
-	fmt.Fprintln(out, ui.Dim("Turbo mode stores names only; sizes and dates are looked up when results are shown. Use --with-metadata to store them (needed for size: filters)."))
+	fmt.Fprintln(out, ui.Dim("--no-metadata: names only; sizes and dates are looked up when results are shown (size: filters and planning copies from the index need them)."))
 }
 
 // letterOrRoot turns `E:\` into "E:" for messages.

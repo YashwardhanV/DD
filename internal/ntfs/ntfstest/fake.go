@@ -30,7 +30,14 @@ type file struct {
 	name   string
 	attrs  uint32
 	usn    int64 // USN of the last change, as reported by enumeration
+
+	size       int64
+	mtimeNs    int64
+	reparseTag uint32
+	unreadable bool // ListDir of this folder fails (access denied)
 }
+
+const reasonBasicInfo uint32 = 0x00008000 // USN_REASON_BASIC_INFO_CHANGE (times, attributes)
 
 // Volume is the fake drive. Create it with New.
 type Volume struct {
@@ -164,6 +171,142 @@ func (v *Volume) Touch(frn uint64) {
 	defer v.mu.Unlock()
 	v.journal(frn, reasonWrite)
 	v.journal(frn, reasonWrite|reasonClose)
+}
+
+// SetMeta gives a file its size and modification time quietly (no journal
+// record): what it "always" had, for building a starting state.
+func (v *Volume) SetMeta(frn uint64, size, mtimeNs int64) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	f := v.files[frn]
+	f.size, f.mtimeNs = size, mtimeNs
+}
+
+// Write simulates a program changing a file's content: new size and time,
+// journaled like a real write.
+func (v *Volume) Write(frn uint64, size, mtimeNs int64) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	f := v.files[frn]
+	f.size, f.mtimeNs = size, mtimeNs
+	v.journal(frn, reasonWrite)
+	v.journal(frn, reasonWrite|reasonClose)
+}
+
+// SetTime simulates a program setting a file's modification time (for
+// example putting the old time back after an edit). NTFS journals it.
+func (v *Volume) SetTime(frn uint64, mtimeNs int64) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.files[frn].mtimeNs = mtimeNs
+	v.journal(frn, reasonBasicInfo)
+	v.journal(frn, reasonBasicInfo|reasonClose)
+}
+
+// CreateLink creates a reparse point (a symlink, junction or other link)
+// with the given reparse tag.
+func (v *Volume) CreateLink(parent uint64, name string, dir bool, tag uint32) uint64 {
+	attrs := ntfs.AttrReparse
+	if dir {
+		attrs |= ntfs.AttrDirectory
+	}
+	frn := v.add(parent, name, attrs)
+	v.mu.Lock()
+	v.files[frn].reparseTag = tag
+	v.mu.Unlock()
+	return frn
+}
+
+// SetUnreadable makes listing a folder fail, like a folder the user may not open.
+func (v *Volume) SetUnreadable(frn uint64) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.files[frn].unreadable = true
+}
+
+// FRNOf returns the reference number of the file at rel (`\` separators).
+func (v *Volume) FRNOf(rel string) (uint64, bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	for frn := range v.files {
+		if p, ok := v.pathOf(frn); ok && strings.EqualFold(p, rel) {
+			return frn, true
+		}
+	}
+	return 0, false
+}
+
+// Lister returns a DirLister reading this volume as if it were mounted at
+// root (such as `E:\`); ListDir counts its calls in ListCalls.
+func (v *Volume) Lister(root string) *Lister { return &Lister{v: v, root: root} }
+
+// Lister is the folder lister of a fake volume.
+type Lister struct {
+	v         *Volume
+	root      string
+	mu        sync.Mutex
+	ListCalls int
+}
+
+// rel is path relative to the lister's root, with `\` separators. Both are
+// converted the same way, so a Unix-style root works too.
+func (l *Lister) rel(path string) string {
+	slash := func(s string) string { return strings.TrimRight(strings.ReplaceAll(s, "/", `\`), `\`) }
+	return strings.Trim(strings.TrimPrefix(slash(path), slash(l.root)), `\`)
+}
+
+// StatFile implements ntfs.FileStater: one file of the fake volume.
+func (l *Lister) StatFile(path string) (ntfs.DirRecord, error) {
+	rel := l.rel(path)
+	v := l.v
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	for frn, f := range v.files {
+		if p, ok := v.pathOf(frn); ok && strings.EqualFold(p, rel) {
+			return ntfs.DirRecord{FileID: frn, Name: f.name, Size: f.size, MTimeNs: f.mtimeNs, Attrs: f.attrs, ReparseTag: f.reparseTag}, nil
+		}
+	}
+	return ntfs.DirRecord{}, fmt.Errorf("ntfstest: no file %q", rel)
+}
+
+// ListDir implements ntfs.DirLister.
+func (l *Lister) ListDir(dir string) ([]ntfs.DirRecord, error) {
+	l.mu.Lock()
+	l.ListCalls++
+	l.mu.Unlock()
+	rel := l.rel(dir)
+	v := l.v
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	folder := v.RootFRN
+	if rel != "" {
+		found := false
+		for frn, f := range v.files {
+			if f.attrs&ntfs.AttrDirectory == 0 {
+				continue
+			}
+			if p, ok := v.pathOf(frn); ok && strings.EqualFold(p, rel) {
+				folder, found = frn, true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("ntfstest: no folder %q", rel)
+		}
+	}
+	if v.files[folder].unreadable {
+		return nil, fmt.Errorf("ntfstest: access to %q is denied", rel)
+	}
+	var recs []ntfs.DirRecord
+	for frn, f := range v.files {
+		if f.parent != folder || frn == v.RootFRN || ntfs.RecordNumber(frn) < ntfs.FirstUserRecord {
+			continue
+		}
+		recs = append(recs, ntfs.DirRecord{FileID: frn, Name: f.name, Size: f.size, MTimeNs: f.mtimeNs, Attrs: f.attrs, ReparseTag: f.reparseTag})
+	}
+	sort.Slice(recs, func(a, b int) bool { return recs[a].Name < recs[b].Name })
+	// Round-trip through the real buffer format, so the parser is exercised too.
+	return ntfs.ParseDirInfo(nil, ntfs.EncodeDirInfo(recs))
 }
 
 // Delete removes a file or (empty) folder.

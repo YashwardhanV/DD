@@ -14,6 +14,7 @@ import (
 
 	"github.com/yashwardhanv/dd/internal/copier"
 	"github.com/yashwardhanv/dd/internal/phone"
+	"github.com/yashwardhanv/dd/internal/preflight"
 	"github.com/yashwardhanv/dd/internal/ui"
 )
 
@@ -22,8 +23,8 @@ var copyChecks = copier.DefaultChecks
 
 // newCopyCmd implements `drivedex copy <src> <dst>`.
 func newCopyCmd() *cobra.Command {
-	var workers, onConflict string
-	var verify, dryRun bool
+	var workers, onConflict, verify, onCase, onBad, sourceList, readOrder, compare string
+	var dryRun, yes, asJSON, verbose, caseSensitive, noManifest bool
 
 	cmd := &cobra.Command{
 		Use:   "copy <src> <dst>",
@@ -48,21 +49,88 @@ for speed, DriveDex does not force every file to be flushed to the disk.`,
   drivedex copy C:\Projects F:\ --on-conflict skip --verify`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runCopy(cmd.Context(), cmd.OutOrStdout(), args[0], args[1], copyFlags{
-				workers: effectiveWorkers(cmd, workers), onConflict: onConflict, verify: verify, dryRun: dryRun,
+			mode, ok := copier.ParseVerifyMode(verify)
+			if !ok {
+				return userErr(fmt.Sprintf("--verify %q isn't valid", verify), "use --verify (the same as --verify=media), --verify=cache or --verify=off", nil)
+			}
+			names, err := nameOptions(onCase, onBad, caseSensitive)
+			if err != nil {
+				return err
+			}
+			if err := checkCopyModes(sourceList, readOrder, compare); err != nil {
+				return err
+			}
+			stdout := cmd.OutOrStdout()
+			human := stdout
+			if asJSON {
+				human = cmd.ErrOrStderr() // stdout carries only the JSON result
+			}
+			js := &copyJSON{}
+			err = runCopy(cmd.Context(), human, args[0], args[1], copyFlags{
+				workers: effectiveWorkers(cmd, workers), onConflict: onConflict, verify: mode, dryRun: dryRun,
+				names: names, yes: yes, verbose: verbose, in: cmd.InOrStdin(), json: js,
+				sourceList: sourceList, readOrder: readOrder, human: human, compare: compare, noManifest: noManifest,
 			})
+			if asJSON {
+				finishJSON(stdout, js, err)
+			}
+			return err
 		},
 	}
 	cmd.Flags().StringVar(&workers, "workers", "auto", "files copied at once: auto (picked from the drive types) or a number")
 	cmd.Flags().StringVar(&onConflict, "on-conflict", copier.OnConflictNewer, "when a file already exists: newer (replace only if the source is newer), skip, or overwrite")
-	cmd.Flags().BoolVar(&verify, "verify", false, "afterwards compare CRC-32 checksums of every copied file (note: the copy may be read back from RAM cache, so this checks the copy logic, not the physical media)")
+	cmd.Flags().StringVar(&verify, "verify", "off", verifyHelp)
+	cmd.Flags().Lookup("verify").NoOptDefVal = "media"
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "show what would be copied, skipped or overwritten, without writing anything")
+	addNameFlags(cmd, &onCase, &onBad, &caseSensitive)
+	addCompareFlags(cmd, &compare, &noManifest)
+	cmd.Flags().StringVar(&sourceList, "source-list", sourceListAuto, "where the list of files to copy comes from: auto (the saved index of an NTFS drive when the change journal proves it is current - needs Administrator - otherwise a fresh listing), index (fail if it can't be used), or scan (always list the source)")
+	cmd.Flags().StringVar(&readOrder, "read-order", copier.ReadOrderAuto, "order of small files: size (biggest first), disk (where they lie on the disk; experimental, for USB hard disks), or auto (= size for now)")
+	cmd.Flags().BoolVar(&yes, "yes", false, "continue past pre-flight warnings without asking")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print one JSON result object on stdout (messages go to stderr)")
+	cmd.Flags().BoolVar(&verbose, "verbose", false, "list every affected file in the pre-flight report")
 	return cmd
 }
 
+// addNameFlags adds the flags for names the destination can't hold as they are.
+func addNameFlags(cmd *cobra.Command, onCase, onBad *string, caseSensitive *bool) {
+	cmd.Flags().StringVar(onCase, "on-case-collision", copier.OnCaseRename, `when two names differ only in letter case (a.jpg and A.jpg, from a phone): rename (the second becomes "A (case 2).jpg"), skip, or fail`)
+	cmd.Flags().StringVar(onBad, "on-bad-name", copier.OnBadReplace, "when a name can't be stored on Windows (notes:1.txt, CON.txt, a trailing dot): replace (with look-alike characters), skip, or fail")
+	cmd.Flags().BoolVar(caseSensitive, "case-sensitive-dest", false, "make the folders the copy creates case-sensitive (NTFS, Windows 10 1803+), so a.jpg and A.jpg can both stay as they are; some older Windows programs mishandle such folders")
+}
+
+// nameOptions checks the name flags.
+func nameOptions(onCase, onBad string, caseSensitive bool) (copier.NameOptions, error) {
+	switch onCase {
+	case copier.OnCaseRename, copier.OnCaseSkip, copier.OnCaseFail:
+	default:
+		return copier.NameOptions{}, userErr(fmt.Sprintf("--on-case-collision %q isn't valid", onCase), "use rename, skip or fail", nil)
+	}
+	switch onBad {
+	case copier.OnBadReplace, copier.OnBadSkip, copier.OnBadFail:
+	default:
+		return copier.NameOptions{}, userErr(fmt.Sprintf("--on-bad-name %q isn't valid", onBad), "use replace, skip or fail", nil)
+	}
+	return copier.NameOptions{OnCaseCollision: onCase, OnBadName: onBad, CaseSensitiveDest: caseSensitive}, nil
+}
+
+// verifyHelp explains --verify, including its honest limit.
+const verifyHelp = `check every copied file: --verify (= media) hashes the source while copying, flushes the copy to the drive and reads it back WITHOUT the Windows cache; --verify=cache reads it back through the cache (cheaper, but only proves DriveDex wrote the right bytes); off. Honest limit: some cheap USB devices confirm a flush without writing, and a cache inside the device can still answer the read - only unplugging and replugging defeats that (doctor --capacity does). Phones are checked with the phone's own sha256sum/sha1sum/md5sum`
+
 type copyFlags struct {
 	workers, onConflict string
-	verify, dryRun      bool
+	verify              copier.VerifyMode
+	dryRun              bool
+	names               copier.NameOptions
+	yes, verbose        bool
+	in                  io.Reader
+	json                *copyJSON
+	sourceList          string
+	readOrder           string
+	human               io.Writer // where messages go (stdout, or stderr with --json)
+	compare             string    // --compare
+	noManifest          bool      // --no-manifest
+	sync                *syncRun  // set by 'drivedex sync'
 }
 
 // phoneSpec is a parsed "phone:..." copy source.
@@ -114,7 +182,11 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 
 	// --- plan -----------------------------------------------------------------
 	var plan *copier.Plan
+	var srcDev preflight.Device
+	plannedFrom := "scan"
 	srcRoot := "" // the local source, for the USB speed check ("" for a phone)
+	var srcID string
+	var jstart *journalStart
 	spec, isPhone, err := parsePhoneSource(srcArg)
 	if err != nil {
 		return err
@@ -138,6 +210,9 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 			workers = copier.AutoWorkers(false, true, dstPenalty, dstKnown)
 			why = autoWhy(workers)
 		}
+		srcDev = preflight.Device{Label: dev.Name(), ID: phone.SourceID(dev.Serial), Class: preflight.ClassPhone}
+		srcID = phone.SourceID(dev.Serial)
+		plannedFrom = "phone"
 		remote := copier.PhonePathRoot(spec.path, activePhoneRoot())
 		status.Update("Reading the file list from " + dev.Name() + " …")
 		plan, err = copier.PlanPhone(ctx, adb, dev.Serial, remote, dst, f.onConflict, max(workers, 4))
@@ -145,9 +220,15 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 		if err != nil {
 			return planError(srcArg, err)
 		}
-		if f.verify {
-			fmt.Fprintln(out, ui.Dim("note: --verify isn't available for phone copies (there is nothing on the PC to compare with); files are still copied atomically."))
-			f.verify = false
+		if f.verify != copier.VerifyOff {
+			tool, terr := adb.HashTool(ctx, dev.Serial)
+			if terr != nil || tool == "" {
+				fmt.Fprintln(out, ui.Dim("note: this phone has no sha256sum, sha1sum or md5sum, so its files can't be verified; they are still copied atomically."))
+				f.verify = copier.VerifyOff
+			} else {
+				plan.Phone.HashTool = tool
+				fmt.Fprintln(out, ui.Dim("Verifying with the phone's own "+tool+" (each file is hashed on the phone and on the PC)."))
+			}
 		}
 	} else {
 		src, err := resolveSource(srcArg)
@@ -161,8 +242,13 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 			workers = copier.AutoWorkers(srcPenalty, srcKnown, dstPenalty, dstKnown)
 			why = autoWhy(workers)
 		}
+		srcID = srcIDFor(src)
+		if f.compare != copier.CompareFast && f.compare != copier.CompareStrict && !f.noManifest {
+			jstart = startJournal(src) // before listing: every later change shows in the journal
+		}
 		status.Update("Reading the file list from " + src + " …")
-		plan, err = copier.PlanLocal(ctx, src, dst, f.onConflict, max(workers, 2))
+		out.Flush()
+		plan, plannedFrom, err = planLocalSource(ctx, out, src, dst, f, workers)
 		status.Clear()
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -174,107 +260,11 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 	}
 
 	return finishPlan(ctx, out, status, plan, planRun{
-		workers: workers, why: why, verify: f.verify, dryRun: f.dryRun, dstArg: dstArg, srcRoot: srcRoot,
+		workers: workers, why: why, verify: f.verify, dryRun: f.dryRun, dstArg: dstArg, srcArg: srcArg, srcRoot: srcRoot,
+		names: f.names, yes: f.yes, verbose: f.verbose, in: f.in, json: f.json,
+		srcDev: srcDev, plannedFrom: plannedFrom, readOrder: f.readOrder,
+		compare: f.compare, noManifest: f.noManifest, srcID: srcID, jstart: jstart, sync: f.sync,
 	})
-}
-
-// planRun are the options for carrying out a finished plan.
-type planRun struct {
-	workers int
-	why     string // why that many workers (for the message)
-	verify  bool
-	dryRun  bool
-	dstArg  string // the destination as the user typed it (for messages)
-	srcRoot string // a local source folder, "" when there isn't one (phone, search results)
-}
-
-// finishPlan checks, announces, (dry-)runs and reports one copy plan. Both
-// `copy` and `search --copy-to` use it, so they behave identically.
-func finishPlan(ctx context.Context, out *bufio.Writer, status *ui.StatusLine, plan *copier.Plan, o planRun) error {
-	dst, dstArg, workers, why := plan.DstRoot, o.dstArg, o.workers, o.why
-	f := copyFlags{verify: o.verify, dryRun: o.dryRun}
-	counts := plan.Counts()
-	if counts.Files == 0 {
-		fmt.Fprintln(out, "Nothing to copy: the source has no files.")
-		return nil
-	}
-
-	// --- safety checks --------------------------------------------------------
-	if err := plan.Check(copyChecks()); err != nil {
-		return checkError(dstArg, err)
-	}
-
-	// --- announce -------------------------------------------------------------
-	if counts.Skipped == 0 {
-		fmt.Fprintf(out, "Copying %s files (%s) with %d workers…\n",
-			ui.Thousands(counts.Files), ui.HumanSize(counts.TotalBytes), workers)
-	} else {
-		fmt.Fprintf(out, "%s files (%s): %s already up to date, copying %s (%s) with %d workers…\n",
-			ui.Thousands(counts.Files), ui.HumanSize(counts.TotalBytes), ui.Thousands(counts.Skipped),
-			ui.Thousands(counts.Copy+counts.Overwrite), ui.HumanSize(counts.WriteBytes), workers)
-	}
-	if !f.dryRun {
-		fmt.Fprintln(out, ui.Dim(fmt.Sprintf("(%d workers: %s)", workers, why)))
-	}
-	// A USB 3 drive stuck at USB 2.0 speed is worth knowing BEFORE a long copy.
-	anyUSB := warnSlowUSB(out, []string{o.srcRoot, dst}, counts.WriteBytes)
-	bigLanes := 0
-	if anyUSB {
-		bigLanes = usbBigLanes
-	}
-
-	if f.dryRun {
-		return printDryRun(out, plan, counts)
-	}
-	if counts.Copy+counts.Overwrite == 0 {
-		fmt.Fprintln(out, "Everything is already there. Nothing to do.")
-		return nil
-	}
-
-	// --- run ------------------------------------------------------------------
-	out.Flush()
-	res, err := copier.Run(ctx, plan, copier.Options{
-		Workers:  workers,
-		BigLanes: bigLanes,
-		Verify:   f.verify,
-		Progress: func(p ui.CopyProgress) {
-			status.Update(ui.FormatCopyProgress(p))
-		},
-	})
-	status.Clear()
-	if err != nil {
-		return userErr("the copy couldn't start", "check the destination can be written to: "+dst, err)
-	}
-
-	// --- report ---------------------------------------------------------------
-	rate := ui.PerSecond(res.BytesWritten, res.Elapsed)
-	fmt.Fprintf(out, "Copied %s files (%s) in %s · %s/s · %d skipped · %d failed\n",
-		ui.Thousands(res.Written), ui.HumanSize(res.BytesWritten), ui.FormatDuration(res.Elapsed),
-		ui.HumanSize(rate), res.Skipped, res.Failed)
-	if res.NotRegular > 0 {
-		fmt.Fprintln(out, ui.Dim(fmt.Sprintf("%d links/special files were skipped (DriveDex never follows links).", res.NotRegular)))
-	}
-	if f.verify && res.VerifyMismatches == 0 && res.Failed == 0 {
-		fmt.Fprintln(out, ui.Green("Verified:")+" every copied file matches its original (checksums).")
-	}
-	if res.Cancelled {
-		fmt.Fprintln(out, "Stopped. Run the same command again to resume.")
-		return nil
-	}
-	if res.Failed > 0 {
-		fmt.Fprintln(out, ui.Red("These files could not be copied:"))
-		for _, fl := range res.Failures {
-			fmt.Fprintf(out, "  %s — %s\n", fl.Rel, fl.Err)
-		}
-		if more := res.Failed - int64(len(res.Failures)); more > 0 {
-			fmt.Fprintf(out, "  … and %d more\n", more)
-		}
-		out.Flush()
-		return userErr(fmt.Sprintf("%d %s could not be copied", res.Failed, plural(int(res.Failed), "file", "files")),
-			"run the same command again to retry just those files", nil)
-	}
-	fmt.Fprintln(out, ui.Dim("Tip: use \"Safely Remove Hardware\" before unplugging the destination drive."))
-	return nil
 }
 
 // usbBigLanes is how many big files are copied at once when a USB drive is
@@ -331,6 +321,10 @@ func resolveDestination(arg string) (string, error) {
 }
 
 func planError(srcArg string, err error) error {
+	var ue *UserError
+	if errors.As(err, &ue) {
+		return err // already in plain words (e.g. --source-list index)
+	}
 	if errors.Is(err, copier.ErrDestinationInsideSource) {
 		return userErr(fmt.Sprintf("can't copy %s into itself", srcArg),
 			"choose a destination folder outside the folder being copied", err)
@@ -340,17 +334,6 @@ func planError(srcArg string, err error) error {
 			"paths are relative to the phone's storage, e.g. phone:/DCIM/Camera; search with 'drivedex search' to find the exact folder", err)
 	}
 	return userErr(fmt.Sprintf("couldn't read the files in %s", srcArg), "check the drive or phone is connected and unlocked", err)
-}
-
-func checkError(dstArg string, err error) error {
-	switch {
-	case errors.Is(err, copier.ErrNotEnoughSpace):
-		return userErr("the destination doesn't have enough free space", "free up space on "+dstArg+" or choose another destination", err)
-	case errors.Is(err, copier.ErrFileTooBigForFAT32):
-		return userErr("the destination is FAT32, which can't store a file of 4 GB or more",
-			"copy to an NTFS or exFAT drive instead (or reformat this one as exFAT - back it up first)", err)
-	}
-	return userErr("the copy can't go ahead", "run with --debug for details", err)
 }
 
 // printDryRun lists what would happen, then a summary. Nothing is written.

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/yashwardhanv/dd/internal/fixture"
+	"github.com/yashwardhanv/dd/internal/fsinfo"
 	"github.com/yashwardhanv/dd/internal/ui"
 )
 
@@ -83,12 +84,13 @@ type fakeInfo struct {
 	size  int64
 	mtime int64
 	dir   bool
+	nanos int64
 }
 
 func (f fakeInfo) Name() string       { return "x" }
 func (f fakeInfo) Size() int64        { return f.size }
 func (f fakeInfo) Mode() fs.FileMode  { return 0o644 }
-func (f fakeInfo) ModTime() time.Time { return time.Unix(f.mtime, 0) }
+func (f fakeInfo) ModTime() time.Time { return time.Unix(f.mtime, f.nanos) }
 func (f fakeInfo) IsDir() bool        { return f.dir }
 func (f fakeInfo) Sys() any           { return nil }
 
@@ -103,23 +105,25 @@ func TestDecide(t *testing.T) {
 		want   Decision
 	}{
 		{"missing -> copy", "newer", 10, T, nil, Copy},
-		{"same size and time -> skip (resume)", "newer", 10, T, fakeInfo{10, T, false}, SkipSame},
-		{"FAT 2-second rounding is still the same", "overwrite", 10, T, fakeInfo{10, T + 2, false}, SkipSame},
-		{"3 seconds apart is NOT the same (newer: src older -> keep)", "newer", 10, T, fakeInfo{10, T + 3, false}, SkipNewer},
-		{"newer: source newer -> overwrite", "newer", 10, T + 100, fakeInfo{10, T, false}, Overwrite},
-		{"newer: different size, source newer -> overwrite", "newer", 99, T + 100, fakeInfo{10, T, false}, Overwrite},
-		{"newer: destination newer -> keep", "newer", 10, T, fakeInfo{99, T + 100, false}, SkipNewer},
-		{"skip: always leave it", "skip", 10, T + 100, fakeInfo{99, T, false}, SkipPolicy},
-		{"overwrite: always replace", "overwrite", 10, T, fakeInfo{99, T + 100, false}, Overwrite},
-		{"default policy is newer", "", 10, T + 5, fakeInfo{99, T, false}, Overwrite},
+		{"same size and time -> skip (resume)", "newer", 10, T, fakeInfo{size: 10, mtime: T, dir: false}, SkipSame},
+		{"FAT 2-second rounding is still the same", "overwrite", 10, T, fakeInfo{size: 10, mtime: T + 2, dir: false}, SkipSame},
+		{"3 seconds apart is NOT the same (newer: src older -> keep)", "newer", 10, T, fakeInfo{size: 10, mtime: T + 3, dir: false}, SkipNewer},
+		{"newer: source newer -> overwrite", "newer", 10, T + 100, fakeInfo{size: 10, mtime: T, dir: false}, Overwrite},
+		{"newer: different size, source newer -> overwrite", "newer", 99, T + 100, fakeInfo{size: 10, mtime: T, dir: false}, Overwrite},
+		{"newer: destination newer -> keep", "newer", 10, T, fakeInfo{size: 99, mtime: T + 100, dir: false}, SkipNewer},
+		{"skip: always leave it", "skip", 10, T + 100, fakeInfo{size: 99, mtime: T, dir: false}, SkipPolicy},
+		{"overwrite: always replace", "overwrite", 10, T, fakeInfo{size: 99, mtime: T + 100, dir: false}, Overwrite},
+		{"default policy is newer", "", 10, T + 5, fakeInfo{size: 99, mtime: T, dir: false}, Overwrite},
 	}
+	// The table was written for a FAT32 destination (2-second times).
+	src, fat := fsinfo.ForFileSystem("NTFS"), fsinfo.ForFileSystem("FAT32")
 	for _, c := range cases {
-		got, blocked := decide(c.policy, c.size, c.mtime, c.dst)
-		if got != c.want || blocked != "" {
-			t.Errorf("%s: got %v (%q), want %v", c.name, got, blocked, c.want)
+		dec := decide(c.policy, Job{Size: c.size, ModTime: c.mtime}, c.dst, src, fat)
+		if dec.d != c.want || dec.blocked != "" {
+			t.Errorf("%s: got %v (%q), want %v", c.name, dec.d, dec.blocked, c.want)
 		}
 	}
-	if _, blocked := decide("newer", 1, T, fakeInfo{dir: true}); blocked == "" {
+	if dec := decide("newer", Job{Size: 1, ModTime: T}, fakeInfo{dir: true}, src, fat); dec.blocked == "" {
 		t.Error("a folder where a file should go must be reported")
 	}
 	if !SkipSame.Skipped() || Copy.Skipped() || Overwrite.Skipped() {
@@ -132,6 +136,49 @@ func TestDecide(t *testing.T) {
 	}
 	if !ValidPolicy("newer") || !ValidPolicy("skip") || !ValidPolicy("overwrite") || ValidPolicy("merge") || ValidPolicy("") {
 		t.Error("ValidPolicy wrong")
+	}
+}
+
+// TestINV1_NTFSEditWithinTwoSecondsIsCopied: the old fixed 2-second tolerance
+// skipped a file edited (same size) a second after the last copy. Between two
+// NTFS drives times are exact, so that edit must be copied.
+func TestINV1_NTFSEditWithinTwoSecondsIsCopied(t *testing.T) {
+	const T = 1_700_000_000
+	ntfs := fsinfo.ForFileSystem("NTFS")
+	j := Job{Size: 10, ModTime: T + 1, ModTimeNs: (T+1)*1e9 + 5}
+	if dec := decide("newer", j, fakeInfo{size: 10, mtime: T}, ntfs, ntfs); dec.d != Overwrite {
+		t.Errorf("NTFS->NTFS one second newer: %v, want overwrite", dec.d)
+	}
+	// Exactly the same 100 ns tick: skip.
+	j = Job{Size: 10, ModTime: T, ModTimeNs: T*1e9 + 700}
+	if dec := decide("newer", j, fakeInfo{size: 10, mtime: T, nanos: 700}, ntfs, ntfs); dec.d != SkipSame {
+		t.Errorf("identical NTFS times: %v, want skip", dec.d)
+	}
+	// A coarse (whole-second) source time still matches within the second.
+	j = Job{Size: 10, ModTime: T, TimeCoarse: true}
+	if dec := decide("newer", j, fakeInfo{size: 10, mtime: T, nanos: 999_000_000}, ntfs, ntfs); dec.d != SkipSame {
+		t.Errorf("coarse source time: %v, want skip", dec.d)
+	}
+}
+
+// TestDaylightSavingShiftOnFAT32IsTreatedAsUnchanged: after a daylight-saving
+// change every file on a FAT32 drive appears one hour off.
+func TestDaylightSavingShiftOnFAT32IsTreatedAsUnchanged(t *testing.T) {
+	const T = 1_700_000_000
+	ntfs, fat := fsinfo.ForFileSystem("NTFS"), fsinfo.ForFileSystem("FAT32")
+	for _, off := range []int64{3600, -3600} {
+		dec := decide("newer", Job{Size: 10, ModTime: T}, fakeInfo{size: 10, mtime: T + off}, ntfs, fat)
+		if dec.d != SkipSame || !dec.shift {
+			t.Errorf("offset %d: %+v, want skip with a DST shift", off, dec)
+		}
+	}
+	// A different size is a real change, whatever the time.
+	if dec := decide("newer", Job{Size: 11, ModTime: T + 3600}, fakeInfo{size: 10, mtime: T}, ntfs, fat); dec.d != Overwrite || dec.shift {
+		t.Errorf("size change with a 1 h offset: %+v", dec)
+	}
+	// Between two NTFS drives an hour is just an hour.
+	if dec := decide("newer", Job{Size: 10, ModTime: T + 3600}, fakeInfo{size: 10, mtime: T}, ntfs, ntfs); dec.d != Overwrite {
+		t.Errorf("NTFS 1 h newer: %+v", dec)
 	}
 }
 
@@ -297,8 +344,8 @@ func TestRunningAgainSkipsEverything(t *testing.T) {
 		t.Fatalf("second plan = %+v: everything should be skipped as already there", c)
 	}
 	var writes atomic.Int64
-	openSource = func(string) (*os.File, error) { writes.Add(1); return nil, errors.New("must not be opened") }
-	defer func() { openSource = os.Open }()
+	openSource = func(string, bool) (*os.File, error) { writes.Add(1); return nil, errors.New("must not be opened") }
+	defer func() { openSource = defaultOpenSource }()
 	r := mustRun(t, p, fastOpts(4))
 	if r.Written != 0 || int(r.Skipped) != res.Files || writes.Load() != 0 {
 		t.Errorf("result = %+v, source opened %d times", r, writes.Load())
@@ -315,7 +362,7 @@ func TestCancelMidwayThenResume(t *testing.T) {
 	opt := fastOpts(3)
 	opt.Progress = func(p ui.CopyProgress) {} // progress reporter running during cancel is part of the scenario
 	// Cancel after about 100 files have been opened.
-	openSource = func(name string) (*os.File, error) {
+	openSource = func(name string, _ bool) (*os.File, error) {
 		if seen.Add(1) == 100 {
 			cancel()
 		}
@@ -323,7 +370,7 @@ func TestCancelMidwayThenResume(t *testing.T) {
 	}
 	p := plan(t, src, dst, "")
 	r, err := Run(ctx, p, opt)
-	openSource = os.Open
+	openSource = defaultOpenSource
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,12 +432,12 @@ func TestRealNameNeverHoldsAHalfWrittenFile(t *testing.T) {
 	final := filepath.Join(dst, filepath.Base(src), "big.bin")
 
 	ctx, cancel := context.WithCancel(context.Background())
-	openSource = func(name string) (*os.File, error) {
+	openSource = func(name string, _ bool) (*os.File, error) {
 		f, err := os.Open(name)
 		cancel() // cancelled right as copying starts
 		return f, err
 	}
-	defer func() { openSource = os.Open }()
+	defer func() { openSource = defaultOpenSource }()
 	Run(ctx, plan(t, src, dst, ""), fastOpts(1))
 	if _, err := os.Stat(final); err == nil {
 		t.Error("a cancelled copy must not leave anything under the real name")
@@ -454,14 +501,14 @@ func TestRetriesThenReportsFailureAndCarriesOn(t *testing.T) {
 	dst := t.TempDir()
 
 	var badAttempts atomic.Int64
-	openSource = func(name string) (*os.File, error) {
+	openSource = func(name string, _ bool) (*os.File, error) {
 		if filepath.Base(name) == "bad.txt" {
 			badAttempts.Add(1)
 			return nil, errors.New("simulated read error")
 		}
 		return os.Open(name)
 	}
-	defer func() { openSource = os.Open }()
+	defer func() { openSource = defaultOpenSource }()
 
 	r := mustRun(t, plan(t, src, dst, ""), fastOpts(2))
 	if r.Written != 2 || r.Failed != 1 {
@@ -481,13 +528,13 @@ func TestARetrySucceedsWhenTheProblemIsTemporary(t *testing.T) {
 	os.WriteFile(filepath.Join(src, "flaky.txt"), []byte("eventually"), 0o644)
 	dst := t.TempDir()
 	var tries atomic.Int64
-	openSource = func(name string) (*os.File, error) {
+	openSource = func(name string, _ bool) (*os.File, error) {
 		if tries.Add(1) < 3 {
 			return nil, errors.New("temporarily unavailable")
 		}
 		return os.Open(name)
 	}
-	defer func() { openSource = os.Open }()
+	defer func() { openSource = defaultOpenSource }()
 	r := mustRun(t, plan(t, src, dst, ""), fastOpts(1))
 	if r.Written != 1 || r.Failed != 0 || tries.Load() != 3 {
 		t.Errorf("result = %+v after %d tries", r, tries.Load())
@@ -499,8 +546,8 @@ func TestOnlyFirst20FailuresAreKept(t *testing.T) {
 	for i := 0; i < 30; i++ {
 		os.WriteFile(filepath.Join(src, fmt.Sprintf("f%02d.txt", i)), []byte("x"), 0o644)
 	}
-	openSource = func(string) (*os.File, error) { return nil, errors.New("nope") }
-	defer func() { openSource = os.Open }()
+	openSource = func(string, bool) (*os.File, error) { return nil, errors.New("nope") }
+	defer func() { openSource = defaultOpenSource }()
 	r := mustRun(t, plan(t, src, t.TempDir(), ""), fastOpts(4))
 	if r.Failed != 30 || len(r.Failures) != 20 {
 		t.Errorf("failed=%d kept=%d, want 30/20", r.Failed, len(r.Failures))
@@ -516,9 +563,12 @@ func TestSymlinksAreSkippedNotFollowed(t *testing.T) {
 		t.Skipf("can't create symlinks here: %v", err)
 	}
 	dst := t.TempDir()
-	r := mustRun(t, plan(t, src, dst, ""), fastOpts(2))
-	if r.Written != 1 || r.NotRegular != 1 || r.Failed != 0 {
-		t.Errorf("result = %+v", r)
+	p := plan(t, src, dst, "")
+	r := mustRun(t, p, fastOpts(2))
+	// The plan leaves links out (LinksSkipped); a link the listing missed is
+	// caught when the copy opens it (NotRegular). Either way it isn't copied.
+	if r.Written != 1 || p.LinksSkipped+r.NotRegular != 1 || r.Failed != 0 {
+		t.Errorf("result = %+v, links skipped by the plan %d", r, p.LinksSkipped)
 	}
 	if _, err := os.Stat(filepath.Join(dst, filepath.Base(src), "link.txt")); err == nil {
 		t.Error("a symlink's target must never be copied")
@@ -542,7 +592,7 @@ func TestVerifyDetectsACorruptCopyAndRemovesIt(t *testing.T) {
 	defer func() { afterCopy = nil }()
 
 	opt := fastOpts(1)
-	opt.Verify = true
+	opt.Verify = VerifyMedia
 	r := mustRun(t, plan(t, src, dst, ""), opt)
 	if r.Failed != 1 || r.VerifyMismatches < 1 || r.Written != 1 {
 		t.Fatalf("result = %+v", r)
@@ -558,7 +608,7 @@ func TestVerifyDetectsACorruptCopyAndRemovesIt(t *testing.T) {
 func TestVerifyPassesForGoodCopies(t *testing.T) {
 	src, res := source(t, 120)
 	opt := fastOpts(4)
-	opt.Verify = true
+	opt.Verify = VerifyMedia
 	r := mustRun(t, plan(t, src, t.TempDir(), ""), opt)
 	if int(r.Written) != res.Files || r.Failed != 0 || r.VerifyMismatches != 0 {
 		t.Errorf("result = %+v", r)
@@ -568,8 +618,8 @@ func TestVerifyPassesForGoodCopies(t *testing.T) {
 func TestProgressReportsAreMonotonicAndEndComplete(t *testing.T) {
 	src, res := source(t, 200)
 	// Slow the copy a little so the 200 ms reporter has a chance to fire.
-	openSource = func(name string) (*os.File, error) { time.Sleep(3 * time.Millisecond); return os.Open(name) }
-	defer func() { openSource = os.Open }()
+	openSource = func(name string, _ bool) (*os.File, error) { time.Sleep(3 * time.Millisecond); return os.Open(name) }
+	defer func() { openSource = defaultOpenSource }()
 
 	var snaps []ui.CopyProgress
 	opt := fastOpts(2)
@@ -608,7 +658,7 @@ func fakePlan(dst string, sizes ...int64) *Plan {
 	for i, s := range sizes {
 		jobs = append(jobs, Job{Src: fmt.Sprintf("/x/%d", i), Rel: fmt.Sprintf("f%d.bin", i), Size: s})
 	}
-	return PlanJobs(dst, jobs, "", 1)
+	return PlanJobs(dst, jobs, "", 1, fsinfo.ForFileSystem("NTFS"))
 }
 
 func TestFAT32RefusesFilesOfFourGiBOrMore(t *testing.T) {
@@ -649,17 +699,23 @@ func TestFreeSpaceCheck(t *testing.T) {
 	dst := t.TempDir()
 	free := func(n uint64) Checks { return Checks{FreeBytes: func(string) (uint64, error) { return n, nil }} }
 
-	if err := fakePlan(dst, 600, 500).Check(free(1000)); !errors.Is(err, ErrNotEnoughSpace) {
-		t.Errorf("1100 bytes into 1000 free: %v", err)
+	// Space is counted in whole clusters (4 KB here), plus 1 percent.
+	cl4k := func(p *Plan) *Plan {
+		p.DstFS = fsinfo.ForFileSystem("exFAT")
+		p.DstFS.ClusterBytes = 4096
+		return p
 	}
-	if err := fakePlan(dst, 600, 400).Check(free(1000)); err != nil {
-		t.Errorf("exactly fits: %v", err)
+	if err := cl4k(fakePlan(dst, 600, 500)).Check(free(8000)); !errors.Is(err, ErrNotEnoughSpace) {
+		t.Errorf("two files = two 4 KB clusters (8,272 bytes with the margin) into 8,000 free: %v", err)
+	}
+	if err := cl4k(fakePlan(dst, 600, 400)).Check(free(8300)); err != nil {
+		t.Errorf("fits: %v", err)
 	}
 	// Skipped files don't need space.
-	p := fakePlan(dst, 600, 900)
-	p.Items[0].Decision = SkipSame // the 900-byte one (sorted first)
-	if err := p.Check(free(700)); err != nil {
-		t.Errorf("only the 600-byte file needs space: %v", err)
+	p := cl4k(fakePlan(dst, 6000, 9000))
+	p.Items[0].Decision = SkipSame // the 9000-byte one (sorted first)
+	if err := p.Check(free(8300)); err != nil {
+		t.Errorf("only the 6000-byte file (2 clusters) needs space: %v", err)
 	}
 	// A failing query doesn't block the copy.
 	broken := Checks{FreeBytes: func(string) (uint64, error) { return 0, errors.New("can't tell") }}

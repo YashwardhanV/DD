@@ -32,6 +32,7 @@ func (ix *Index) FillMeta(slot int, fullPath string) bool {
 		ix.Sizes[slot] = st.Size()
 	}
 	ix.MTimes[slot] = st.ModTime().Unix()
+	ix.Nanos[slot] = uint32(st.ModTime().Nanosecond())
 	ix.Flags[slot] &^= FlagNoMeta
 	return true
 }
