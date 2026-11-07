@@ -247,7 +247,7 @@ func (b *destBook) journalView(ctx context.Context, js *journalStart) {
 		}
 		return true
 	})
-	jv := &copier.JournalView{ID: js.id, Next: js.next, Since: since, Touched: map[uint64]bool{}}
+	jv := &copier.JournalView{ID: js.id, Next: js.next, Since: since, Touched: map[uint64]int64{}}
 	if since < js.next {
 		sess, err := openNTFS(js.root)
 		if err != nil {

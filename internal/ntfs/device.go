@@ -218,13 +218,15 @@ func Refresh(ctx context.Context, s *Session, ix *index.Index) (RefreshResult, e
 	return RefreshResult{Changes: ap.Changes(), Records: ap.Records, Touched: ap.Touched()}, nil
 }
 
-// ChangesSince reads the change journal from usn to now and returns every
-// file reference number it mentions (created, written, renamed, deleted,
-// attributes changed...), with the journal's state. It is how copy
-// --compare journal knows a file was edited even if its time was put back.
+// ChangesSince reads the change journal from usn to now and returns, for
+// every file whose content may have changed (written, created, deleted,
+// times or attributes changed - not just renamed), the USN of its latest
+// such entry, with the journal's state. It is how copy --compare journal
+// knows a file was edited even if its time was put back; the caller compares
+// the USN with each file's own bookmark.
 //
 // ErrJournalEntryDeleted means the journal no longer reaches back to usn.
-func ChangesSince(ctx context.Context, s *Session, journalID uint64, usn int64) (JournalData, map[uint64]bool, error) {
+func ChangesSince(ctx context.Context, s *Session, journalID uint64, usn int64) (JournalData, map[uint64]int64, error) {
 	jd, err := QueryJournal(s.Dev)
 	if err != nil {
 		return jd, nil, err
@@ -232,11 +234,15 @@ func ChangesSince(ctx context.Context, s *Session, journalID uint64, usn int64) 
 	if jd.ID != journalID || usn < jd.FirstUsn || usn < jd.LowestValidUsn {
 		return jd, nil, ErrJournalEntryDeleted
 	}
-	touched := map[uint64]bool{}
+	touched := map[uint64]int64{}
 	if usn >= jd.NextUsn {
 		return jd, touched, nil
 	}
-	if _, err := ReadJournal(ctx, s.Dev, jd.ID, usn, func(r Record) { touched[r.FRN] = true }); err != nil {
+	if _, err := ReadJournal(ctx, s.Dev, jd.ID, usn, func(r Record) {
+		if r.MayChangeContent() && r.USN > touched[r.FRN] {
+			touched[r.FRN] = r.USN
+		}
+	}); err != nil {
 		return jd, nil, err
 	}
 	return jd, touched, nil

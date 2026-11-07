@@ -279,6 +279,9 @@ func TestINV1_CompareJournalCatchesAnEditThatKeptItsTime(t *testing.T) {
 
 func TestCompareJournalWithoutAdministratorSaysWhy(t *testing.T) {
 	src, dst := syncEnv(t)
+	old := isElevated
+	isElevated = func() bool { return false } // CI runners are Administrator
+	t.Cleanup(func() { isElevated = old })
 	out, err := run(t, "copy", src, dst, "--compare", "journal", "--dry-run")
 	if err != nil || !strings.Contains(out, "no readable NTFS change journal") {
 		t.Errorf("%v\n%s", err, out)

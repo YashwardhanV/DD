@@ -372,7 +372,7 @@ func TestCompareChecksum(t *testing.T) {
 	src, dst := filepath.Join(base, "S"), filepath.Join(base, "D")
 	t0 := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	put(t, src, "same.txt", "abc", t0)
-	put(t, dst, `S\same.txt`, "abc", t0.Add(time.Hour)) // other time, same content
+	put(t, dst, `S\same.txt`, "abc", t0.Add(-time.Hour)) // older, same content: no need to overwrite
 	put(t, src, "edited.txt", "new", t0)
 	put(t, dst, `S\edited.txt`, "old", t0) // same size and time, other content
 	p, _ := PlanLocal(context.Background(), src, dst, OnConflictNewer, 2)
@@ -413,7 +413,7 @@ func TestINV1_JournalCatchesAnEditWithTheOldTime(t *testing.T) {
 	}
 	p := &Plan{OnConflict: OnConflictOverwrite, Items: items}
 	rep, err := p.Compare(context.Background(), CompareOptions{Mode: CompareAuto, Manifest: m, SrcID: testSrcID,
-		Journal: &JournalView{ID: 7, Next: 500, Since: 100, Touched: map[uint64]bool{11: true}}})
+		Journal: &JournalView{ID: 7, Next: 500, Since: 100, Touched: map[uint64]int64{11: 200}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,6 +435,53 @@ func TestINV1_JournalCatchesAnEditWithTheOldTime(t *testing.T) {
 	rep, _ = p.Compare(context.Background(), CompareOptions{Mode: CompareJournal, Manifest: m, SrcID: testSrcID, Journal: &JournalView{ID: 7}})
 	if rep.JournalNote == "" || p.Items[0].Why == WhyJournal {
 		t.Errorf("wrapped journal: %+v", rep)
+	}
+}
+
+// TestJournalJudgesEachFileByItsOwnBookmark: a change the journal saw before
+// a file's own bookmark (it was copied after that change) doesn't make it
+// "changed", even when an older record pulls the journal window back.
+func TestJournalJudgesEachFileByItsOwnBookmark(t *testing.T) {
+	t0 := int64(1_700_000_000e9)
+	m := manifest.New()
+	items := []Item{
+		{Job: Job{Rel: "old.txt", Size: 5, ModTimeNs: t0, SrcFileID: 21}, Decision: SkipSame, Dst: DstState{Exists: true, Size: 5, MTimeNs: t0}},
+		{Job: Job{Rel: "copiedlater.txt", Size: 5, ModTimeNs: t0, SrcFileID: 22}, Decision: SkipSame, Dst: DstState{Exists: true, Size: 5, MTimeNs: t0}},
+	}
+	m.Put(manifest.Record{Rel: "old.txt", SrcID: testSrcID, SrcFileID: 21, SrcSize: 5, SrcMTimeNs: t0, DstSize: 5, DstMTimeNs: t0, JournalID: 7, SrcUSN: 100})
+	m.Put(manifest.Record{Rel: "copiedlater.txt", SrcID: testSrcID, SrcFileID: 22, SrcSize: 5, SrcMTimeNs: t0, DstSize: 5, DstMTimeNs: t0, JournalID: 7, SrcUSN: 300})
+	p := &Plan{OnConflict: OnConflictNewer, Items: items}
+	jv := &JournalView{ID: 7, Next: 500, Since: 100, Touched: map[uint64]int64{22: 250}} // created at 250, copied at 300
+	if _, err := p.Compare(context.Background(), CompareOptions{Mode: CompareAuto, Manifest: m, SrcID: testSrcID, Journal: jv}); err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range p.Items {
+		if it.Decision != SkipSame || it.Why != WhyJournal {
+			t.Errorf("%s: %v %v, want skipped as unchanged (journal)", it.Rel, it.Decision, it.Why)
+		}
+	}
+}
+
+// TestCompareNeverOverridesOnConflictSkip: --on-conflict skip means existing
+// files are never replaced, whatever the journal or a checksum says.
+func TestCompareNeverOverridesOnConflictSkip(t *testing.T) {
+	t0 := int64(1_700_000_000e9)
+	m := manifest.New()
+	m.Put(manifest.Record{Rel: "a.txt", SrcID: testSrcID, SrcFileID: 31, SrcSize: 5, SrcMTimeNs: t0, DstSize: 5, DstMTimeNs: t0, JournalID: 7, SrcUSN: 100})
+	for _, it := range []Item{
+		{Job: Job{Rel: "a.txt", Size: 5, ModTimeNs: t0, SrcFileID: 31}, Decision: SkipSame, Dst: DstState{Exists: true, Size: 5, MTimeNs: t0}},
+		{Job: Job{Rel: "a.txt", Size: 5, ModTimeNs: t0 + 1e9, SrcFileID: 31}, Decision: SkipPolicy, Dst: DstState{Exists: true, Size: 5, MTimeNs: t0}},
+	} {
+		for _, mode := range []string{CompareAuto, CompareChecksum} {
+			p := &Plan{OnConflict: OnConflictSkip, Items: []Item{it}}
+			jv := &JournalView{ID: 7, Next: 500, Since: 100, Touched: map[uint64]int64{31: 200}}
+			if _, err := p.Compare(context.Background(), CompareOptions{Mode: mode, Manifest: m, SrcID: testSrcID, Journal: jv}); err != nil {
+				t.Fatal(err)
+			}
+			if !p.Items[0].Decision.Skipped() {
+				t.Errorf("%s, %v: became %v", mode, it.Decision, p.Items[0].Decision)
+			}
+		}
 	}
 }
 

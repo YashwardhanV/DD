@@ -79,6 +79,16 @@ func (r Record) IsDir() bool { return r.Attrs&AttrDirectory != 0 }
 // IsDelete reports whether the journal says this file was deleted.
 func (r Record) IsDelete() bool { return r.Reason&UsnReasonFileDelete != 0 }
 
+// Journal reasons that can't change a file's content or times: a rename
+// (RENAME_OLD_NAME, RENAME_NEW_NAME), the handle closing (CLOSE), its
+// security, "content indexed" flag, object ID or hard links changing.
+const nameOnlyReasons uint32 = 0x00001000 | 0x00002000 | 0x80000000 | 0x00000800 | 0x00004000 | 0x00080000 | 0x00010000
+
+// MayChangeContent reports whether the record can mean the file's data,
+// size or times changed: anything except a rename and the like. Unknown
+// reasons count as a change.
+func (r Record) MayChangeContent() bool { return r.Reason&^nameOnlyReasons != 0 }
+
 // USN_RECORD_V2 layout (byte offsets, little-endian):
 //
 //	 0 RecordLength uint32          4 MajorVersion uint16 (we only read 2)

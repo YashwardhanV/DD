@@ -45,11 +45,21 @@ func ValidCompare(s string) bool {
 type JournalView struct {
 	ID   uint64 // the journal's ID now
 	Next int64  // the journal's next USN when it was read: new records get it as SrcUSN
-	// Since is the oldest USN Touched covers; Touched holds every file
-	// reference number with a journal entry after Since. Touched == nil means
-	// the journal could not be read back that far (wrapped or recreated).
+	// Since is the oldest USN Touched covers. Touched maps each file
+	// reference number whose content may have changed after Since (renames
+	// don't count) to the USN of its latest such entry; a file changed since
+	// its record when that USN is at or after the record's SrcUSN.
+	// Touched == nil means the journal could not be read back that far
+	// (wrapped or recreated).
 	Since   int64
-	Touched map[uint64]bool
+	Touched map[uint64]int64
+}
+
+// changedSince reports whether the journal saw a possible content change of
+// file frn at or after usn.
+func (j *JournalView) changedSince(frn uint64, usn int64) bool {
+	u, ok := j.Touched[frn]
+	return ok && u >= usn
 }
 
 // CompareOptions are the inputs of Plan.Compare.
@@ -108,10 +118,15 @@ func (p *Plan) Compare(ctx context.Context, c CompareOptions) (CompareReport, er
 		useJournal = false
 	}
 
+	// A comparison only refines "same or changed?". The --on-conflict
+	// decisions stand: a file kept because the destination is newer, or
+	// because of --on-conflict skip, is never replaced by what a comparison
+	// finds (and isn't worth hashing).
+	mayReplace := p.OnConflict != OnConflictSkip
 	var hashJobs []int
 	for i := range p.Items {
 		it := &p.Items[i]
-		if it.Blocked != "" || !it.Dst.Exists || it.Dst.IsDir {
+		if it.Blocked != "" || !it.Dst.Exists || it.Dst.IsDir || it.Decision == SkipNewer || it.Decision == SkipPolicy {
 			continue
 		}
 		var rec manifest.Record
@@ -132,7 +147,7 @@ func (p *Plan) Compare(ctx context.Context, c CompareOptions) (CompareReport, er
 				it.Decision, it.DSTShift, it.Why = dec.d, false, WhyNone
 			}
 		case CompareChecksum:
-			if it.Dst.Size == it.Size {
+			if it.Dst.Size == it.Size && mayReplace {
 				hashJobs = append(hashJobs, i)
 			}
 			continue
@@ -140,9 +155,9 @@ func (p *Plan) Compare(ctx context.Context, c CompareOptions) (CompareReport, er
 
 		if useJournal && dstAsRecorded && rec.JournalID == c.Journal.ID && rec.SrcFileID != 0 &&
 			rec.SrcUSN >= c.Journal.Since && (it.SrcFileID == 0 || it.SrcFileID == rec.SrcFileID) {
-			changed := c.Journal.Touched[rec.SrcFileID] || rec.SrcSize != it.Size
+			changed := c.Journal.changedSince(rec.SrcFileID, rec.SrcUSN) || rec.SrcSize != it.Size
 			switch {
-			case changed && it.Decision.Skipped():
+			case changed && it.Decision == SkipSame && mayReplace:
 				// Same size and time, but the journal saw a write: the classic
 				// "edited, then the old time put back" (INV-1).
 				it.Decision, it.Why, it.Changed, it.DSTShift = Overwrite, WhyNone, true, false
