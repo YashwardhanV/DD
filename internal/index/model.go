@@ -34,8 +34,15 @@ type Entry struct {
 	Name     string // single path component, original case, UTF-8
 	Size     int64  // bytes; -1 = unknown; 0 for directories
 	ModTime  int64  // unix seconds; 0 = unknown
-	Flags    uint8
+	// Nanos is the sub-second part of the modification time (0..999,999,999).
+	// Scanners that read the file system fill it; phones and portable devices
+	// only know whole seconds and leave it 0 (see Header.MTimeUnit).
+	Nanos uint32
+	Flags uint8
 }
+
+// ModTimeNs is the modification time in nanoseconds since 1970 (UTC).
+func (e Entry) ModTimeNs() int64 { return e.ModTime*1e9 + int64(e.Nanos) }
 
 // IsDir reports whether the entry is a folder.
 func (e Entry) IsDir() bool { return e.Flags&FlagDir != 0 }
@@ -58,7 +65,21 @@ type Header struct {
 	ScanMillis    int64     `json:"scan_millis"`
 	UsnJournalID  uint64    `json:"usn_journal_id,omitempty"` // stage 6
 	NextUsn       int64     `json:"next_usn,omitempty"`       // stage 6
+
+	// MetaComplete: every live file entry has its size and time (no
+	// FlagNoMeta). Planning a copy from the index needs that (stage 14).
+	MetaComplete bool `json:"meta_complete,omitempty"`
+	// SkipRules are the folder names (lowercase) that were left out at scan
+	// time. Planning from the index must skip the same ones as a fresh listing.
+	SkipRules []string `json:"skip_rules,omitempty"`
+	// MTimeUnit is "ns" when the scanner recorded exact times (Entry.Nanos),
+	// otherwise "" or "s": times are whole seconds and comparisons must
+	// allow for that ("coarse" times).
+	MTimeUnit string `json:"mtime_unit,omitempty"`
 }
+
+// ExactTimes reports whether entries carry nanosecond modification times.
+func (h *Header) ExactTimes() bool { return h.MTimeUnit == "ns" }
 
 // Source kinds used in Header.SourceKind.
 const (
@@ -81,6 +102,7 @@ type Index struct {
 	Lower   []string // lowercase names, used for matching
 	Sizes   []int64
 	MTimes  []int64
+	Nanos   []uint32 // sub-second part of MTimes, see Entry.Nanos
 	Flags   []uint8
 
 	byID    map[uint64]int32 // ID -> slot
@@ -100,6 +122,7 @@ func NewWithCapacity(n int) *Index {
 		Lower:   make([]string, 0, n),
 		Sizes:   make([]int64, 0, n),
 		MTimes:  make([]int64, 0, n),
+		Nanos:   make([]uint32, 0, n),
 		Flags:   make([]uint8, 0, n),
 		byID:    make(map[uint64]int32, n),
 	}
@@ -121,7 +144,15 @@ func (ix *Index) Add(e Entry) {
 	ix.Lower = append(ix.Lower, strings.ToLower(e.Name))
 	ix.Sizes = append(ix.Sizes, e.Size)
 	ix.MTimes = append(ix.MTimes, e.ModTime)
+	ix.Nanos = append(ix.Nanos, e.Nanos)
 	ix.Flags = append(ix.Flags, e.Flags)
+}
+
+// ModTimeNs is the modification time of the entry in slot in nanoseconds
+// since 1970 (UTC). With a seconds-only index (Header.ExactTimes false) the
+// sub-second part is 0.
+func (ix *Index) ModTimeNs(slot int) int64 {
+	return ix.MTimes[slot]*1e9 + int64(ix.Nanos[slot])
 }
 
 // Slot returns the slot holding the entry with the given ID.
@@ -138,6 +169,7 @@ func (ix *Index) Entry(slot int) Entry {
 		Name:     ix.Names[slot],
 		Size:     ix.Sizes[slot],
 		ModTime:  ix.MTimes[slot],
+		Nanos:    ix.Nanos[slot],
 		Flags:    ix.Flags[slot],
 	}
 }
@@ -157,6 +189,7 @@ func (ix *Index) Upsert(e Entry) {
 	ix.Lower[slot] = strings.ToLower(e.Name)
 	ix.Sizes[slot] = e.Size
 	ix.MTimes[slot] = e.ModTime
+	ix.Nanos[slot] = e.Nanos
 	ix.Flags[slot] = e.Flags &^ FlagDeleted
 }
 
@@ -189,6 +222,7 @@ func (ix *Index) Compact() {
 		ix.Lower[w] = ix.Lower[r]
 		ix.Sizes[w] = ix.Sizes[r]
 		ix.MTimes[w] = ix.MTimes[r]
+		ix.Nanos[w] = ix.Nanos[r]
 		ix.Flags[w] = ix.Flags[r]
 		w++
 	}
@@ -198,6 +232,7 @@ func (ix *Index) Compact() {
 	ix.Lower = ix.Lower[:w]
 	ix.Sizes = ix.Sizes[:w]
 	ix.MTimes = ix.MTimes[:w]
+	ix.Nanos = ix.Nanos[:w]
 	ix.Flags = ix.Flags[:w]
 	ix.deleted = 0
 	ix.rebuildByID()

@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/yashwardhanv/dd/internal/fsinfo"
 	"github.com/yashwardhanv/dd/internal/index"
 	"github.com/yashwardhanv/dd/internal/scan"
 )
@@ -35,10 +36,6 @@ const (
 	OnConflictSkip      = "skip"      // never overwrite
 	OnConflictOverwrite = "overwrite" // always overwrite
 )
-
-// mtimeTolerance: FAT stores modification times in 2-second steps, so two
-// copies of the "same" file can differ by up to 2 s. Within that, times are equal.
-const mtimeTolerance = 2 // seconds
 
 // fat32MaxFile is the largest file FAT32 can store (4 GiB minus one byte).
 const fat32MaxFile = 4 << 30
@@ -81,6 +78,20 @@ type Job struct {
 	Rel string
 	// Size in bytes, and ModTime in unix seconds, as reported by the source.
 	Size, ModTime int64
+	// ModTimeNs is the modification time in nanoseconds since 1970 (UTC). 0
+	// means "only ModTime is known" (see MTimeNs).
+	ModTimeNs int64
+	// TimeCoarse: the source only knows whole seconds (phones, indexes written
+	// before exact times existed), so comparisons allow at least one second.
+	TimeCoarse bool
+}
+
+// MTimeNs is the job's modification time in nanoseconds.
+func (j Job) MTimeNs() int64 {
+	if j.ModTimeNs != 0 {
+		return j.ModTimeNs
+	}
+	return j.ModTime * 1e9
 }
 
 // Item is a Job plus what the plan decided about it.
@@ -89,6 +100,18 @@ type Item struct {
 	Decision Decision
 	// Blocked is set when the destination exists but can't be replaced (it is a folder).
 	Blocked string
+	// DSTShift: the destination differs by exactly one hour on a drive that
+	// stores local time (FAT32), the mark of a daylight-saving change, and is
+	// treated as unchanged (SkipSame).
+	DSTShift bool
+
+	// Filled in when the file is copied (they feed the copy manifest):
+	Hash         [16]byte // XXH3-128 of the bytes read from the source
+	Hashed       bool     // Hash is valid
+	SrcSize      int64    // the source as it was when it was copied
+	SrcMTimeNs   int64
+	DstMTimeNs   int64 // the modification time given to the copy
+	MediaChecked bool  // read back from the destination without the cache and compared
 }
 
 // Plan is everything a copy is going to do.
@@ -99,6 +122,22 @@ type Plan struct {
 	Phone   *PhoneSource
 
 	OnConflict string
+
+	// SrcFS and DstFS describe the two file systems; they decide how
+	// modification times are compared (fsinfo.SameTime).
+	SrcFS, DstFS fsinfo.Info
+}
+
+// DSTShifts counts files treated as unchanged although their times differ by
+// exactly one hour (daylight saving on a FAT32 drive).
+func (p *Plan) DSTShifts() int64 {
+	var n int64
+	for i := range p.Items {
+		if p.Items[i].DSTShift {
+			n++
+		}
+	}
+	return n
 }
 
 // Counts summarises the plan.
@@ -137,50 +176,63 @@ func ValidPolicy(s string) bool {
 	return false
 }
 
+// decision is what decide concluded about one file.
+type decision struct {
+	d       Decision
+	blocked string
+	shift   bool // unchanged except for a daylight-saving hour
+}
+
 // decide applies the conflict rules to one file. dst is nil when the
 // destination doesn't exist.
 //
-//	same size and times within 2 s  -> skip  (this is how resume works)
-//	different + newer               -> overwrite only if the source is newer
-//	different + skip                -> skip
-//	different + overwrite           -> overwrite
-func decide(policy string, srcSize, srcMTime int64, dst os.FileInfo) (Decision, string) {
+//	same size and SameTime            -> skip  (this is how resume works)
+//	same size, exactly 1 h apart, FAT -> skip, counted as a daylight-saving shift
+//	different + newer                 -> overwrite only if the source is newer
+//	different + skip                  -> skip
+//	different + overwrite             -> overwrite
+//
+// Times are compared with the coarser of the two file systems' resolutions
+// (fsinfo.SameTime), not a fixed 2 seconds: NTFS to NTFS needs no slack at
+// all, so an edit within the same second is not missed (INV-1).
+func decide(policy string, j Job, dst os.FileInfo, srcFS, dstFS fsinfo.Info) decision {
 	if dst == nil {
-		return Copy, ""
+		return decision{d: Copy}
 	}
 	if dst.IsDir() {
-		return Copy, "the destination is a folder, not a file"
+		return decision{d: Copy, blocked: "the destination is a folder, not a file"}
 	}
-	dstMTime := dst.ModTime().Unix()
-	if dst.Size() == srcSize && abs64(dstMTime-srcMTime) <= mtimeTolerance {
-		return SkipSame, ""
+	srcNs, dstNs := j.MTimeNs(), dst.ModTime().UnixNano()
+	if dst.Size() == j.Size {
+		same, shift := fsinfo.SameTime(srcNs, dstNs, srcFS, dstFS, j.TimeCoarse)
+		if same {
+			return decision{d: SkipSame}
+		}
+		if shift {
+			return decision{d: SkipSame, shift: true}
+		}
 	}
 	switch policy {
 	case OnConflictSkip:
-		return SkipPolicy, ""
+		return decision{d: SkipPolicy}
 	case OnConflictOverwrite:
-		return Overwrite, ""
+		return decision{d: Overwrite}
 	default: // newer
-		if srcMTime > dstMTime {
-			return Overwrite, ""
+		if srcNs > dstNs {
+			return decision{d: Overwrite}
 		}
-		return SkipNewer, ""
+		return decision{d: SkipNewer}
 	}
-}
-
-func abs64(v int64) int64 {
-	if v < 0 {
-		return -v
-	}
-	return v
 }
 
 // finalize resolves conflicts for jobs (statting destinations in parallel),
-// sorts so big files go first, and assembles the Plan.
-func finalize(dstRoot string, dirs []string, jobs []Job, policy string, workers int) *Plan {
+// sorts so big files go first, and assembles the Plan. srcFS describes where
+// the jobs are read from.
+func finalize(dstRoot string, dirs []string, jobs []Job, policy string, workers int, srcFS fsinfo.Info) *Plan {
 	if policy == "" {
 		policy = OnConflictNewer
 	}
+	dstFS := fsinfo.OrDefault(dstRoot)
 	items := make([]Item, len(jobs))
 	parallelFor(len(jobs), workers, func(i int) {
 		j := jobs[i]
@@ -189,7 +241,8 @@ func finalize(dstRoot string, dirs []string, jobs []Job, policy string, workers 
 		if err != nil {
 			st = nil // not there (or unreadable: copying will report the real problem)
 		}
-		items[i].Decision, items[i].Blocked = decide(policy, j.Size, j.ModTime, st)
+		dec := decide(policy, j, st, srcFS, dstFS)
+		items[i].Decision, items[i].Blocked, items[i].DSTShift = dec.d, dec.blocked, dec.shift
 	})
 
 	// Largest first: big files start early instead of ending as one lonely
@@ -202,7 +255,7 @@ func finalize(dstRoot string, dirs []string, jobs []Job, policy string, workers 
 		return items[a].Rel < items[b].Rel
 	})
 	sort.Strings(dirs)
-	return &Plan{DstRoot: dstRoot, Dirs: dirs, Items: items, OnConflict: policy}
+	return &Plan{DstRoot: dstRoot, Dirs: dirs, Items: items, OnConflict: policy, SrcFS: srcFS, DstFS: dstFS}
 }
 
 // parallelFor runs fn(0..n-1) on up to `workers` goroutines.
@@ -259,9 +312,10 @@ func PlanLocal(ctx context.Context, src, dstRoot, policy string, workers int) (*
 		return nil, fmt.Errorf("opening %s: %w", src, err)
 	}
 
+	srcFS := fsinfo.OrDefault(src)
 	if !st.IsDir() {
-		job := Job{Src: src, Rel: filepath.Base(src), Size: st.Size(), ModTime: st.ModTime().Unix()}
-		return finalize(dstRoot, nil, []Job{job}, policy, 1), nil
+		job := Job{Src: src, Rel: filepath.Base(src), Size: st.Size(), ModTime: st.ModTime().Unix(), ModTimeNs: st.ModTime().UnixNano()}
+		return finalize(dstRoot, nil, []Job{job}, policy, 1, srcFS), nil
 	}
 
 	if inside(src, dstRoot) {
@@ -286,13 +340,15 @@ func PlanLocal(ctx context.Context, src, dstRoot, policy string, workers int) (*
 			continue
 		}
 		jobs = append(jobs, Job{
-			Src:     index.JoinRoot(src, ix.RelPathCached(slot, cache)),
-			Rel:     rel,
-			Size:    max(ix.Sizes[slot], 0),
-			ModTime: ix.MTimes[slot],
+			Src:        index.JoinRoot(src, ix.RelPathCached(slot, cache)),
+			Rel:        rel,
+			Size:       max(ix.Sizes[slot], 0),
+			ModTime:    ix.MTimes[slot],
+			ModTimeNs:  ix.ModTimeNs(slot),
+			TimeCoarse: !ix.Header.ExactTimes(),
 		})
 	}
-	return finalize(dstRoot, dirs, jobs, policy, workers), nil
+	return finalize(dstRoot, dirs, jobs, policy, workers, srcFS), nil
 }
 
 // ErrDestinationInsideSource means a folder would be copied into itself (or
@@ -311,9 +367,10 @@ func inside(dir, path string) bool {
 }
 
 // PlanJobs plans copying an explicit list of files (for example every match of
-// a search) into dstRoot.
-func PlanJobs(dstRoot string, jobs []Job, policy string, workers int) *Plan {
-	return finalize(dstRoot, nil, append([]Job(nil), jobs...), policy, workers)
+// a search) into dstRoot. srcFS describes the files' file system (they may
+// come from several drives; pass the most tolerant one).
+func PlanJobs(dstRoot string, jobs []Job, policy string, workers int, srcFS fsinfo.Info) *Plan {
+	return finalize(dstRoot, nil, append([]Job(nil), jobs...), policy, workers, srcFS)
 }
 
 // ---------------------------------------------------------------------------

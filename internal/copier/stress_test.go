@@ -106,7 +106,7 @@ func TestStressCancelAndResume(t *testing.T) {
 				cancel()
 			}
 		}
-		res, err := Run(ctx, p, Options{Workers: 8, Verify: round%2 == 0})
+		res, err := Run(ctx, p, Options{Workers: 8, Verify: map[bool]VerifyMode{true: VerifyMedia, false: VerifyOff}[round%2 == 0]})
 		cancel()
 		if err != nil {
 			t.Fatalf("round %d: %v", round, err)

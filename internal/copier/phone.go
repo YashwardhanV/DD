@@ -2,8 +2,10 @@ package copier
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -12,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yashwardhanv/dd/internal/fsinfo"
 	"github.com/yashwardhanv/dd/internal/index"
 	"github.com/yashwardhanv/dd/internal/phone"
 	"github.com/yashwardhanv/dd/internal/scan"
@@ -22,6 +25,11 @@ type PhoneSource struct {
 	ADB    *phone.ADB
 	Serial string
 	Remote string // the folder or file being copied, e.g. "/sdcard/DCIM/Camera"
+	// HashTool is the checksum program found on the phone ("sha256sum",
+	// "sha1sum", "md5sum"; see phone.ADB.HashTool). With --verify, each
+	// pulled batch is hashed ON THE PHONE and compared with the same
+	// algorithm computed on the PC copy. "" = phone copies can't be verified.
+	HashTool string
 }
 
 const (
@@ -62,8 +70,8 @@ func PlanPhone(ctx context.Context, adb *phone.ADB, serial, remote, dstRoot, pol
 	}
 
 	if !info.IsDir {
-		job := Job{Src: remote, Rel: SafeName(path.Base(remote)), Size: info.Size, ModTime: info.ModTime}
-		plan := finalize(dstRoot, nil, []Job{job}, policy, 1)
+		job := Job{Src: remote, Rel: SafeName(path.Base(remote)), Size: info.Size, ModTime: info.ModTime, TimeCoarse: true}
+		plan := finalize(dstRoot, nil, []Job{job}, policy, 1, fsinfo.ForPhone())
 		plan.Phone = src
 		return plan, nil
 	}
@@ -88,13 +96,14 @@ func PlanPhone(ctx context.Context, adb *phone.ADB, serial, remote, dstRoot, pol
 			continue
 		}
 		jobs = append(jobs, Job{
-			Src:     path.Join(remote, strings.ReplaceAll(relBack, `\`, "/")),
-			Rel:     rel,
-			Size:    max(ix.Sizes[slot], 0),
-			ModTime: ix.MTimes[slot],
+			Src:        path.Join(remote, strings.ReplaceAll(relBack, `\`, "/")),
+			Rel:        rel,
+			Size:       max(ix.Sizes[slot], 0),
+			ModTime:    ix.MTimes[slot],
+			TimeCoarse: true, // adb's stat gives whole seconds
 		})
 	}
-	plan := finalize(dstRoot, dirs, jobs, policy, workers)
+	plan := finalize(dstRoot, dirs, jobs, policy, workers, fsinfo.ForPhone())
 	plan.Phone = src
 	return plan, nil
 }
@@ -222,7 +231,7 @@ func pullBatchInto(ctx context.Context, p *Plan, b pullBatch, opt Options, st *s
 		}
 		var stillPending []*Item
 		for _, files := range group {
-			failed, err := pullAndPlace(ctx, p, files, st)
+			failed, err := pullAndPlace(ctx, p, files, opt, st)
 			if err != nil {
 				lastErr = err
 			}
@@ -244,7 +253,7 @@ func pullBatchInto(ctx context.Context, p *Plan, b pullBatch, opt Options, st *s
 
 // pullAndPlace pulls files into a fresh staging folder and moves each
 // delivered file to its final place. It returns the files that did not arrive.
-func pullAndPlace(ctx context.Context, p *Plan, files []*Item, st *state) (failed []*Item, err error) {
+func pullAndPlace(ctx context.Context, p *Plan, files []*Item, opt Options, st *state) (failed []*Item, err error) {
 	staging, mkErr := os.MkdirTemp(p.DstRoot, stagingPrefix)
 	if mkErr != nil {
 		return files, fmt.Errorf("creating a staging folder in %s: %w", p.DstRoot, mkErr)
@@ -267,6 +276,7 @@ func pullAndPlace(ctx context.Context, p *Plan, files []*Item, st *state) (faile
 		return nil, ctx.Err()
 	}
 
+	var placed []placedFile
 	for _, it := range files {
 		staged := filepath.Join(staging, path.Base(it.Src))
 		if unsafe {
@@ -286,11 +296,108 @@ func pullAndPlace(ctx context.Context, p *Plan, files []*Item, st *state) (faile
 			err = fmt.Errorf("moving %s into place: %w", it.Rel, rerr)
 			continue
 		}
+		it.SrcSize, it.SrcMTimeNs, it.DstMTimeNs = it.Size, it.MTimeNs(), it.MTimeNs()
+		placed = append(placed, placedFile{it: it, path: final, size: info.Size()})
+	}
+
+	// Verify the batch: one command hashes every file on the phone, the PC
+	// hashes its copies (read back from the drive) with the same algorithm.
+	bad := map[*Item]bool{}
+	if opt.Verify != VerifyOff && p.Phone.HashTool != "" && len(placed) > 0 {
+		bad, err = verifyPhoneBatch(ctx, p, placed, opt, st, err)
+	}
+	for _, pf := range placed {
+		if bad[pf.it] {
+			failed = append(failed, pf.it)
+			continue
+		}
 		st.written.Add(1)
-		st.bytesDone.Add(info.Size())
+		st.bytesDone.Add(pf.size)
 		st.filesDone.Add(1)
 	}
 	return failed, err
+}
+
+type placedFile struct {
+	it   *Item
+	path string
+	size int64
+}
+
+// verifyPhoneBatch compares the phone's checksums with the copies'. A copy
+// that differs (or can't be checked) is deleted and returned as bad, so it is
+// pulled again.
+func verifyPhoneBatch(ctx context.Context, p *Plan, placed []placedFile, opt Options, st *state, prevErr error) (map[*Item]bool, error) {
+	bad := map[*Item]bool{}
+	remotes := make([]string, len(placed))
+	for i, pf := range placed {
+		remotes[i] = pf.it.Src
+	}
+	sums, herr := p.Phone.ADB.HashFiles(ctx, p.Phone.Serial, p.Phone.HashTool, remotes)
+	if herr != nil {
+		for _, pf := range placed {
+			os.Remove(pf.path)
+			bad[pf.it] = true
+		}
+		return bad, fmt.Errorf("%w: the phone couldn't compute checksums (%v)", errVerify, herr)
+	}
+	var abuf []byte
+	if opt.Verify == VerifyMedia {
+		abufp := alignedPool.Get().(*[]byte)
+		defer alignedPool.Put(abufp)
+		abuf = *abufp
+	}
+	for _, pf := range placed {
+		want, ok := sums[pf.it.Src]
+		if !ok {
+			continue // the tool couldn't name it unambiguously: not verified, not failed
+		}
+		got, err := hashFileWith(ctx, pf.path, p.Phone.HashTool, opt.Verify == VerifyMedia, abuf)
+		if err != nil || got != want {
+			os.Remove(pf.path)
+			bad[pf.it] = true
+			st.mismatches.Add(1)
+			prevErr = fmt.Errorf("%w: the copy of %s differs from the file on the phone", errVerify, pf.it.Src)
+			continue
+		}
+		pf.it.MediaChecked = opt.Verify == VerifyMedia
+	}
+	return bad, prevErr
+}
+
+// hashFileWith hashes a local file with the phone tool's algorithm, read back
+// without the cache when unbuffered is set.
+func hashFileWith(ctx context.Context, path, tool string, unbuffered bool, abuf []byte) (string, error) {
+	h, ok := phone.NewHash(tool)
+	if !ok {
+		return "", fmt.Errorf("unknown hash tool %s", tool)
+	}
+	var f *os.File
+	var err error
+	if unbuffered {
+		f, err = openUnbuffered(path)
+	} else {
+		f, err = os.Open(path)
+		abuf = make([]byte, 1<<20)
+	}
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		n, rerr := f.Read(abuf)
+		h.Write(abuf[:n])
+		if rerr == io.EOF || (rerr == nil && n == 0) {
+			break
+		}
+		if rerr != nil {
+			return "", rerr
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // PlanPhoneJobs plans pulling an explicit list of files (for example every
@@ -303,8 +410,9 @@ func PlanPhoneJobs(adb *phone.ADB, serial string, jobs []Job, dstRoot, policy st
 	jobs = append([]Job(nil), jobs...)
 	for i := range jobs {
 		jobs[i].Rel = SafeRel(jobs[i].Rel)
+		jobs[i].TimeCoarse = true
 	}
-	plan := finalize(dstRoot, nil, jobs, policy, workers)
+	plan := finalize(dstRoot, nil, jobs, policy, workers, fsinfo.ForPhone())
 	plan.Phone = &PhoneSource{ADB: adb, Serial: serial}
 	return plan
 }

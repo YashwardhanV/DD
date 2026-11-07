@@ -110,3 +110,25 @@ func openForQuery(device string) (windows.Handle, error) {
 	}
 	return h, nil
 }
+
+// storageAccessAlignmentProperty is STORAGE_PROPERTY_ID 6.
+const storageAccessAlignmentProperty = 6
+
+// SectorSize returns the larger of the logical and physical sector size of the
+// drive holding vol ("E:"). Unbuffered reads (copy --verify) must be aligned
+// to it.
+func SectorSize(vol string) (int64, error) {
+	// STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR: Version, Size, BytesPerCacheLine,
+	// BytesOffsetForCacheAlignment, BytesPerLogicalSector,
+	// BytesPerPhysicalSector, BytesOffsetForSectorAlignment (all uint32).
+	out, err := queryStorageProperty(vol, storageAccessAlignmentProperty, 28)
+	if err != nil {
+		return 0, err
+	}
+	if len(out) < 24 {
+		return 0, errors.New("short alignment reply")
+	}
+	logical := int64(binary.LittleEndian.Uint32(out[16:]))
+	physical := int64(binary.LittleEndian.Uint32(out[20:]))
+	return max(logical, physical), nil
+}

@@ -22,8 +22,8 @@ var copyChecks = copier.DefaultChecks
 
 // newCopyCmd implements `drivedex copy <src> <dst>`.
 func newCopyCmd() *cobra.Command {
-	var workers, onConflict string
-	var verify, dryRun bool
+	var workers, onConflict, verify string
+	var dryRun bool
 
 	cmd := &cobra.Command{
 		Use:   "copy <src> <dst>",
@@ -48,21 +48,30 @@ for speed, DriveDex does not force every file to be flushed to the disk.`,
   drivedex copy C:\Projects F:\ --on-conflict skip --verify`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			mode, ok := copier.ParseVerifyMode(verify)
+			if !ok {
+				return userErr(fmt.Sprintf("--verify %q isn't valid", verify), "use --verify (the same as --verify=media), --verify=cache or --verify=off", nil)
+			}
 			return runCopy(cmd.Context(), cmd.OutOrStdout(), args[0], args[1], copyFlags{
-				workers: effectiveWorkers(cmd, workers), onConflict: onConflict, verify: verify, dryRun: dryRun,
+				workers: effectiveWorkers(cmd, workers), onConflict: onConflict, verify: mode, dryRun: dryRun,
 			})
 		},
 	}
 	cmd.Flags().StringVar(&workers, "workers", "auto", "files copied at once: auto (picked from the drive types) or a number")
 	cmd.Flags().StringVar(&onConflict, "on-conflict", copier.OnConflictNewer, "when a file already exists: newer (replace only if the source is newer), skip, or overwrite")
-	cmd.Flags().BoolVar(&verify, "verify", false, "afterwards compare CRC-32 checksums of every copied file (note: the copy may be read back from RAM cache, so this checks the copy logic, not the physical media)")
+	cmd.Flags().StringVar(&verify, "verify", "off", verifyHelp)
+	cmd.Flags().Lookup("verify").NoOptDefVal = "media"
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "show what would be copied, skipped or overwritten, without writing anything")
 	return cmd
 }
 
+// verifyHelp explains --verify, including its honest limit.
+const verifyHelp = `check every copied file: --verify (= media) hashes the source while copying, flushes the copy to the drive and reads it back WITHOUT the Windows cache; --verify=cache reads it back through the cache (cheaper, but only proves DriveDex wrote the right bytes); off. Honest limit: some cheap USB devices confirm a flush without writing, and a cache inside the device can still answer the read - only unplugging and replugging defeats that (doctor --capacity does). Phones are checked with the phone's own sha256sum/sha1sum/md5sum`
+
 type copyFlags struct {
 	workers, onConflict string
-	verify, dryRun      bool
+	verify              copier.VerifyMode
+	dryRun              bool
 }
 
 // phoneSpec is a parsed "phone:..." copy source.
@@ -145,9 +154,15 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 		if err != nil {
 			return planError(srcArg, err)
 		}
-		if f.verify {
-			fmt.Fprintln(out, ui.Dim("note: --verify isn't available for phone copies (there is nothing on the PC to compare with); files are still copied atomically."))
-			f.verify = false
+		if f.verify != copier.VerifyOff {
+			tool, terr := adb.HashTool(ctx, dev.Serial)
+			if terr != nil || tool == "" {
+				fmt.Fprintln(out, ui.Dim("note: this phone has no sha256sum, sha1sum or md5sum, so its files can't be verified; they are still copied atomically."))
+				f.verify = copier.VerifyOff
+			} else {
+				plan.Phone.HashTool = tool
+				fmt.Fprintln(out, ui.Dim("Verifying with the phone's own "+tool+" (each file is hashed on the phone and on the PC)."))
+			}
 		}
 	} else {
 		src, err := resolveSource(srcArg)
@@ -182,7 +197,7 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 type planRun struct {
 	workers int
 	why     string // why that many workers (for the message)
-	verify  bool
+	verify  copier.VerifyMode
 	dryRun  bool
 	dstArg  string // the destination as the user typed it (for messages)
 	srcRoot string // a local source folder, "" when there isn't one (phone, search results)
@@ -254,8 +269,16 @@ func finishPlan(ctx context.Context, out *bufio.Writer, status *ui.StatusLine, p
 	if res.NotRegular > 0 {
 		fmt.Fprintln(out, ui.Dim(fmt.Sprintf("%d links/special files were skipped (DriveDex never follows links).", res.NotRegular)))
 	}
-	if f.verify && res.VerifyMismatches == 0 && res.Failed == 0 {
-		fmt.Fprintln(out, ui.Green("Verified:")+" every copied file matches its original (checksums).")
+	if f.verify != copier.VerifyOff && res.VerifyMismatches == 0 && res.Failed == 0 && res.Written > 0 {
+		if f.verify == copier.VerifyMedia {
+			fmt.Fprintln(out, ui.Green("Verified:")+" every copied file was read back from the drive (not the PC's cache) and matches its original.")
+		} else {
+			fmt.Fprintln(out, ui.Green("Verified:")+" every copied file matches its original (read back through the Windows cache).")
+		}
+	}
+	if n := plan.DSTShifts(); n > 0 {
+		fmt.Fprintln(out, ui.Dim(fmt.Sprintf("%s %s by exactly one hour (daylight-saving time on a FAT32 drive); treated as unchanged.",
+			ui.Thousands(n), plural(int(n), "file differs", "files differ"))))
 	}
 	if res.Cancelled {
 		fmt.Fprintln(out, "Stopped. Run the same command again to resume.")

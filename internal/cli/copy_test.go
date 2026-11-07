@@ -407,14 +407,32 @@ func TestCopyFromPhoneErrors(t *testing.T) {
 	}
 }
 
-func TestCopyVerifyIsNotAvailableForPhones(t *testing.T) {
+func TestCopyVerifyUsesThePhonesHashTool(t *testing.T) {
 	t.Setenv("DRIVEDEX_INDEX_DIR", t.TempDir())
 	fs := phonetest.NewFS()
 	fs.Add("/sdcard/a.txt", "x", 1)
 	useFS(t, fs)
 	out, err := run(t, "copy", "phone:/a.txt", t.TempDir(), "--verify")
-	if err != nil || !strings.Contains(out, "--verify isn't available for phone copies") {
+	if err != nil || !strings.Contains(out, "phone's own sha256sum") || !strings.Contains(out, "Verified:") {
 		t.Errorf("%v\n%s", err, out)
+	}
+}
+
+func TestCopyVerifyOnAPhoneWithoutHashTools(t *testing.T) {
+	t.Setenv("DRIVEDEX_INDEX_DIR", t.TempDir())
+	fs := phonetest.NewFS()
+	fs.HashTools = nil
+	fs.Add("/sdcard/a.txt", "x", 1)
+	useFS(t, fs)
+	out, err := run(t, "copy", "phone:/a.txt", t.TempDir(), "--verify")
+	if err != nil || !strings.Contains(out, "can't be verified") || strings.Contains(out, "Verified:") {
+		t.Errorf("%v\n%s", err, out)
+	}
+}
+
+func TestCopyRejectsAnUnknownVerifyMode(t *testing.T) {
+	if _, err := run(t, "copy", t.TempDir(), t.TempDir(), "--verify=sometimes"); err == nil || !strings.Contains(err.Error(), "--verify") {
+		t.Errorf("err = %v", err)
 	}
 }
 
@@ -423,7 +441,7 @@ func TestCopyHelpMentionsTheSafetyAdvice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Safely Remove", "phone:/DCIM/Camera", "RAM cache", "--dry-run", "--on-conflict"} {
+	for _, want := range []string{"Safely Remove", "phone:/DCIM/Camera", "WITHOUT the Windows cache", "Honest limit", "--dry-run", "--on-conflict"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("help missing %q", want)
 		}

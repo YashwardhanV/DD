@@ -19,7 +19,7 @@ import (
 func TestBigLanesLimitBigFilesWithoutStarvingSmallOnes(t *testing.T) {
 	oldBig := bigFileSize
 	bigFileSize = 4 << 10
-	defer func() { bigFileSize = oldBig; openSource = os.Open; afterCopy = nil }()
+	defer func() { bigFileSize = oldBig; openSource = defaultOpenSource; afterCopy = nil }()
 
 	src := filepath.Join(t.TempDir(), "src")
 	if err := os.MkdirAll(src, 0o755); err != nil {
@@ -42,7 +42,7 @@ func TestBigLanesLimitBigFilesWithoutStarvingSmallOnes(t *testing.T) {
 
 	var bigActive, maxBig, smallDuringBig atomic.Int32
 	var mu sync.Mutex
-	openSource = func(name string) (*os.File, error) {
+	openSource = func(name string, _ bool) (*os.File, error) {
 		if strings.HasPrefix(filepath.Base(name), "big") {
 			n := bigActive.Add(1)
 			mu.Lock()
@@ -150,7 +150,7 @@ func TestReservedSpaceFileArrivesExactly(t *testing.T) {
 
 	dst := filepath.Join(t.TempDir(), "dst")
 	opt := fastOpts(2)
-	opt.Verify = true
+	opt.Verify = VerifyMedia
 	if r := mustRun(t, plan(t, p, dst, ""), opt); r.Written != 1 || r.Failed != 0 || r.VerifyMismatches != 0 {
 		t.Fatalf("result %+v", r)
 	}

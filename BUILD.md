@@ -22,6 +22,7 @@
 | 10 | Explorer integration | Right-click → "Search with DriveDex" | Windows registry |
 | 11 | Doctor, config, power search | `doctor` diagnoses slow USB; `ext:` `size:` filters; JSON output | Diagnostics, query parsing |
 | 12 | Packaging & release | One-command install, GitHub release, README | Distribution, CI |
+| 13 | Correctness groundwork (design doc P0) | Exact times, changed-while-copying detection, FAT-aware comparison, `--verify` that reads the drive back | File-system time resolution, FlushFileBuffers, unbuffered I/O |
 
 Stages 1–7 are the core tool. Stages 8–12 make it easy to use.
 
@@ -1605,6 +1606,40 @@ The owner should be able to explain the project in an interview after reading th
 - [ ] README renders correctly on GitHub.
 
 **Commit:** `stage 12: packaging, install and release` → then tag `v1.0.0` (ask first).
+
+---
+
+---
+
+## Stage 13 — Correctness groundwork (design doc P0)
+
+**Source:** `DriveDex-Design-Doc.pdf` v1.0 (7 Nov 2026), chapter 5. Stages 13 onwards implement that document phase by phase; it is the specification, this section records what was built.
+
+**Goal:** make a single file copy exact and honest before anything is built on top of it.
+
+### Files
+- `internal/fsinfo/` (new): `Info` per volume (file system, cluster and sector size, time resolution, local-time flag, case sensitivity, read-only), `Of(path)` cached per volume root, `ForPhone`/`ForDevice`, `SameTime`/`Tolerance`, per-folder case sensitivity (Windows).
+- `internal/index/model.go`, `format.go`: `Entry.Nanos` / `Index.Nanos` (sub-second part of the modification time), `.ddx` **format version 2** (one extra uvarint per entry); version 1 files keep loading (INV-8). New optional header fields `meta_complete`, `skip_rules`, `mtime_unit`.
+- `internal/scan/`: walkers record nanoseconds, `mtime_unit = "ns"` and the skip rules they used.
+- `internal/copier/copyfile.go` (new), `copy.go`, `plan.go`, `phone.go`, `fileops_*.go`.
+- `internal/phone/hash.go` (new), fake phone gains hash tools and corrupting pulls.
+- `internal/cli/copy.go`, `searchcopy.go`.
+
+### Spec (as built)
+1. **Exact times.** `copier.Job` has `ModTimeNs` and `TimeCoarse`. The time written to a copy comes from the source's `Lstat` taken at copy time (not from the plan), at full precision through the open handle (`SetFileTime`), together with the creation time.
+2. **Changed while copying.** `Lstat` before and after reading; size, exact modification time and bytes read must agree, otherwise the `.ddxpart` is deleted and the file retried; after the last retry: *"the file kept changing while it was copied"*. Every attempt but the last opens the source **share-read only** (`CreateFile` with `FILE_SHARE_READ`): a file another program has open for writing fails as *in use, will retry*; the last attempt opens normally, still guarded by the check.
+3. **Comparing times.** `decide()` uses `fsinfo.SameTime`: tolerance = the coarser of both file systems (100 ns NTFS, 10 ms exFAT, 2 s FAT32, 1 s phone; unknown = 2 s), at least 1 s for coarse times. A difference of exactly one hour (± tolerance) when either side stores local time is a **daylight-saving shift**: same size → treated as unchanged, counted and reported once.
+4. **`--verify` proves the media.** `--verify` (= `--verify=media`): the source is hashed (XXH3-128) while it is copied, so it is read once; the copy is flushed (`FlushFileBuffers`, which also flushes the device cache) and read back with `FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN` into a 4096-aligned 1 MiB buffer per worker. `--verify=cache` reads it back through the cache. A mismatch deletes the copy and retries. The help text states the honest limit (devices that acknowledge a flush without writing).
+5. **Phone verify.** `adb shell` is probed once for `sha256sum`, `sha1sum`, `md5sum`; after each pulled batch one remote command (`printf '%s\0' ... | xargs -0 <tool>`) hashes the files on the phone and the PC hashes its copies (read back unbuffered) with the same algorithm. No tool: the old "can't be verified" note.
+
+### Acceptance
+- [x] NTFS → NTFS copy keeps the modification time to 100 ns (`TestModTimePreservedTo100ns`, run on Windows/NTFS).
+- [x] Appending to the source during the copy → failure, nothing under the real name (`TestINV4_SourceThatChangesDuringCopyIsRejected`).
+- [x] Table-driven `SameTime` tests for every pair incl. FAT ±1 h (`TestSameTimeTable`).
+- [x] `--verify` opens the copy with `FILE_FLAG_NO_BUFFERING` and reads the source exactly once (`TestVerifyMediaOpensWithoutTheCache`, `TestVerifyMediaReadsSourceOnceAndDestinationUnbuffered`).
+- [ ] Hardware: FAT32 pen drive across a daylight-saving change; `--verify` on a USB pen drive (PROGRESS.md).
+
+**Commit:** `stage 13: correctness groundwork (P0)`
 
 ---
 

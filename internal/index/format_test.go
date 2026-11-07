@@ -2,7 +2,10 @@ package index
 
 import (
 	"bytes"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
+	"hash/crc32"
 	"reflect"
 	"testing"
 	"time"
@@ -135,5 +138,69 @@ func TestGarbageGivesErrorNotPanic(t *testing.T) {
 		if _, err := Read(data); !errors.Is(err, ErrCorruptIndex) {
 			t.Errorf("Read(%q) err = %v, want ErrCorruptIndex", data, err)
 		}
+	}
+}
+
+// writeV1 encodes ix in the version 1 layout (no nanos field), exactly as
+// DriveDex 1.x wrote it.
+func writeV1(ix *Index) []byte {
+	var body bytes.Buffer
+	var tmp [binary.MaxVarintLen64]byte
+	h := ix.Header
+	h.FormatVersion = 1
+	hj, _ := json.Marshal(h)
+	body.WriteString(magic)
+	binary.LittleEndian.PutUint16(tmp[:2], 1)
+	body.Write(tmp[:2])
+	binary.LittleEndian.PutUint32(tmp[:4], uint32(len(hj)))
+	body.Write(tmp[:4])
+	body.Write(hj)
+	body.Write(tmp[:binary.PutUvarint(tmp[:], uint64(ix.Len()))])
+	for s := 0; s < ix.Len(); s++ {
+		body.Write(tmp[:binary.PutUvarint(tmp[:], ix.IDs[s])])
+		body.Write(tmp[:binary.PutUvarint(tmp[:], ix.Parents[s])])
+		body.WriteByte(ix.Flags[s])
+		body.Write(tmp[:binary.PutVarint(tmp[:], ix.Sizes[s])])
+		body.Write(tmp[:binary.PutVarint(tmp[:], ix.MTimes[s])])
+		body.Write(tmp[:binary.PutUvarint(tmp[:], uint64(len(ix.Names[s])))])
+		body.WriteString(ix.Names[s])
+	}
+	binary.LittleEndian.PutUint32(tmp[:4], crc32.ChecksumIEEE(body.Bytes()))
+	body.Write(tmp[:4])
+	return body.Bytes()
+}
+
+// TestINV8_Version1IndexStillLoads: an index written by DriveDex 1.x loads in
+// this version, with whole-second times (not "exact").
+func TestINV8_Version1IndexStillLoads(t *testing.T) {
+	orig := sample()
+	orig.Header.MTimeUnit = "ns" // even if a v1 header somehow claimed it
+	got, err := Read(writeV1(orig))
+	if err != nil {
+		t.Fatalf("version 1 file: %v", err)
+	}
+	if !reflect.DeepEqual(entriesOf(got), entriesOf(orig)) {
+		t.Errorf("entries differ:\n got %+v\nwant %+v", entriesOf(got), entriesOf(orig))
+	}
+	if got.Header.ExactTimes() {
+		t.Error("a version 1 index only has whole seconds")
+	}
+}
+
+func TestNanosecondTimesRoundTrip(t *testing.T) {
+	ix := New()
+	ix.Header = Header{SourceID: "dir-x", MTimeUnit: "ns"}
+	ix.Add(Entry{ID: 1, Name: "a", Size: 3, ModTime: 1_700_000_000, Nanos: 123_456_700})
+	ix.Add(Entry{ID: 2, Name: "b", Size: 3, ModTime: -5, Nanos: 999_999_999})
+	var buf bytes.Buffer
+	if err := Write(&buf, ix); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Read(buf.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ModTimeNs(0) != 1_700_000_000*1e9+123_456_700 || got.Nanos[1] != 999_999_999 || !got.Header.ExactTimes() {
+		t.Errorf("times after round trip: %d %d exact=%v", got.ModTimeNs(0), got.Nanos[1], got.Header.ExactTimes())
 	}
 }

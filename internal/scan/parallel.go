@@ -149,6 +149,11 @@ func (p *Parallel) Scan(ctx context.Context, b *index.Builder, report func(Progr
 		skipNames = DefaultSkipDirs
 	}
 	skip := newSkipSet(skipNames)
+	// File-system listings know exact (nanosecond) times; record which
+	// folders were left out, so a copy planned from this index later knows
+	// it skips the same ones.
+	b.Index().Header.MTimeUnit = "ns"
+	b.Index().Header.SkipRules = SkipRules(skipNames)
 
 	var (
 		nextID   atomic.Uint64
@@ -195,6 +200,7 @@ func (p *Parallel) Scan(ctx context.Context, b *index.Builder, report func(Progr
 			} else {
 				e.Size = info.Size()
 				e.ModTime = info.ModTime().Unix()
+				e.Nanos = uint32(info.ModTime().Nanosecond())
 				e.Flags |= attrFlags(info, name)
 			}
 			if isDir {
