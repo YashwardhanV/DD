@@ -76,3 +76,11 @@ func termWidth() int {
 	}
 	return envWidth(os.Getenv("COLUMNS"))
 }
+
+// isConsole reports whether f is a real console (GetConsoleMode only works
+// on console handles; it fails for NUL, pipes and files).
+func isConsole(f *os.File) bool {
+	var mode uint32
+	r, _, _ := procGetConsoleMode.Call(f.Fd(), uintptr(unsafe.Pointer(&mode)))
+	return r != 0
+}

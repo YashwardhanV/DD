@@ -20,10 +20,14 @@ import (
 
 // Entry flags. They are stored as one byte per entry.
 const (
-	FlagDir     uint8 = 1 << 0
-	FlagHidden  uint8 = 1 << 1
-	FlagSystem  uint8 = 1 << 2
-	FlagNoMeta  uint8 = 1 << 3 // size/mtime unknown (filled lazily on display)
+	FlagDir    uint8 = 1 << 0
+	FlagHidden uint8 = 1 << 1
+	FlagSystem uint8 = 1 << 2
+	FlagNoMeta uint8 = 1 << 3 // size/mtime unknown (filled lazily on display)
+	// FlagReparse marks a link: a symbolic link, a junction or another
+	// entry that is not a regular file or folder. DriveDex never follows or
+	// copies links.
+	FlagReparse uint8 = 1 << 4
 	FlagDeleted uint8 = 1 << 7 // tombstone, in-memory only; never written to disk
 )
 

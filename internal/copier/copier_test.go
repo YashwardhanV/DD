@@ -696,17 +696,23 @@ func TestFreeSpaceCheck(t *testing.T) {
 	dst := t.TempDir()
 	free := func(n uint64) Checks { return Checks{FreeBytes: func(string) (uint64, error) { return n, nil }} }
 
-	if err := fakePlan(dst, 600, 500).Check(free(1000)); !errors.Is(err, ErrNotEnoughSpace) {
-		t.Errorf("1100 bytes into 1000 free: %v", err)
+	// Space is counted in whole clusters (4 KB here), plus 1 percent.
+	cl4k := func(p *Plan) *Plan {
+		p.DstFS = fsinfo.ForFileSystem("exFAT")
+		p.DstFS.ClusterBytes = 4096
+		return p
 	}
-	if err := fakePlan(dst, 600, 400).Check(free(1000)); err != nil {
-		t.Errorf("exactly fits: %v", err)
+	if err := cl4k(fakePlan(dst, 600, 500)).Check(free(8000)); !errors.Is(err, ErrNotEnoughSpace) {
+		t.Errorf("two files = two 4 KB clusters (8,272 bytes with the margin) into 8,000 free: %v", err)
+	}
+	if err := cl4k(fakePlan(dst, 600, 400)).Check(free(8300)); err != nil {
+		t.Errorf("fits: %v", err)
 	}
 	// Skipped files don't need space.
-	p := fakePlan(dst, 600, 900)
-	p.Items[0].Decision = SkipSame // the 900-byte one (sorted first)
-	if err := p.Check(free(700)); err != nil {
-		t.Errorf("only the 600-byte file needs space: %v", err)
+	p := cl4k(fakePlan(dst, 6000, 9000))
+	p.Items[0].Decision = SkipSame // the 9000-byte one (sorted first)
+	if err := p.Check(free(8300)); err != nil {
+		t.Errorf("only the 6000-byte file (2 clusters) needs space: %v", err)
 	}
 	// A failing query doesn't block the copy.
 	broken := Checks{FreeBytes: func(string) (uint64, error) { return 0, errors.New("can't tell") }}

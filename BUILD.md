@@ -23,6 +23,7 @@
 | 11 | Doctor, config, power search | `doctor` diagnoses slow USB; `ext:` `size:` filters; JSON output | Diagnostics, query parsing |
 | 12 | Packaging & release | One-command install, GitHub release, README | Distribution, CI |
 | 13 | Correctness groundwork (design doc P0) | Exact times, changed-while-copying detection, FAT-aware comparison, `--verify` that reads the drive back | File-system time resolution, FlushFileBuffers, unbuffered I/O |
+| 14 | Pre-flight (design doc P1) | Every problem shown before a byte is written; names fixed; real space; time estimate | Allocation units, Windows name rules, a cost model |
 
 Stages 1–7 are the core tool. Stages 8–12 make it easy to use.
 
@@ -1640,6 +1641,53 @@ The owner should be able to explain the project in an interview after reading th
 - [ ] Hardware: FAT32 pen drive across a daylight-saving change; `--verify` on a USB pen drive (PROGRESS.md).
 
 **Commit:** `stage 13: correctness groundwork (P0)`
+
+---
+
+---
+
+## Stage 14 — Planning ahead: pre-flight checks (design doc P1)
+
+**Goal:** before a single byte is written, tell the user everything that will go wrong or be slow, and fix the fixable automatically.
+
+### Files
+- `internal/preflight/` (new): `Severity` (Info / Warn / Block), `Issue`, `Report`, `Run(plan, Options)`, `Print`, `EstimateCopy` and `Estimate.Text`.
+- `internal/winname/` (new): Windows' name rules (`Check`, `Valid`, `Fix`, `Fold`, `CaseVariant`), used by the planner and the phone copier.
+- `internal/copier/names.go` (new): `Plan.FixNames` — the rename engine for bad names and letter-case clashes; `plan.go`: `SpaceNeeded`, `LinksSkipped`, `NewDirs`; `index.FlagReparse` marks links so they are counted before copying.
+- `internal/cli/copyrun.go` (new): `finishPlan` with pre-flight, the estimate, the y/N, exit code 3 and the `--json` result object; `copy.go` gains `--on-case-collision`, `--on-bad-name`, `--case-sensitive-dest`, `--yes`, `--json`, `--verbose`.
+
+### Spec (as built)
+| Code | Severity | When |
+|---|---|---|
+| `no-space` | Block | the space the files really take (6.5) exceeds free space |
+| `fat32-4gib` | Block | a file of 4 GiB or more to FAT32 |
+| `case-collision` | Warn (fixed) / Block with `fail` | two planned paths, or a planned path and an existing destination entry, differ only in case on a case-insensitive destination |
+| `bad-name` | Warn (fixed) / Block with `fail` | a name Windows can't store |
+| `name-too-long` | Warn (fixed by shortening) / Block with `fail` | a name over 255 UTF-16 units |
+| `long-path` | Warn | full destination path over 259 characters |
+| `fat-dir-full` | Warn | a FAT folder over 65,534 directory entries (1 + ceil(len/13) per name) |
+| `read-only` | Block | read-only volume, or a probe file can't be created (SD lock switch); no probe in a dry run |
+| `slow-port` | Info | a USB drive below its speed (the stage 12+ USB check) |
+| `source-offline` | Block | a plan from an index whose source is unplugged (used by P4/P7) |
+| `links-skipped` | Info | links/junctions in the source |
+| `cluster-slack` | Info | files take more than 10 % more space than their size ("2.1 GB of files will use 6.8 GB on this exFAT drive (128 KB clusters)") |
+| `dst-shift` | Info | P0's daylight-saving count |
+
+- **Names:** look-alike full-width characters for `: ? * < > | " \`, U+FFFD for control characters, `_` for a trailing dot/space, `CON.txt` → `CON_.txt`, over-long names cut with `~` + 8 hex digits of the name's XXH3. The second of two names that differ in case becomes `name (case 2).ext`. Every new name is checked again. Names that were already valid are handled first, so a fixed name never displaces one that was fine. NTFS per-folder case sensitivity (`FILE_CASE_SENSITIVE_DIR`) is honoured; `--case-sensitive-dest` sets it on created folders.
+- **Space:** each written file rounded up to whole clusters, NTFS files under ~700 bytes count 0 (resident in the MFT), one cluster per new folder, +1 %.
+- **Estimate:** `bytes/read + bytes/write + files × (perFile(src) + perFile(dst))`, rates capped by the USB link (USB 2.0 × 0.70, USB 3 × 0.80); defaults HDD 100 MB/s, SSD 300 MB/s, pen drive read 80 / write 15 MB/s, phone 30 MB/s; per file SSD 0.3 ms, HDD 4 ms, pen drive 8 ms, phone 15 ms. Shown as a range (×0.75 to ×1.5) until P6 learns real rates; plus the USB 3 comparison and the verify cost.
+- **Interaction:** issues are printed grouped by severity (5 paths each, every path with `--dry-run`/`--verbose`). A Block stops the copy with exit code 3. An unfixed Warn asks `Continue? [y/N]` when stdin is a console; `--yes` continues; a non-interactive run (pipe, NUL, file) continues after printing it.
+- **`--json`:** one object on stdout (`ok, kind, source, destination, planned_from, dry_run, verify, files, bytes, to_write, write_bytes, skipped, written, bytes_written, failed, cancelled, elapsed_ms, failures, preflight, error, exit_code`); every human line goes to stderr.
+
+### Acceptance
+- [x] Golden tests for each issue's text (`TestIssueMessages`) and the JSON shape (`TestReportJSONShape`, `TestCopyJSONResult`).
+- [x] Fuzz: names are valid, collision-free, and valid ones unchanged (`FuzzNamesAreValidAndCollisionFree`, `FuzzFix`). The fuzzer found a real crash on its first minute (below).
+- [x] Phone fixture a.jpg / A.jpg / notes:1.txt / CON.txt / trailing. copies with all five files present and four renames reported (`TestPhoneFixtureCopiesEveryFileAndReportsRenames`, on real NTFS).
+- [x] 128 KiB cluster slack is counted (`TestSlackIsCountedWith128KClusters`).
+- [x] Estimate unit tests with fixed inputs (`TestEstimateFixedInputs`, `TestEstimateUsesLearnedRatesAndDropsTheRange`).
+- [ ] Hardware: calibrate per-file overheads and rates (PROGRESS.md).
+
+**Commit:** `stage 14: pre-flight checks and time estimate (P1)`
 
 ---
 

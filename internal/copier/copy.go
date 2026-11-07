@@ -12,6 +12,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/yashwardhanv/dd/internal/fsinfo"
 	"github.com/yashwardhanv/dd/internal/ui"
 )
 
@@ -105,6 +106,9 @@ type Options struct {
 	// RetryDelay is the wait between attempts (default 500 ms).
 	Retries    int
 	RetryDelay time.Duration
+	// CaseSensitiveDirs: folders the copy creates get NTFS per-folder case
+	// sensitivity (see NameOptions.CaseSensitiveDest).
+	CaseSensitiveDirs bool
 	// BigLanes, when > 0, is how many BIG files (BigFileSize and up) are
 	// copied at once; the other workers keep copying small files meanwhile.
 	// For USB drives: the link moves one stream as fast as eight, so eight
@@ -220,7 +224,12 @@ func Run(ctx context.Context, p *Plan, opt Options) (Result, error) {
 		}
 	}
 
-	if err := makeDirs(p); err != nil {
+	if !p.NamesFixed {
+		// Nobody checked the names (a library caller): apply the safe defaults
+		// rather than write a name Windows can't store.
+		p.FixNames(NameOptions{})
+	}
+	if err := makeDirs(p, opt.CaseSensitiveDirs); err != nil {
 		return Result{}, err
 	}
 
@@ -294,18 +303,31 @@ func defaultOpenSource(name string, locked bool) (*os.File, error) {
 func joinDst(root, rel string) string { return filepath.Join(root, rel) }
 
 // makeDirs creates every destination folder up front (including empty ones).
-func makeDirs(p *Plan) error {
+// With caseSensitive, each folder it creates gets NTFS per-folder case
+// sensitivity (copy --case-sensitive-dest).
+func makeDirs(p *Plan, caseSensitive bool) error {
 	if err := os.MkdirAll(p.DstRoot, 0o755); err != nil {
 		return fmt.Errorf("creating %s: %w", p.DstRoot, err)
 	}
 	made := map[string]bool{}
-	mk := func(rel string) error {
+	var mk func(rel string) error
+	mk = func(rel string) error {
 		if rel == "" || rel == "." || made[rel] {
 			return nil
 		}
 		made[rel] = true
-		if err := os.MkdirAll(filepath.Join(p.DstRoot, rel), 0o755); err != nil {
-			return fmt.Errorf("creating folder %s: %w", filepath.Join(p.DstRoot, rel), err)
+		full := filepath.Join(p.DstRoot, rel)
+		if _, err := os.Lstat(full); err == nil {
+			return nil
+		}
+		if err := mk(filepath.Dir(rel)); err != nil {
+			return err
+		}
+		if err := os.Mkdir(full, 0o755); err != nil && !os.IsExist(err) {
+			return fmt.Errorf("creating folder %s: %w", full, err)
+		}
+		if caseSensitive {
+			fsinfo.SetCaseSensitiveDir(full) // best effort: needs NTFS and Windows 10 1803+
 		}
 		return nil
 	}

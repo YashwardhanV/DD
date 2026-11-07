@@ -14,3 +14,6 @@ func SetupConsole() (restore func()) { return func() {} }
 func termWidth() int {
 	return envWidth(os.Getenv("COLUMNS"))
 }
+
+// isConsole: on Unix a character device on stdin is a terminal.
+func isConsole(*os.File) bool { return true }

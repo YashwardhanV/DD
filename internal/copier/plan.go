@@ -84,6 +84,10 @@ type Job struct {
 	// TimeCoarse: the source only knows whole seconds (phones, indexes written
 	// before exact times existed), so comparisons allow at least one second.
 	TimeCoarse bool
+	// SrcRel is the original destination-relative path when FixNames had to
+	// change it (a name Windows can't store, or a letter-case clash); the
+	// copy manifest keeps it so later runs recognise the file.
+	SrcRel string
 }
 
 // MTimeNs is the job's modification time in nanoseconds.
@@ -112,6 +116,9 @@ type Item struct {
 	SrcMTimeNs   int64
 	DstMTimeNs   int64 // the modification time given to the copy
 	MediaChecked bool  // read back from the destination without the cache and compared
+	// Renamed: FixNames gave this file a different destination name (SrcRel
+	// holds the original).
+	Renamed bool
 }
 
 // Plan is everything a copy is going to do.
@@ -126,6 +133,16 @@ type Plan struct {
 	// SrcFS and DstFS describe the two file systems; they decide how
 	// modification times are compared (fsinfo.SameTime).
 	SrcFS, DstFS fsinfo.Info
+
+	// LinksSkipped counts symbolic links and junctions in the source. They are
+	// never followed or copied (that could copy files from somewhere else).
+	LinksSkipped int64
+	// NewDirs are the destination folders that don't exist yet (filled by
+	// finalize); each takes at least one cluster.
+	NewDirs int
+	// NamesFixed is set once FixNames has run (Run runs it with the defaults
+	// if nobody did, so a name Windows can't store is never written as-is).
+	NamesFixed bool
 }
 
 // DSTShifts counts files treated as unchanged although their times differ by
@@ -255,8 +272,70 @@ func finalize(dstRoot string, dirs []string, jobs []Job, policy string, workers 
 		return items[a].Rel < items[b].Rel
 	})
 	sort.Strings(dirs)
-	return &Plan{DstRoot: dstRoot, Dirs: dirs, Items: items, OnConflict: policy, SrcFS: srcFS, DstFS: dstFS}
+	p := &Plan{DstRoot: dstRoot, Dirs: dirs, Items: items, OnConflict: policy, SrcFS: srcFS, DstFS: dstFS}
+	p.countNewDirs()
+	return p
 }
+
+// countNewDirs counts the destination folders the copy will create.
+func (p *Plan) countNewDirs() {
+	seen := map[string]bool{}
+	n := 0
+	var walk func(rel string)
+	walk = func(rel string) {
+		for rel != "" && rel != "." && !seen[rel] {
+			seen[rel] = true
+			if _, err := os.Lstat(filepath.Join(p.DstRoot, rel)); err == nil {
+				return // it exists, and so do its parents
+			}
+			n++
+			rel = filepath.Dir(rel)
+		}
+	}
+	for _, d := range p.Dirs {
+		walk(d)
+	}
+	for i := range p.Items {
+		if !p.Items[i].Decision.Skipped() {
+			walk(filepath.Dir(p.Items[i].Rel))
+		}
+	}
+	p.NewDirs = n
+}
+
+// SpaceNeeded is how much free space writing the plan really takes: every
+// written file rounded up to whole clusters (allocation units), plus one
+// cluster per new folder, plus 1 percent margin. On NTFS, files under about
+// 700 bytes live inside their MFT record and take no cluster at all.
+//
+// The difference matters for many small files on exFAT drives, whose default
+// clusters are 32 to 128 KB: 10,000 files of 1 KB take 1.25 GB at 128 KB each.
+func (p *Plan) SpaceNeeded() (files, onDisk int64) {
+	cl := p.DstFS.ClusterBytes
+	if cl <= 0 {
+		cl = 4096
+	}
+	for i := range p.Items {
+		it := &p.Items[i]
+		if it.Decision.Skipped() {
+			continue
+		}
+		files += it.Size
+		if p.DstFS.IsNTFS() && it.Size < ntfsResidentMax {
+			continue
+		}
+		onDisk += (it.Size + cl - 1) / cl * cl
+	}
+	onDisk += int64(p.NewDirs) * cl
+	onDisk += onDisk / 100
+	return files, onDisk
+}
+
+// ntfsResidentMax: NTFS stores files smaller than this inside their MFT
+// record ("resident"), using no cluster. The real limit depends on the length
+// of the name and other attributes; ~700 bytes is the usual figure for a
+// 1 KB record. A starting value to calibrate on real hardware.
+const ntfsResidentMax = 700
 
 // parallelFor runs fn(0..n-1) on up to `workers` goroutines.
 func parallelFor(n, workers int, fn func(i int)) {
@@ -332,11 +411,16 @@ func PlanLocal(ctx context.Context, src, dstRoot, policy string, workers int) (*
 
 	dirs := []string{name} // the top folder itself, even if the source is empty
 	var jobs []Job
+	var links int64
 	cache := map[uint64]string{}
 	for slot := 0; slot < ix.Len(); slot++ {
 		rel := filepath.Join(name, strings.ReplaceAll(ix.RelPathCached(slot, cache), `\`, string(filepath.Separator)))
 		if ix.Flags[slot]&index.FlagDir != 0 {
 			dirs = append(dirs, rel)
+			continue
+		}
+		if ix.Flags[slot]&index.FlagReparse != 0 {
+			links++
 			continue
 		}
 		jobs = append(jobs, Job{
@@ -348,7 +432,9 @@ func PlanLocal(ctx context.Context, src, dstRoot, policy string, workers int) (*
 			TimeCoarse: !ix.Header.ExactTimes(),
 		})
 	}
-	return finalize(dstRoot, dirs, jobs, policy, workers, srcFS), nil
+	p := finalize(dstRoot, dirs, jobs, policy, workers, srcFS)
+	p.LinksSkipped = links
+	return p, nil
 }
 
 // ErrDestinationInsideSource means a folder would be copied into itself (or
@@ -408,8 +494,9 @@ func (p *Plan) Check(c Checks) error {
 
 	probe := nearestExisting(p.DstRoot)
 	if c.FreeBytes != nil {
-		if free, err := c.FreeBytes(probe); err == nil && uint64(counts.WriteBytes) > free {
-			return fmt.Errorf("%w: need %d bytes but only %d are free", ErrNotEnoughSpace, counts.WriteBytes, free)
+		_, need := p.SpaceNeeded()
+		if free, err := c.FreeBytes(probe); err == nil && uint64(need) > free {
+			return fmt.Errorf("%w: need %d bytes but only %d are free", ErrNotEnoughSpace, need, free)
 		}
 	}
 	if c.FileSystem != nil {

@@ -201,7 +201,8 @@ func copyMatches(ctx context.Context, in io.Reader, out *bufio.Writer, indexes [
 			plan = copier.PlanJobs(dst, g.jobs, copier.OnConflictNewer, max(workers, 4), fsinfo.ForFileSystem(g.index.Header.FileSystem))
 		}
 		fmt.Fprintf(out, "\n%s\n", ui.Bold(g.label))
-		if err := finishPlan(ctx, out, status, plan, planRun{workers: workers, why: why, dstArg: f.copyTo}); err != nil {
+		if err := finishPlan(ctx, out, status, plan, planRun{workers: workers, why: why, dstArg: f.copyTo, srcArg: g.label, plannedFrom: "search",
+			names: copier.NameOptions{OnCaseCollision: copier.OnCaseRename, OnBadName: copier.OnBadReplace}, yes: f.yes, in: in}); err != nil {
 			failed++
 			fmt.Fprintln(out, ui.Red("  "+err.Error()))
 		}

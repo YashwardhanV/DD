@@ -126,6 +126,9 @@ func (w *Walk) Scan(ctx context.Context, b *index.Builder, report func(Progress)
 			e.ModTime = info.ModTime().Unix()
 			e.Nanos = uint32(info.ModTime().Nanosecond())
 			e.Flags |= attrFlags(info, name)
+			if !isDir && !info.Mode().IsRegular() {
+				e.Flags |= index.FlagReparse // a link (or device): listed, never copied
+			}
 		}
 		if isDir {
 			e.Flags |= index.FlagDir

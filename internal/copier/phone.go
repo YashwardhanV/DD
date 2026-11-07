@@ -18,6 +18,7 @@ import (
 	"github.com/yashwardhanv/dd/internal/index"
 	"github.com/yashwardhanv/dd/internal/phone"
 	"github.com/yashwardhanv/dd/internal/scan"
+	"github.com/yashwardhanv/dd/internal/winname"
 )
 
 // PhoneSource marks a plan whose files are on an Android phone.
@@ -70,7 +71,7 @@ func PlanPhone(ctx context.Context, adb *phone.ADB, serial, remote, dstRoot, pol
 	}
 
 	if !info.IsDir {
-		job := Job{Src: remote, Rel: SafeName(path.Base(remote)), Size: info.Size, ModTime: info.ModTime, TimeCoarse: true}
+		job := Job{Src: remote, Rel: path.Base(remote), Size: info.Size, ModTime: info.ModTime, TimeCoarse: true}
 		plan := finalize(dstRoot, nil, []Job{job}, policy, 1, fsinfo.ForPhone())
 		plan.Phone = src
 		return plan, nil
@@ -84,13 +85,12 @@ func PlanPhone(ctx context.Context, adb *phone.ADB, serial, remote, dstRoot, pol
 	}
 	ix := b.Index()
 
-	name = SafeName(name)
 	dirs := []string{name}
 	var jobs []Job
 	cache := map[uint64]string{}
 	for slot := 0; slot < ix.Len(); slot++ {
 		relBack := ix.RelPathCached(slot, cache)
-		rel := filepath.Join(name, SafeRel(relBack))
+		rel := filepath.Join(name, toOSRel(relBack))
 		if ix.Flags[slot]&index.FlagDir != 0 {
 			dirs = append(dirs, rel)
 			continue
@@ -121,8 +121,8 @@ func makeBatches(p *Plan) []pullBatch {
 		if it.Decision.Skipped() || it.Blocked != "" {
 			continue
 		}
-		if base := path.Base(it.Src); SafeName(base) != base {
-			batches = append(batches, pullBatch{items: []*Item{it}}) // pulled alone, to a safe name
+		if pulledAlone(it) {
+			batches = append(batches, pullBatch{items: []*Item{it}}) // pulled alone, to its new name
 			continue
 		}
 		dir := path.Dir(it.Src)
@@ -264,11 +264,12 @@ func pullAndPlace(ctx context.Context, p *Plan, files []*Item, opt Options, st *
 	for i, it := range files {
 		srcs[i] = it.Src
 	}
-	// A name Windows can't store (such as "a:b.jpg") is pulled on its own, to
-	// an explicit safe local name; makeBatches gives such files a batch each.
-	unsafe := len(files) == 1 && SafeName(path.Base(files[0].Src)) != path.Base(files[0].Src)
+	// A file whose name changed (a name Windows can't store, such as
+	// "a:b.jpg", or the second of a.jpg / A.jpg) is pulled on its own, to an
+	// explicit local name; makeBatches gives such files a batch each.
+	unsafe := len(files) == 1 && pulledAlone(files[0])
 	if unsafe {
-		err = p.Phone.ADB.PullFile(ctx, p.Phone.Serial, files[0].Src, filepath.Join(staging, SafeName(path.Base(files[0].Src))))
+		err = p.Phone.ADB.PullFile(ctx, p.Phone.Serial, files[0].Src, filepath.Join(staging, filepath.Base(files[0].Rel)))
 	} else {
 		err = p.Phone.ADB.Pull(ctx, p.Phone.Serial, srcs, staging)
 	}
@@ -280,7 +281,7 @@ func pullAndPlace(ctx context.Context, p *Plan, files []*Item, opt Options, st *
 	for _, it := range files {
 		staged := filepath.Join(staging, path.Base(it.Src))
 		if unsafe {
-			staged = filepath.Join(staging, SafeName(path.Base(it.Src)))
+			staged = filepath.Join(staging, filepath.Base(it.Rel))
 		}
 		info, statErr := os.Stat(staged)
 		if statErr != nil || info.IsDir() {
@@ -404,12 +405,12 @@ func hashFileWith(ctx context.Context, path, tool string, unbuffered bool, abuf 
 // search match on one phone) into dstRoot. Each Job.Src must be an absolute
 // path on the phone.
 //
-// Each Job.Rel is made safe for Windows (see SafeRel): phone file names may
-// contain characters such as ':' that Windows doesn't allow.
+// Job.Rel may use `\` (index paths) or this OS's separator. Names Windows
+// can't store are fixed by Plan.FixNames (pre-flight), like for any plan.
 func PlanPhoneJobs(adb *phone.ADB, serial string, jobs []Job, dstRoot, policy string, workers int) *Plan {
 	jobs = append([]Job(nil), jobs...)
 	for i := range jobs {
-		jobs[i].Rel = SafeRel(jobs[i].Rel)
+		jobs[i].Rel = toOSRel(jobs[i].Rel)
 		jobs[i].TimeCoarse = true
 	}
 	plan := finalize(dstRoot, nil, jobs, policy, workers, fsinfo.ForPhone())
@@ -435,47 +436,12 @@ func PhonePathRoot(p, root string) string {
 	return path.Clean(root + p)
 }
 
-// SafeName makes one phone file or folder name storable on Windows. Android
-// allows names Windows doesn't: a ':' would even silently write an NTFS
-// "alternate data stream" instead of a file. So:
-//
-//   - < > : " | ? * \ and control characters become '_'
-//   - trailing dots and spaces (which Windows strips) become '_'
-//   - reserved device names (CON, NUL, COM1, LPT1, ... even with an
-//     extension, like "aux.txt") get a '_' in front
-//
-// A name that is already fine is returned unchanged.
+// SafeName makes one file or folder name storable on Windows (see
+// winname.Fix: look-alike characters for : ? * and friends, CON.txt becomes
+// CON_.txt, trailing dots become _). A name that is already fine is returned
+// unchanged.
 func SafeName(name string) string {
-	var b strings.Builder
-	changed := false
-	for _, r := range name {
-		if r < 0x20 || strings.ContainsRune(`<>:"|?*\`, r) {
-			b.WriteByte('_')
-			changed = true
-			continue
-		}
-		b.WriteRune(r)
-	}
-	s := name
-	if changed {
-		s = b.String()
-	}
-	if t := strings.TrimRight(s, ". "); t != s {
-		s = t + strings.Repeat("_", len(s)-len(t))
-	}
-	if s == "" {
-		return "_"
-	}
-	stem := s
-	if i := strings.IndexByte(stem, '.'); i >= 0 {
-		stem = stem[:i]
-	}
-	switch strings.ToUpper(strings.TrimRight(stem, " ")) {
-	case "CON", "PRN", "AUX", "NUL",
-		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
-		s = "_" + s
-	}
+	s, _ := winname.Fix(name)
 	return s
 }
 
@@ -483,9 +449,25 @@ func SafeName(name string) string {
 // this OS's separator or by the index's `\`) and joins them with this OS's
 // separator.
 func SafeRel(rel string) string {
-	parts := strings.FieldsFunc(rel, func(r rune) bool { return r == '\\' || r == filepath.Separator })
+	parts := splitRel(rel)
 	for i, p := range parts {
 		parts[i] = SafeName(p)
 	}
 	return filepath.Join(parts...)
+}
+
+// toOSRel turns an index path (`\`) into one with this OS's separators.
+func toOSRel(rel string) string { return filepath.Join(splitRel(rel)...) }
+
+// splitRel splits a relative path at `\` and at this OS's separator.
+func splitRel(rel string) []string {
+	return strings.FieldsFunc(rel, func(r rune) bool { return r == '\\' || r == filepath.Separator })
+}
+
+// pulledAlone reports whether a phone file must be pulled on its own, to an
+// explicit local name: its destination name differs from its name on the
+// phone (fixed by FixNames), so a batch pull, which keeps phone names, would
+// write the wrong name (or two names that are one on Windows).
+func pulledAlone(it *Item) bool {
+	return path.Base(it.Src) != filepath.Base(it.Rel)
 }

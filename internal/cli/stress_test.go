@@ -99,7 +99,7 @@ func TestPhoneCopyMakesNamesSafeForWindows(t *testing.T) {
 		t.Fatalf("%v\n%s", err, out)
 	}
 	for name, want := range map[string]string{
-		"meeting 10_30.txt": "colon", "what_.txt": "question", "plain.txt": "plain", "_con.txt": "device name",
+		"meeting 10\uFF1A30.txt": "colon", "what\uFF1F.txt": "question", "plain.txt": "plain", "con_.txt": "device name",
 	} {
 		if got := string(readFile(t, dst, "Notes", name)); got != want {
 			t.Errorf("%s = %q, want %q", name, got, want)
