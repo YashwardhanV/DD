@@ -88,6 +88,9 @@ type Job struct {
 	// change it (a name Windows can't store, or a letter-case clash); the
 	// copy manifest keeps it so later runs recognise the file.
 	SrcRel string
+	// SrcFileID is the source's NTFS file reference number when known
+	// (plans from an index), 0 otherwise.
+	SrcFileID uint64
 }
 
 // MTimeNs is the job's modification time in nanoseconds.
@@ -143,6 +146,12 @@ type Plan struct {
 	// NamesFixed is set once FixNames has run (Run runs it with the defaults
 	// if nobody did, so a name Windows can't store is never written as-is).
 	NamesFixed bool
+	// FromIndex: planned from a saved index (PlanFromIndex), not a listing.
+	FromIndex bool
+
+	// dstNames caches the destination folders read while deciding (one
+	// directory read per folder), for FixNames.
+	dstNames map[string][]string
 }
 
 // DSTShifts counts files treated as unchanged although their times differ by
@@ -250,46 +259,186 @@ func finalize(dstRoot string, dirs []string, jobs []Job, policy string, workers 
 		policy = OnConflictNewer
 	}
 	dstFS := fsinfo.OrDefault(dstRoot)
-	items := make([]Item, len(jobs))
-	parallelFor(len(jobs), workers, func(i int) {
-		j := jobs[i]
-		items[i].Job = j
-		st, err := os.Lstat(filepath.Join(dstRoot, j.Rel))
-		if err != nil {
-			st = nil // not there (or unreadable: copying will report the real problem)
-		}
-		dec := decide(policy, j, st, srcFS, dstFS)
-		items[i].Decision, items[i].Blocked, items[i].DSTShift = dec.d, dec.blocked, dec.shift
-	})
+	listing := checkDestination(dstRoot, jobs, workers, dstFS)
 
 	// Largest first: big files start early instead of ending as one lonely
 	// straggler while every other worker sits idle. Ties by name for a
 	// predictable order.
-	sort.SliceStable(items, func(a, b int) bool {
-		if items[a].Size != items[b].Size {
-			return items[a].Size > items[b].Size
+	// PERF: sort positions, not Items: an Item is ~200 bytes, and moving
+	// them around was a sixth of planning a 200,000-file copy.
+	order := make([]int32, len(jobs))
+	for i := range order {
+		order[i] = int32(i)
+	}
+	sort.Slice(order, func(a, b int) bool {
+		ja, jb := &jobs[order[a]], &jobs[order[b]]
+		if ja.Size != jb.Size {
+			return ja.Size > jb.Size
 		}
-		return items[a].Rel < items[b].Rel
+		return ja.Rel < jb.Rel
+	})
+	items := make([]Item, len(jobs))
+	parallelFor(len(jobs), workers, func(i int) {
+		j := jobs[order[i]]
+		items[i].Job = j
+		st := listing.lookup(j.Rel)
+		dec := decide(policy, j, st, srcFS, dstFS)
+		items[i].Decision, items[i].Blocked, items[i].DSTShift = dec.d, dec.blocked, dec.shift
 	})
 	sort.Strings(dirs)
-	p := &Plan{DstRoot: dstRoot, Dirs: dirs, Items: items, OnConflict: policy, SrcFS: srcFS, DstFS: dstFS}
-	p.countNewDirs()
+	p := &Plan{DstRoot: dstRoot, Dirs: dirs, Items: items, OnConflict: policy, SrcFS: srcFS, DstFS: dstFS, dstNames: listing.names}
+	p.countNewDirsWith(listing)
 	return p
 }
 
+// dstListing is what the destination folders hold, read once per folder.
+type dstListing struct {
+	infos   map[string]os.FileInfo // "<folder>\x00<folded name>" -> info
+	names   map[string][]string    // folder -> every name in it (for case collisions)
+	missing map[string]bool        // folders known not to exist
+	allNew  bool                   // the destination itself doesn't exist yet
+	fold    func(string) string
+}
+
+func (d *dstListing) lookup(rel string) os.FileInfo {
+	if d.allNew || len(d.infos) == 0 {
+		return nil
+	}
+	dir, name := splitDirBase(rel)
+	return d.infos[dir+"\x00"+d.fold(name)]
+}
+
+// splitDirBase splits a relative path at its last separator, without the
+// cleaning (and allocations) filepath.Dir and Base do.
+func splitDirBase(rel string) (dir, name string) {
+	i := strings.LastIndexByte(rel, filepath.Separator)
+	if filepath.Separator != '/' {
+		if j := strings.LastIndexByte(rel, '/'); j > i {
+			i = j
+		}
+	}
+	if i < 0 {
+		return "", rel
+	}
+	return rel[:i], rel[i+1:]
+}
+
+// checkDestination reads every destination folder the jobs go to, once, in
+// parallel (instead of one Lstat per file). A folder that doesn't exist means
+// every file below it is new, and nothing below it is read. On Windows the
+// sizes and times come with the folder listing itself (FindFirstFile data),
+// so this costs one call per folder. Names are matched the way the
+// destination matches them: ignoring case unless it is case-sensitive.
+func checkDestination(dstRoot string, jobs []Job, workers int, dstFS fsinfo.Info) *dstListing {
+	d := &dstListing{infos: map[string]os.FileInfo{}, names: map[string][]string{}, missing: map[string]bool{}, fold: func(s string) string { return s }}
+	if !dstFS.CaseSensitive {
+		d.fold = strings.ToUpper
+	}
+	if _, err := os.Lstat(dstRoot); err != nil {
+		d.allNew = true // nothing there yet: every file is new, nothing to read
+		return d
+	}
+	seen := map[string]bool{}
+	var folders []string
+	for _, j := range jobs {
+		dir, _ := splitDirBase(j.Rel)
+		if !seen[dir] {
+			seen[dir] = true
+			folders = append(folders, dir)
+		}
+	}
+	sort.Strings(folders) // parents before children
+	missing := d.missing
+	var mu sync.Mutex
+	// Walk folders top-down in "waves" by depth, so a missing parent is known
+	// before its children are tried.
+	byDepth := map[int][]string{}
+	maxDepth := 0
+	for _, f := range folders {
+		depth := 0
+		if f != "" {
+			depth = strings.Count(f, string(filepath.Separator)) + 1
+		}
+		byDepth[depth] = append(byDepth[depth], f)
+		maxDepth = max(maxDepth, depth)
+	}
+	parentMissing := func(f string) bool {
+		for p := filepath.Dir(f); p != "." && p != f; p = filepath.Dir(p) {
+			if missing[p] {
+				return true
+			}
+			f = p
+		}
+		return false
+	}
+	for depth := 0; depth <= maxDepth; depth++ {
+		wave := byDepth[depth]
+		parallelFor(len(wave), workers, func(i int) {
+			f := wave[i]
+			mu.Lock()
+			skip := parentMissing(f)
+			mu.Unlock()
+			if skip {
+				mu.Lock()
+				missing[f] = true
+				mu.Unlock()
+				return
+			}
+			entries, err := os.ReadDir(filepath.Join(dstRoot, f))
+			if err != nil {
+				mu.Lock()
+				missing[f] = true
+				mu.Unlock()
+				return
+			}
+			names := make([]string, 0, len(entries))
+			infos := make(map[string]os.FileInfo, len(entries))
+			for _, e := range entries {
+				names = append(names, e.Name())
+				if info, err := e.Info(); err == nil {
+					infos[f+"\x00"+d.fold(e.Name())] = info
+				}
+			}
+			mu.Lock()
+			d.names[f] = names
+			for k, v := range infos {
+				d.infos[k] = v
+			}
+			mu.Unlock()
+		})
+	}
+	return d
+}
+
 // countNewDirs counts the destination folders the copy will create.
-func (p *Plan) countNewDirs() {
+func (p *Plan) countNewDirs() { p.countNewDirsWith(nil) }
+
+// countNewDirsWith is countNewDirs using what checkDestination already knows,
+// so planning a big copy to a new folder makes no extra system calls.
+func (p *Plan) countNewDirsWith(known *dstListing) {
 	seen := map[string]bool{}
 	n := 0
+	exists := func(rel string) bool {
+		if known != nil {
+			if known.allNew || known.missing[rel] {
+				return false
+			}
+			if _, ok := known.names[rel]; ok {
+				return true
+			}
+		}
+		_, err := os.Lstat(filepath.Join(p.DstRoot, rel))
+		return err == nil
+	}
 	var walk func(rel string)
 	walk = func(rel string) {
 		for rel != "" && rel != "." && !seen[rel] {
 			seen[rel] = true
-			if _, err := os.Lstat(filepath.Join(p.DstRoot, rel)); err == nil {
+			if exists(rel) {
 				return // it exists, and so do its parents
 			}
 			n++
-			rel = filepath.Dir(rel)
+			rel, _ = splitDirBase(rel)
 		}
 	}
 	for _, d := range p.Dirs {
@@ -297,7 +446,8 @@ func (p *Plan) countNewDirs() {
 	}
 	for i := range p.Items {
 		if !p.Items[i].Decision.Skipped() {
-			walk(filepath.Dir(p.Items[i].Rel))
+			dir, _ := splitDirBase(p.Items[i].Rel)
+			walk(dir)
 		}
 	}
 	p.NewDirs = n

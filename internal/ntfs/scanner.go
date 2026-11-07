@@ -23,6 +23,10 @@ type MFTScanner struct {
 	WithMetadata bool
 	// Workers is the number of goroutines used for WithMetadata (<= 0: 8).
 	Workers int
+	// Lister, when set, makes WithMetadata read sizes and dates folder by
+	// folder (FillMetadataByDir, one call per folder) instead of one Lstat per
+	// file.
+	Lister DirLister
 	// SkipDirs overrides scan.DefaultSkipDirs when non-nil.
 	SkipDirs []string
 
@@ -78,6 +82,7 @@ func (s *MFTScanner) Scan(ctx context.Context, b *index.Builder, report func(sca
 	}
 
 	s.build = AddRecords(b, recs, s.Session.RootFRN, s.SkipDirs)
+	b.Index().Header.SkipRules = scan.SkipRules(s.SkipDirs)
 	s.stats = scan.Stats{Files: s.build.Files, Dirs: s.build.Dirs}
 	if report != nil {
 		report(scan.Progress{Entries: s.stats.Entries(), Dirs: s.stats.Dirs})
@@ -93,15 +98,28 @@ func (s *MFTScanner) Scan(ctx context.Context, b *index.Builder, report func(sca
 		if workers <= 0 {
 			workers = min(16, 2*runtime.NumCPU())
 		}
-		filled, missing, err := FillMetadata(ctx, ix, s.Root, workers, func(done, total int64) {
+		progress := func(done, total int64) {
 			if report != nil {
 				report(scan.Progress{Entries: done, Current: fmt.Sprintf("reading sizes and dates (%d of %d)", done, total)})
 			}
-		})
-		if err != nil {
-			return err
 		}
-		s.metaFilled, s.metaMissing = filled, missing
+		if s.Lister != nil {
+			st, err := FillMetadataByDir(ctx, ix, s.Root, s.Lister, workers, progress)
+			if err != nil {
+				return err
+			}
+			s.metaFilled, s.metaMissing = st.Filled, st.Missing
+		} else {
+			filled, missing, err := FillMetadata(ctx, ix, s.Root, workers, progress)
+			if err != nil {
+				return err
+			}
+			s.metaFilled, s.metaMissing = filled, missing
+			finishMeta(ix)
+		}
+	}
+	if !s.WithMetadata {
+		ix.Header.MetaComplete = false
 	}
 	return nil
 }

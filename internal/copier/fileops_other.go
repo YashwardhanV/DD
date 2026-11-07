@@ -25,3 +25,6 @@ const unbufferedFlags = 0
 
 // unbufferedOpen is a normal open off Windows (tests only).
 func unbufferedOpen(name string) (*os.File, error) { return os.Open(name) }
+
+// platformFirstLCN is unknown off Windows.
+func platformFirstLCN(string) (int64, bool) { return 0, false }

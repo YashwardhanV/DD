@@ -39,6 +39,14 @@ drivedex index .\fx20k ; drivedex scan .\fx20k --count-only
 drivedex bench-scan .\fx20k --workers 1,2,4,8,16
 ```
 
+### Measured on the owner's PC (CPU work only)
+
+**Machine:** Intel Core i7-8750H (6 cores / 12 threads), Windows 11, Go 1.27. 2026-11-07.
+
+| Test | Entries | Result | Target | Verdict |
+|---|---|---|---|---|
+| `PlanFromIndex`: plan one folder (200,000 files) out of a 1,000,000-entry index, destination check excluded (`go test -bench PlanFromIndex ./internal/copier`) | 1,000,000 | 172 ms | < 500 ms | pass |
+
 ## 2. Still to measure — real hardware
 
 These are the numbers that matter for the project's claim ("faster than Explorer on external drives and phones"). Each needs the owner's PC and drives; **none is claimed until it is filled in with the drive, the port and the evidence.** (The checklists for taking them are in [PROGRESS.md](../PROGRESS.md#owner-to-verify-hardware-dependent-checks).)
@@ -50,6 +58,8 @@ These are the numbers that matter for the project's claim ("faster than Explorer
 | Walk vs parallel scan, replug between runs (stage 4) | | | | walk: / parallel: | | |
 | USB hard disk: workers 1 / 2 / 4 / 8 (stage 4) | | | | | | confirms "2 is best on HDD" |
 | `index phone` — 50k-file phone (stage 5) | | | "gave up after N min" | | adb | target: under ~1 minute |
+| Plan a copy from the saved index after editing a file (stage 15, as Administrator) | | | n/a | planning time: | `--source-list auto` | the edit must be copied |
+| Small files from a USB hard disk, `--read-order size` vs `disk` (stage 15) | | ~20,000 | n/a | size: / disk: | | replug between runs; decides `auto` |
 | NTFS turbo mode, `index C: --mode mft` (Administrator, stage 6) | | | | | mft | target: < ~15 s per million files |
 | Turbo mode vs parallel entry counts on the same NTFS drive (±2 %) | | | | | | explain differences |
 | USN delta refresh after a few changes | | | n/a | | mft | target: < 1 s |
@@ -69,3 +79,4 @@ These are the numbers that matter for the project's claim ("faster than Explorer
 | USN delta refresh | < 1 s for typical changes | needs an NTFS drive + Administrator |
 | Phone index (50k files) | under ~1 minute | needs a phone |
 | Copy of many small files | faster than Explorer; comparable to `robocopy /MT` | needs real drives |
+| Plan a copy from a 1M-entry index (200k-file folder) | < 500 ms | **met** (172 ms) |

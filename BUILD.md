@@ -24,6 +24,7 @@
 | 12 | Packaging & release | One-command install, GitHub release, README | Distribution, CI |
 | 13 | Correctness groundwork (design doc P0) | Exact times, changed-while-copying detection, FAT-aware comparison, `--verify` that reads the drive back | File-system time resolution, FlushFileBuffers, unbuffered I/O |
 | 14 | Pre-flight (design doc P1) | Every problem shown before a byte is written; names fixed; real space; time estimate | Allocation units, Windows name rules, a cost model |
+| 15 | Plan from the saved index (design doc P2) | `copy` plans from the NTFS index in well under a second when the journal proves it current | Folder enumeration by file ID, journal freshness proof, CSR trees |
 
 Stages 1–7 are the core tool. Stages 8–12 make it easy to use.
 
@@ -1688,6 +1689,40 @@ The owner should be able to explain the project in an interview after reading th
 - [ ] Hardware: calibrate per-file overheads and rates (PROGRESS.md).
 
 **Commit:** `stage 14: pre-flight checks and time estimate (P1)`
+
+---
+
+---
+
+## Stage 15 — Plan from the saved index (design doc P2)
+
+**Goal:** `drivedex copy E:\Photos D:\Backup` plans in well under a second on a large NTFS drive, because the file list already exists. The index is used only when it is provably current (INV-5); otherwise the copy lists the source exactly as before.
+
+### Files
+- `internal/ntfs/dirlist.go` (new): `DirRecord`, `DirLister`, `ParseDirInfo`/`EncodeDirInfo` (the `FILE_ID_BOTH_DIR_INFO` layout), `FillMetadataByDir`, `RefreshTouched`, `MetaComplete`, `Fresh(ctx, ix, FreshEnv)`. `dirlist_windows.go`: `WindowsLister` (`GetFileInformationByHandleEx`, classes 10/11, 64 KiB buffer).
+- `internal/ntfs/apply.go`: `Applier.Touched()` (every entry a journal replay changed) and `FlagReparse` from attributes; `scanner.go`: `MFTScanner.Lister`, `Header.SkipRules`.
+- `internal/copier/fromindex.go` (new): `Children` (compressed-sparse-row children table, built in O(n)), `PlanFromIndex`. `plan.go`: the destination check reads one folder at a time. `readorder.go` (new): `--read-order` and `diskOrder`.
+- `internal/cli/sourcelist.go` (new): `copy --source-list auto|index|scan`; `scanner.go`/`turbo.go`: metadata is read by default, `--no-metadata` opts out, a journal refresh keeps it complete.
+
+### Spec (as built)
+- **Fill by folder.** For each folder of the index: open it, list it with `FileIdBothDirectoryInfo`, match each record's FileId (the NTFS reference number = the index ID), set size, time (ns) and attributes. One call per folder, not one `Lstat` per file. A folder that can't be opened leaves `FlagNoMeta` on its children. Turbo indexes now do this by default (`--no-metadata` keeps the old names-only index; `--with-metadata` is accepted and does nothing new).
+- **Keep it current.** After a journal replay the touched entries are grouped by parent: a folder with 32 or more touched children is listed again, others are looked up one by one; deleted files simply don't resolve.
+- **`Header.MetaComplete`** is true when no live file has `FlagNoMeta`; **`Header.SkipRules`** records the skipped folder names; **`MTimeUnit = "ns"`** (stage 13's format v2).
+- **Freshness (`ntfs.Fresh`)**, first failure is the reason shown: (1) NTFS, mounted, same serial; (2) Administrator (to read the journal); (3) same journal ID and the journal still reaches back to the index's `NextUsn`; (4) the replay and the touched-metadata refresh succeed, and the index is saved under the store lock; (5) the skip rules are the default ones the copy also uses; (6) no file under the source folder lacks metadata — fewer than 1,000 are looked up, more means "list the source".
+- **The store lock is held from the replay until the plan is built**, so the agent can't rewrite the index meanwhile; between planning and copying, stage 13's before/after check covers changes.
+- **`PlanFromIndex`** walks the children table depth-first from the folder, carrying the relative path, and emits exactly the `Dirs` and jobs `PlanLocal` would (links skipped and counted, the folder's own name on top), then the shared `finalize`.
+- **Faster destination check.** Destination folders are read once each, top-down, in parallel waves by depth; a folder that doesn't exist means every file below it is a plain copy and nothing below it is read. The names read are kept for stage 14's case-collision check.
+- **CLI.** `--source-list auto` (default) prints one line either way: `Planned from the saved index of E: (journal checked, 0.08 s).` or `Listing E:\Photos … (index not usable: not running as Administrator)`. `index` fails with the reason instead of listing; `scan` always lists. `--json` reports `planned_from: "index"`.
+- **Read order (experimental).** `--read-order disk` sorts small files by their first cluster (`FSCTL_GET_RETRIEVAL_POINTERS`, no Administrator), then by reference number. `auto` = `size` until a USB hard-disk benchmark shows a gain.
+
+### Acceptance
+- [x] Equivalence property test: fixture trees and random fake-NTFS trees give identical (Rel, Size, ModTime) sets and Dirs (`TestPlanFromIndexEqualsPlanLocal`, `TestPlanFromATurboIndexEqualsPlanLocal`, links in `TestPlanFromIndexSkipsLinksAndDedupFilesAreCopied`).
+- [x] `FillMetadataByDir` through the fake NTFS, including unreadable folders (`TestFillMetadataByDirListsEachFolderOnce`); the real lister agrees with per-file `Lstat` on this PC (`TestWindowsListerMatchesPerFileAnswers`).
+- [x] Every freshness failure has a test with its message (`TestFreshFailurePaths`, `TestFreshLooksUpAFewMissingEntriesButNotMany`), and the CLI fall-backs (`TestSourceListAutoNeedsAdministrator`, `TestSourceListIndexFailsInsteadOfListing`, …). A file edited after indexing is copied with its new size (`TestINV5_PlanFromIndexAfterEdits`).
+- [x] Benchmark: 1,000,000 indexed entries, a 200,000-file subtree, **172 ms** on an i7-8750H (target < 500 ms; `BenchmarkPlanFromIndex`).
+- [ ] Hardware: USB NTFS drive, change a file, plan from index, confirm the change is picked up; disk order on a USB HDD (PROGRESS.md).
+
+**Commit:** `stage 15: plan from the saved index (P2)`
 
 ---
 

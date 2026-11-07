@@ -26,6 +26,12 @@ func init() { ui.SetColorMode(false, false) }
 // written to a fresh folder on a pretend file system.
 func jobsPlan(t *testing.T, fsName string, files map[string]int64) *copier.Plan {
 	t.Helper()
+	return jobsPlanAt(t, t.TempDir(), fsName, files)
+}
+
+// jobsPlanAt is jobsPlan into an existing destination folder.
+func jobsPlanAt(t *testing.T, dst, fsName string, files map[string]int64) *copier.Plan {
+	t.Helper()
 	var jobs []copier.Job
 	var names []string
 	for rel := range files {
@@ -35,7 +41,7 @@ func jobsPlan(t *testing.T, fsName string, files map[string]int64) *copier.Plan 
 	for _, rel := range names {
 		jobs = append(jobs, copier.Job{Src: "/nowhere/" + rel, Rel: filepath.FromSlash(rel), Size: files[rel], ModTime: 1_700_000_000})
 	}
-	p := copier.PlanJobs(t.TempDir(), jobs, "", 2, fsinfo.ForFileSystem("NTFS"))
+	p := copier.PlanJobs(dst, jobs, "", 2, fsinfo.ForFileSystem("NTFS"))
 	p.DstFS = fsinfo.ForFileSystem(fsName)
 	return p
 }
@@ -179,16 +185,18 @@ func TestPhoneFixtureCopiesEveryFileAndReportsRenames(t *testing.T) {
 }
 
 func TestCaseCollisionWithAnExistingDestinationFile(t *testing.T) {
-	p := jobsPlan(t, "NTFS", map[string]int64{"Photo.jpg": 5})
 	// The destination already has "photo.jpg" (other letter case).
-	os.WriteFile(filepath.Join(p.DstRoot, "photo.jpg"), []byte("old"), 0o644)
+	dst := t.TempDir()
+	os.WriteFile(filepath.Join(dst, "photo.jpg"), []byte("old"), 0o644)
+	p := jobsPlanAt(t, dst, "NTFS", map[string]int64{"Photo.jpg": 5})
 	rep := Run(p, Options{})
 	if !rep.Has("case-collision") || len(p.Items) != 1 || p.Items[0].Rel != "Photo (case 2).jpg" {
 		t.Errorf("issues %+v, item %+v", rep.Issues, p.Items)
 	}
 	// The same name in the same case is not a collision: it is the same file.
-	p = jobsPlan(t, "NTFS", map[string]int64{"photo.jpg": 5})
-	os.WriteFile(filepath.Join(p.DstRoot, "photo.jpg"), []byte("old"), 0o644)
+	dst = t.TempDir()
+	os.WriteFile(filepath.Join(dst, "photo.jpg"), []byte("old"), 0o644)
+	p = jobsPlanAt(t, dst, "NTFS", map[string]int64{"photo.jpg": 5})
 	if rep := Run(p, Options{}); rep.Has("case-collision") {
 		t.Errorf("identical names collided: %+v", rep.Issues)
 	}

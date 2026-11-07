@@ -44,6 +44,12 @@ func newTurbo(t *testing.T, elevated bool) *turboEnv {
 	e.ids["readme"] = e.fake.Create(0, "readme.txt")
 	e.write(`Docs\résumé.pdf`, 2048)
 	e.write(`readme.txt`, 5)
+	// The fake volume's own idea of sizes and dates (what its folder listing
+	// answers), matching the real files.
+	for rel, id := range map[string]uint64{`Docs\résumé.pdf`: e.ids["cv"], "readme.txt": e.ids["readme"]} {
+		st, _ := os.Stat(index.JoinRoot(e.dir, rel))
+		e.fake.SetMeta(id, st.Size(), st.ModTime().UnixNano())
+	}
 
 	plug(t, e.drive)
 	setHooks(t, e.fake, elevated)
@@ -52,10 +58,11 @@ func newTurbo(t *testing.T, elevated bool) *turboEnv {
 
 func setHooks(t *testing.T, fake *ntfstest.Volume, elevated bool) {
 	t.Helper()
-	oldOpen, oldElev := openNTFS, isElevated
+	oldOpen, oldElev, oldLister := openNTFS, isElevated, ntfsLister
 	openNTFS = func(string) (*ntfs.Session, error) { return fake.Session(), nil }
 	isElevated = func() bool { return elevated }
-	t.Cleanup(func() { openNTFS, isElevated = oldOpen, oldElev })
+	ntfsLister = func(root string) ntfs.DirLister { return fake.Lister(root) }
+	t.Cleanup(func() { openNTFS, isElevated, ntfsLister = oldOpen, oldElev, oldLister })
 }
 
 func (e *turboEnv) write(rel string, size int) {
@@ -93,7 +100,7 @@ func TestTurboFullIndexThenIncrementalRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
-	for _, want := range []string{"Using NTFS turbo mode", "Indexed ", "names only"} {
+	for _, want := range []string{"Using NTFS turbo mode", "Indexed ", "Sizes and dates read folder by folder for 3 entries"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("full index output missing %q:\n%s", want, out)
 		}
@@ -173,7 +180,7 @@ func TestTurboRefreshFallsBackToFullRebuildWhenJournalWasReset(t *testing.T) {
 func TestTurboWithMetadataStoresRealSizes(t *testing.T) {
 	e := newTurbo(t, true)
 	out, err := e.index(scanOptions{withMetadata: true})
-	if err != nil || !strings.Contains(out, "Sizes and dates read for 3 entries (0 could not be read)") {
+	if err != nil || !strings.Contains(out, "Sizes and dates read folder by folder for 3 entries") {
 		t.Fatalf("%v\n%s", err, out)
 	}
 	ix := e.saved()
@@ -187,16 +194,37 @@ func TestTurboWithMetadataStoresRealSizes(t *testing.T) {
 	if got["readme.txt"] != 5 || got["résumé.pdf"] != 2048 {
 		t.Errorf("sizes = %v", got)
 	}
-	// --with-metadata never takes the refresh shortcut (a refresh would lose the metadata).
-	e.fake.Create(0, "x.txt")
-	if out, _ := e.index(scanOptions{withMetadata: true}); strings.Contains(out, "Refreshed") {
-		t.Errorf("--with-metadata must do a full read:\n%s", out)
+	if !ix.Header.MetaComplete || !ix.Header.ExactTimes() {
+		t.Errorf("header: complete %v, exact %v", ix.Header.MetaComplete, ix.Header.ExactTimes())
+	}
+	// A journal refresh keeps the metadata complete: the new file gets its size.
+	x := e.fake.Create(0, "x.txt")
+	e.fake.Write(x, 77, 1_700_000_000e9)
+	if out, _ := e.index(scanOptions{}); !strings.Contains(out, "Refreshed") {
+		t.Fatalf("the second index should be a journal refresh:\n%s", out)
+	}
+	ix = e.saved()
+	s, ok := ix.Slot(x)
+	if !ok || ix.Sizes[s] != 77 || !ix.Header.MetaComplete {
+		t.Errorf("after the refresh: x.txt size %v, complete %v", ix.Sizes[s], ix.Header.MetaComplete)
+	}
+}
+
+func TestTurboNoMetadataStoresNamesOnly(t *testing.T) {
+	e := newTurbo(t, true)
+	out, err := e.index(scanOptions{noMetadata: true})
+	if err != nil || !strings.Contains(out, "names only") {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if ix := e.saved(); ix.Header.MetaComplete {
+		t.Error("a names-only index is not complete")
 	}
 }
 
 func TestLazyMetadataIsSkippedForOfflineDrives(t *testing.T) {
 	e := newTurbo(t, true)
-	if _, err := e.index(scanOptions{}); err != nil {
+	// A names-only index: sizes would have to be asked of the drive.
+	if _, err := e.index(scanOptions{noMetadata: true}); err != nil {
 		t.Fatal(err)
 	}
 	plug(t) // unplugged

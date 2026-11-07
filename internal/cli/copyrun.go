@@ -37,6 +37,7 @@ type planRun struct {
 
 	srcDev      preflight.Device // for the time estimate (Class/ID; USB is filled here)
 	plannedFrom string           // "scan" | "index" | "phone" | "search" (for --json)
+	readOrder   string           // copier.ReadOrder*
 }
 
 // copyJSON is the result object `copy --json` prints (one JSON object on
@@ -178,6 +179,7 @@ func finishPlan(ctx context.Context, out *bufio.Writer, status *ui.StatusLine, p
 	res, err := copier.Run(ctx, plan, copier.Options{
 		Workers:           workers,
 		BigLanes:          bigLanes,
+		ReadOrder:         readOrderFor(o.readOrder),
 		Verify:            o.verify,
 		CaseSensitiveDirs: o.names.CaseSensitiveDest,
 		Progress: func(p ui.CopyProgress) {
@@ -229,6 +231,15 @@ func finishPlan(ctx context.Context, out *bufio.Writer, status *ui.StatusLine, p
 	js.OK = true
 	fmt.Fprintln(out, ui.Dim("Tip: use \"Safely Remove Hardware\" before unplugging the destination drive."))
 	return nil
+}
+
+// readOrderFor resolves --read-order: auto means size until a benchmark on a
+// real USB hard disk shows disk order is faster (design doc 7.5).
+func readOrderFor(s string) string {
+	if s == copier.ReadOrderDisk {
+		return copier.ReadOrderDisk
+	}
+	return copier.ReadOrderSize
 }
 
 // blockError is the error for a copy pre-flight stopped (exit code 3). The

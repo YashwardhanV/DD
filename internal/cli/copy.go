@@ -23,7 +23,7 @@ var copyChecks = copier.DefaultChecks
 
 // newCopyCmd implements `drivedex copy <src> <dst>`.
 func newCopyCmd() *cobra.Command {
-	var workers, onConflict, verify, onCase, onBad string
+	var workers, onConflict, verify, onCase, onBad, sourceList, readOrder string
 	var dryRun, yes, asJSON, verbose, caseSensitive bool
 
 	cmd := &cobra.Command{
@@ -57,6 +57,14 @@ for speed, DriveDex does not force every file to be flushed to the disk.`,
 			if err != nil {
 				return err
 			}
+			switch sourceList {
+			case sourceListAuto, sourceListIndex, sourceListScan:
+			default:
+				return userErr(fmt.Sprintf("--source-list %q isn't valid", sourceList), "use auto, index or scan", nil)
+			}
+			if !copier.ValidReadOrder(readOrder) {
+				return userErr(fmt.Sprintf("--read-order %q isn't valid", readOrder), "use auto, disk or size", nil)
+			}
 			stdout := cmd.OutOrStdout()
 			human := stdout
 			if asJSON {
@@ -66,6 +74,7 @@ for speed, DriveDex does not force every file to be flushed to the disk.`,
 			err = runCopy(cmd.Context(), human, args[0], args[1], copyFlags{
 				workers: effectiveWorkers(cmd, workers), onConflict: onConflict, verify: mode, dryRun: dryRun,
 				names: names, yes: yes, verbose: verbose, in: cmd.InOrStdin(), json: js,
+				sourceList: sourceList, readOrder: readOrder, human: human,
 			})
 			if asJSON {
 				if err != nil && js.Error == "" {
@@ -86,6 +95,8 @@ for speed, DriveDex does not force every file to be flushed to the disk.`,
 	cmd.Flags().Lookup("verify").NoOptDefVal = "media"
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "show what would be copied, skipped or overwritten, without writing anything")
 	addNameFlags(cmd, &onCase, &onBad, &caseSensitive)
+	cmd.Flags().StringVar(&sourceList, "source-list", sourceListAuto, "where the list of files to copy comes from: auto (the saved index of an NTFS drive when the change journal proves it is current - needs Administrator - otherwise a fresh listing), index (fail if it can't be used), or scan (always list the source)")
+	cmd.Flags().StringVar(&readOrder, "read-order", copier.ReadOrderAuto, "order of small files: size (biggest first), disk (where they lie on the disk; experimental, for USB hard disks), or auto (= size for now)")
 	cmd.Flags().BoolVar(&yes, "yes", false, "continue past pre-flight warnings without asking")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "print one JSON result object on stdout (messages go to stderr)")
 	cmd.Flags().BoolVar(&verbose, "verbose", false, "list every affected file in the pre-flight report")
@@ -125,6 +136,9 @@ type copyFlags struct {
 	yes, verbose        bool
 	in                  io.Reader
 	json                *copyJSON
+	sourceList          string
+	readOrder           string
+	human               io.Writer // where messages go (stdout, or stderr with --json)
 }
 
 // phoneSpec is a parsed "phone:..." copy source.
@@ -234,7 +248,8 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 			why = autoWhy(workers)
 		}
 		status.Update("Reading the file list from " + src + " …")
-		plan, err = copier.PlanLocal(ctx, src, dst, f.onConflict, max(workers, 2))
+		out.Flush()
+		plan, plannedFrom, err = planLocalSource(ctx, out, src, dst, f, workers)
 		status.Clear()
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -248,7 +263,7 @@ func runCopy(ctx context.Context, stdout io.Writer, srcArg, dstArg string, f cop
 	return finishPlan(ctx, out, status, plan, planRun{
 		workers: workers, why: why, verify: f.verify, dryRun: f.dryRun, dstArg: dstArg, srcArg: srcArg, srcRoot: srcRoot,
 		names: f.names, yes: f.yes, verbose: f.verbose, in: f.in, json: f.json,
-		srcDev: srcDev, plannedFrom: plannedFrom,
+		srcDev: srcDev, plannedFrom: plannedFrom, readOrder: f.readOrder,
 	})
 }
 
@@ -306,6 +321,10 @@ func resolveDestination(arg string) (string, error) {
 }
 
 func planError(srcArg string, err error) error {
+	var ue *UserError
+	if errors.As(err, &ue) {
+		return err // already in plain words (e.g. --source-list index)
+	}
 	if errors.Is(err, copier.ErrDestinationInsideSource) {
 		return userErr(fmt.Sprintf("can't copy %s into itself", srcArg),
 			"choose a destination folder outside the folder being copied", err)

@@ -106,6 +106,10 @@ type Options struct {
 	// RetryDelay is the wait between attempts (default 500 ms).
 	Retries    int
 	RetryDelay time.Duration
+	// ReadOrder is the order small files are read in: ReadOrderSize (biggest
+	// first, the default) or ReadOrderDisk (where they lie on the disk; for
+	// spinning hard disks, experimental). Big files keep their own lanes.
+	ReadOrder string
 	// CaseSensitiveDirs: folders the copy creates get NTFS per-folder case
 	// sensitivity (see NameOptions.CaseSensitiveDest).
 	CaseSensitiveDirs bool
@@ -414,7 +418,26 @@ func runLocal(ctx context.Context, p *Plan, opt Options, st *state) {
 		}
 	}
 	dwg.Add(2)
-	go dispatch(smallQ, func(it *Item) bool { return !isBig(it) })
+	if opt.ReadOrder == ReadOrderDisk {
+		ordered := diskOrder(p.Items, isBig)
+		go func() {
+			defer dwg.Done()
+			defer close(smallQ)
+			for _, it := range ordered {
+				if it.Blocked != "" {
+					st.fail(it.Rel, errors.New(it.Blocked))
+					continue
+				}
+				select {
+				case smallQ <- it:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	} else {
+		go dispatch(smallQ, func(it *Item) bool { return !isBig(it) })
+	}
 	go dispatch(bigQ, isBig)
 	dwg.Wait()
 	wg.Wait()

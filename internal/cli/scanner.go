@@ -19,7 +19,8 @@ var seekPenaltyFor = volume.SeekPenalty
 type scanOptions struct {
 	mode         string // auto | walk | parallel | mft
 	workers      string // auto | a number
-	withMetadata bool   // NTFS turbo mode: also read every size and date
+	withMetadata bool   // NTFS turbo mode: also read every size and date (now the default; kept so old scripts work)
+	noMetadata   bool   // NTFS turbo mode: names only (the old, slightly faster behaviour)
 	full         bool   // NTFS turbo mode: skip the incremental refresh
 	quiet        bool   // no live status line (used while the full-screen UI owns the terminal)
 }
@@ -28,7 +29,8 @@ type scanOptions struct {
 func addScanFlags(f *pflag.FlagSet, o *scanOptions) {
 	f.StringVar(&o.mode, "mode", "auto", "how to scan: auto, walk (one thread), parallel, or mft (NTFS turbo mode, Administrator)")
 	f.StringVar(&o.workers, "workers", "auto", "parallel readers: auto (picked from the drive type) or a number")
-	f.BoolVar(&o.withMetadata, "with-metadata", false, "NTFS turbo mode: also read every file size and date (slower, but complete)")
+	f.BoolVar(&o.withMetadata, "with-metadata", false, "NTFS turbo mode: read every file size and date (this is now the default)")
+	f.BoolVar(&o.noMetadata, "no-metadata", false, "NTFS turbo mode: store names only, not sizes and dates (a copy then can't be planned from the index)")
 	f.BoolVar(&o.full, "full", false, "NTFS turbo mode: re-read the whole file table instead of refreshing from the change journal")
 }
 

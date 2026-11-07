@@ -178,8 +178,9 @@ const noJournalHigh = math.MaxInt64
 
 // RefreshResult describes an incremental update.
 type RefreshResult struct {
-	Changes int // distinct files/folders that changed in the visible tree
-	Records int // journal records read
+	Changes int      // distinct files/folders that changed in the visible tree
+	Records int      // journal records read
+	Touched []uint64 // the IDs of those entries (for RefreshTouched)
 }
 
 // Refresh brings ix up to date by replaying only the journal records written
@@ -214,5 +215,5 @@ func Refresh(ctx context.Context, s *Session, ix *index.Index) (RefreshResult, e
 		return res, err
 	}
 	h.NextUsn = next
-	return RefreshResult{Changes: ap.Changes(), Records: ap.Records}, nil
+	return RefreshResult{Changes: ap.Changes(), Records: ap.Records, Touched: ap.Touched()}, nil
 }

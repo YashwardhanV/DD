@@ -166,7 +166,12 @@ func (p *Plan) FixNames(opt NameOptions) NameReport {
 		// Names already in this destination folder (if it exists).
 		existing := map[string]string{} // folded -> exact
 		exists := false
-		if names, err := listDir(filepath.Join(p.DstRoot, finalDir)); err == nil {
+		if names, ok := p.dstNames[finalDir]; ok {
+			exists = true
+			for _, nm := range names {
+				existing[winname.Fold(nm)] = nm
+			}
+		} else if names, err := listDir(filepath.Join(p.DstRoot, finalDir)); err == nil {
 			exists = true
 			for _, nm := range names {
 				existing[winname.Fold(nm)] = nm

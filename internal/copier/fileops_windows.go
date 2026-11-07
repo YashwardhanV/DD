@@ -100,3 +100,36 @@ func unbufferedOpen(name string) (*os.File, error) {
 	}
 	return os.NewFile(uintptr(h), name), nil
 }
+
+// fsctlGetRetrievalPointers asks NTFS where a file's clusters are.
+const fsctlGetRetrievalPointers = 0x00090073
+
+// platformFirstLCN returns the logical cluster number of a file's first
+// extent. It opens the file only to read attributes (no Administrator rights
+// needed). Files stored inside their MFT record have no extent: false.
+func platformFirstLCN(path string) (int64, bool) {
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, false
+	}
+	h, err := windows.CreateFile(p, windows.FILE_READ_ATTRIBUTES, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil, windows.OPEN_EXISTING, 0, 0)
+	if err != nil {
+		return 0, false
+	}
+	defer windows.CloseHandle(h)
+	var in [8]byte // STARTING_VCN_INPUT_BUFFER: StartingVcn = 0
+	// RETRIEVAL_POINTERS_BUFFER: ExtentCount uint32, 4 padding, StartingVcn
+	// int64, then {NextVcn, Lcn int64} per extent. Room for one is enough.
+	var out [32]byte
+	var n uint32
+	err = windows.DeviceIoControl(h, fsctlGetRetrievalPointers, &in[0], uint32(len(in)), &out[0], uint32(len(out)), &n, nil)
+	if err != nil && !errors.Is(err, windows.ERROR_MORE_DATA) {
+		return 0, false
+	}
+	if n < 32 || binary.LittleEndian.Uint32(out[0:]) == 0 {
+		return 0, false
+	}
+	lcn := int64(binary.LittleEndian.Uint64(out[24:]))
+	return lcn, lcn >= 0
+}
