@@ -50,9 +50,10 @@ func contents(m map[string]string) map[string]int {
 	return c
 }
 
+// put writes root\rel (rel may use `\` on any OS, as the tests write it).
 func put(t *testing.T, root, rel, body string, mtime time.Time) {
 	t.Helper()
-	p := filepath.Join(root, rel)
+	p := filepath.Join(root, filepath.FromSlash(strings.ReplaceAll(rel, `\`, "/")))
 	os.MkdirAll(filepath.Dir(p), 0o755)
 	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
 		t.Fatal(err)

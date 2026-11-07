@@ -95,6 +95,7 @@ func TestPhoneCopyMakesNamesSafeForWindows(t *testing.T) {
 	fs.Add("/sdcard/Notes/con.txt", "device name", 1_700_000_004)
 	useFS(t, fs)
 	fakeDriveType(t, false, true)
+	fakeChecks(t, 1<<40, "NTFS") // names are fixed for what the destination can store
 
 	dst := filepath.Join(t.TempDir(), "out")
 	out, err := run(t, "--no-color", "copy", "phone:/Notes", dst)

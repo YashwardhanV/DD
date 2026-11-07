@@ -52,6 +52,8 @@ func free(n uint64) func(string) (uint64, error) {
 
 // TestIssueMessages is the golden test: the exact text of each issue code.
 func TestIssueMessages(t *testing.T) {
+	defer func(v bool) { checkLongPaths = v }(checkLongPaths)
+	checkLongPaths = true // the long-path case, on any OS
 	cases := []struct {
 		name     string
 		fs       string

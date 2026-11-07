@@ -248,9 +248,16 @@ type Lister struct {
 	ListCalls int
 }
 
+// rel is path relative to the lister's root, with `\` separators. Both are
+// converted the same way, so a Unix-style root works too.
+func (l *Lister) rel(path string) string {
+	slash := func(s string) string { return strings.TrimRight(strings.ReplaceAll(s, "/", `\`), `\`) }
+	return strings.Trim(strings.TrimPrefix(slash(path), slash(l.root)), `\`)
+}
+
 // StatFile implements ntfs.FileStater: one file of the fake volume.
 func (l *Lister) StatFile(path string) (ntfs.DirRecord, error) {
-	rel := strings.Trim(strings.TrimPrefix(strings.ReplaceAll(path, "/", `\`), strings.TrimRight(l.root, `\/`)), `\/`)
+	rel := l.rel(path)
 	v := l.v
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -267,7 +274,7 @@ func (l *Lister) ListDir(dir string) ([]ntfs.DirRecord, error) {
 	l.mu.Lock()
 	l.ListCalls++
 	l.mu.Unlock()
-	rel := strings.Trim(strings.TrimPrefix(strings.ReplaceAll(dir, "/", `\`), strings.TrimRight(l.root, `\/`)), `\/`)
+	rel := l.rel(dir)
 	v := l.v
 	v.mu.Lock()
 	defer v.mu.Unlock()

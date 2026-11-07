@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -12,9 +13,13 @@ import (
 )
 
 // sourceListEnv is a fake NTFS drive (a real temp folder) with the volume
-// lookups pointed at it, ready for copy --source-list tests.
+// lookups pointed at it, ready for copy --source-list tests. Windows only:
+// the index is used only for sources on a drive letter.
 func sourceListEnv(t *testing.T, elevated, indexed bool) *turboEnv {
 	t.Helper()
+	if runtime.GOOS != "windows" {
+		t.Skip("planning from the saved index needs a drive letter (Windows)")
+	}
 	e := newTurbo(t, elevated)
 	volumeForPath = func(string) (volume.Volume, error) { return e.drive, nil }
 	t.Cleanup(func() { volumeForPath = volume.ForPath })

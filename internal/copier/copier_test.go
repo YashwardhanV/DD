@@ -563,9 +563,12 @@ func TestSymlinksAreSkippedNotFollowed(t *testing.T) {
 		t.Skipf("can't create symlinks here: %v", err)
 	}
 	dst := t.TempDir()
-	r := mustRun(t, plan(t, src, dst, ""), fastOpts(2))
-	if r.Written != 1 || r.NotRegular != 1 || r.Failed != 0 {
-		t.Errorf("result = %+v", r)
+	p := plan(t, src, dst, "")
+	r := mustRun(t, p, fastOpts(2))
+	// The plan leaves links out (LinksSkipped); a link the listing missed is
+	// caught when the copy opens it (NotRegular). Either way it isn't copied.
+	if r.Written != 1 || p.LinksSkipped+r.NotRegular != 1 || r.Failed != 0 {
+		t.Errorf("result = %+v, links skipped by the plan %d", r, p.LinksSkipped)
 	}
 	if _, err := os.Stat(filepath.Join(dst, filepath.Base(src), "link.txt")); err == nil {
 		t.Error("a symlink's target must never be copied")

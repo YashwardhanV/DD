@@ -22,10 +22,13 @@ func syncEnv(t *testing.T) (src, dst string) {
 	src, dst = filepath.Join(base, "Photos"), filepath.Join(base, "Backup")
 	t0 := time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC)
 	for i, rel := range []string{"a.jpg", `2024\b.jpg`, `2024\c.jpg`, `2025\d.jpg`} {
-		writeAt(t, filepath.Join(src, rel), "content of "+rel, t0.Add(time.Duration(i)*time.Minute))
+		writeAt(t, filepath.Join(src, osRel(rel)), "content of "+rel, t0.Add(time.Duration(i)*time.Minute))
 	}
 	return src, dst
 }
+
+// osRel turns a test path written with `\` into this OS's separators.
+func osRel(rel string) string { return filepath.FromSlash(strings.ReplaceAll(rel, `\`, "/")) }
 
 func writeAt(t *testing.T, p, body string, mtime time.Time) {
 	t.Helper()
@@ -133,7 +136,7 @@ func TestSyncMassDeleteGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, rel := range []string{"a.jpg", `2024\b.jpg`, `2024\c.jpg`} {
-		os.Remove(filepath.Join(src, rel))
+		os.Remove(filepath.Join(src, osRel(rel)))
 	}
 	out, err := run(t, "sync", src, dst, "--yes")
 	var ue *UserError

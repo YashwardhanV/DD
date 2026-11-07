@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -245,10 +246,10 @@ func Run(p *copier.Plan, opt Options) Report {
 			}
 		}
 
-		// --- long paths -------------------------------------------------------
+		// --- long paths (Explorer's limit; other systems have none) ----------
 		var long []string
 		for _, it := range p.Items {
-			if !it.Decision.Skipped() && winname.Units(filepath.Join(p.DstRoot, it.Rel)) > 259 {
+			if checkLongPaths && !it.Decision.Skipped() && winname.Units(filepath.Join(p.DstRoot, it.Rel)) > 259 {
 				long = append(long, it.Rel)
 			}
 		}
@@ -285,6 +286,10 @@ func Run(p *copier.Plan, opt Options) Report {
 
 // fat32MaxFile is the largest file FAT32 can store (4 GiB minus one byte).
 const fat32MaxFile = 4 << 30
+
+// checkLongPaths turns on the 259-character warning: it is Explorer's limit,
+// so it only means something on Windows.
+var checkLongPaths = runtime.GOOS == "windows"
 
 // fatDirLimit is how many 32-byte directory entries one FAT folder can have.
 const fatDirLimit = 65534
